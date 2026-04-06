@@ -1,4 +1,4 @@
-package com.litebfx;
+package com.litebfx.fasta;
 
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.Table;
@@ -6,38 +6,33 @@ import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Represents a BAM/SAM file (or directory/glob of files) as a Spark table.
- *
- * <p>Capabilities: {@code BATCH_READ} only.
- */
-public class BamTable implements Table, SupportsRead {
+/** Represents a FASTA file (or glob of files) as a Spark table. */
+public class FastaTable implements Table, SupportsRead {
+
+    private static final Logger log = LoggerFactory.getLogger(FastaTable.class);
 
     private final Map<String, String> properties;
-    private final boolean isCram;
 
-    BamTable(Map<String, String> properties) {
-        this(properties, false);
-    }
-
-    BamTable(Map<String, String> properties, boolean isCram) {
+    FastaTable(Map<String, String> properties) {
+        log.trace("FastaTable(properties={})", properties);
         this.properties = properties;
-        this.isCram = isCram;
     }
 
     @Override
     public String name() {
-        return properties.getOrDefault("path", isCram ? "cram" : "bam");
+        return properties.getOrDefault("path", "fasta");
     }
 
     @Override
     public StructType schema() {
-        return BamSchema.SCHEMA;
+        return FastaSchema.SCHEMA;
     }
 
     @Override
@@ -47,6 +42,7 @@ public class BamTable implements Table, SupportsRead {
 
     @Override
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
-        return new BamScanBuilder(options, isCram);
+        log.trace("newScanBuilder(options={})", options);
+        return new FastaScanBuilder(options);
     }
 }

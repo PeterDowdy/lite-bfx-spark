@@ -1,4 +1,4 @@
-package com.litebfx;
+package com.litebfx.bam;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -11,6 +11,8 @@ import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -42,25 +44,32 @@ import java.util.List;
  */
 public class BamScan implements Scan, Batch {
 
+    private static final Logger log = LoggerFactory.getLogger(BamScan.class);
+
     private final CaseInsensitiveStringMap options;
     private final StructType requiredSchema;
     private final boolean includeAttributes;
     private final String pushedReferenceName;
     private final int pushedStart;
     private final int pushedEnd;
+    private final boolean isCram;
 
     BamScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
             boolean includeAttributes,
             String pushedReferenceName,
             int pushedStart,
-            int pushedEnd) {
+            int pushedEnd,
+            boolean isCram) {
+        log.trace("BamScan(includeAttributes={}, pushedReferenceName={}, pushedStart={}, pushedEnd={}, isCram={})",
+                includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram);
         this.options = options;
         this.requiredSchema = requiredSchema;
         this.includeAttributes = includeAttributes;
         this.pushedReferenceName = pushedReferenceName;
         this.pushedStart = pushedStart;
         this.pushedEnd = pushedEnd;
+        this.isCram = isCram;
     }
 
     // -------------------------------------------------------------------------
@@ -69,6 +78,7 @@ public class BamScan implements Scan, Batch {
 
     @Override
     public StructType readSchema() {
+        log.trace("readSchema()");
         // Always return the full schema. BAM records cannot be partially read,
         // so we always produce all 12 columns. Spark applies its own projection
         // on top when the user selects a subset of columns.
@@ -79,6 +89,7 @@ public class BamScan implements Scan, Batch {
 
     @Override
     public Batch toBatch() {
+        log.trace("toBatch()");
         return this;
     }
 
@@ -89,37 +100,49 @@ public class BamScan implements Scan, Batch {
     @Override
     public InputPartition[] planInputPartitions() {
         String pathStr = options.get("path");
+        log.trace("planInputPartitions() path={}", pathStr);
         if (pathStr == null) {
-            throw new IllegalArgumentException("'path' option is required for the bam data source");
+            String fmt = isCram ? "cram" : "bam";
+            throw new IllegalArgumentException("'path' option is required for the " + fmt + " data source");
         }
 
         boolean useIndex = Boolean.parseBoolean(options.getOrDefault("useIndex", "true"));
+        String referenceFile = options.get("referenceFile");
+        String referenceMode = options.getOrDefault("referenceMode", referenceFile != null ? "file" : "none");
+        log.trace("planInputPartitions() useIndex={} isCram={} referenceMode={}", useIndex, isCram, referenceMode);
 
         Configuration hadoopConf = SparkSession.builder().getOrCreate()
                 .sessionState().newHadoopConf();
 
         List<BamInputPartition> partitions = new ArrayList<>();
         try {
-            for (Path bamPath : resolveBamFiles(pathStr, hadoopConf)) {
-                String bamUri = bamPath.toUri().toString();
-                String indexPath = useIndex ? resolveIndexPath(bamPath, hadoopConf) : null;
+            for (Path filePath : resolveBamFiles(pathStr, hadoopConf)) {
+                String fileUri = filePath.toUri().toString();
+                String indexPath = useIndex ? resolveIndexPath(filePath, hadoopConf) : null;
+                log.trace("planInputPartitions() adding partition fileUri={} indexPath={}", fileUri, indexPath);
 
                 partitions.add(new BamInputPartition(
-                        bamUri,
+                        fileUri,
                         0L,
                         Long.MAX_VALUE,
                         hadoopConf,
-                        indexPath));
+                        indexPath,
+                        isCram,
+                        referenceFile,
+                        referenceMode));
             }
         } catch (IOException e) {
-            throw new RuntimeException("Failed to plan BAM input partitions for path: " + pathStr, e);
+            String fmt = isCram ? "CRAM" : "BAM";
+            throw new RuntimeException("Failed to plan " + fmt + " input partitions for path: " + pathStr, e);
         }
 
+        log.trace("planInputPartitions() -> {} partition(s)", partitions.size());
         return partitions.toArray(new InputPartition[0]);
     }
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
+        log.trace("createReaderFactory()");
         return new BamPartitionReaderFactory(includeAttributes);
     }
 
@@ -128,6 +151,7 @@ public class BamScan implements Scan, Batch {
     // -------------------------------------------------------------------------
 
     private List<Path> resolveBamFiles(String pathStr, Configuration conf) throws IOException {
+        log.trace("resolveBamFiles(pathStr={})", pathStr);
         Path hadoopPath = new Path(pathStr);
         FileSystem fs = hadoopPath.getFileSystem(conf);
         List<Path> result = new ArrayList<>();
@@ -139,59 +163,75 @@ public class BamScan implements Scan, Batch {
             for (FileStatus s : statuses) {
                 if (s.isDirectory()) {
                     collectBamChildren(fs, s.getPath(), result);
-                } else if (isBamOrSam(s.getPath())) {
+                } else if (isAcceptedExtension(s.getPath())) {
                     result.add(s.getPath());
                 }
             }
         }
 
         if (result.isEmpty()) {
-            // Treat path as a literal file (lets htsjdk detect BAM vs SAM by magic bytes)
+            // Treat path as a literal file (lets htsjdk detect format by magic bytes)
             result.add(hadoopPath);
         }
+        log.trace("resolveBamFiles() -> {} file(s)", result.size());
         return result;
     }
 
     private void collectBamChildren(FileSystem fs, Path dir, List<Path> result) throws IOException {
+        log.trace("collectBamChildren(dir={})", dir);
         for (FileStatus s : fs.listStatus(dir)) {
-            if (!s.isDirectory() && isBamOrSam(s.getPath())) {
+            if (!s.isDirectory() && isAcceptedExtension(s.getPath())) {
+                log.trace("collectBamChildren() found {}", s.getPath());
                 result.add(s.getPath());
             }
         }
     }
 
-    private static boolean isBamOrSam(Path p) {
+    private boolean isAcceptedExtension(Path p) {
         String name = p.getName().toLowerCase();
-        return name.endsWith(".bam") || name.endsWith(".sam");
+        boolean result = isCram ? name.endsWith(".cram")
+                                : name.endsWith(".bam") || name.endsWith(".sam");
+        log.trace("isAcceptedExtension({}) -> {}", p.getName(), result);
+        return result;
     }
 
     /**
-     * Resolves the BAI index for {@code bamPath} using the documented priority order.
-     * Returns null when no index is found.
+     * Resolves the BAI (for BAM) or CRAI (for CRAM) index using the documented
+     * priority order. Returns null when no index is found.
      */
-    private String resolveIndexPath(Path bamPath, Configuration conf) throws IOException {
-        FileSystem fs = bamPath.getFileSystem(conf);
+    private String resolveIndexPath(Path filePath, Configuration conf) throws IOException {
+        log.trace("resolveIndexPath(filePath={}, isCram={})", filePath, isCram);
+        FileSystem fs = filePath.getFileSystem(conf);
+        String indexSuffix = isCram ? ".crai" : ".bai";
 
         // 1. Explicit indexPath option (only reliable for single-file reads)
         String explicit = options.get("indexPath");
         if (explicit != null) {
             Path p = new Path(explicit);
-            if (p.getFileSystem(conf).exists(p)) return explicit;
+            if (p.getFileSystem(conf).exists(p)) {
+                log.trace("resolveIndexPath() -> explicit indexPath={}", explicit);
+                return explicit;
+            }
         }
 
-        // 2. indexDir/<filename>.bai
+        // 2. indexDir/<filename><suffix>
         String indexDir = options.get("indexDir");
         if (indexDir != null) {
-            Path candidate = new Path(indexDir, bamPath.getName() + ".bai");
+            Path candidate = new Path(indexDir, filePath.getName() + indexSuffix);
             if (candidate.getFileSystem(conf).exists(candidate)) {
+                log.trace("resolveIndexPath() -> indexDir candidate={}", candidate);
                 return candidate.toUri().toString();
             }
         }
 
-        // 3. Co-located <bamPath>.bai
-        Path colocated = new Path(bamPath.toUri().toString() + ".bai");
-        if (fs.exists(colocated)) return colocated.toUri().toString();
+        // 3. Co-located <filePath><suffix>
+        Path colocated = new Path(filePath.toUri().toString() + indexSuffix);
+        if (fs.exists(colocated)) {
+            log.trace("resolveIndexPath() -> co-located index={}", colocated);
+            return colocated.toUri().toString();
+        }
 
+        log.trace("resolveIndexPath() -> no index found");
         return null;
     }
 }

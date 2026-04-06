@@ -1,1 +1,5 @@
-com.litebfx.BamDataSource
+com.litebfx.bam.BamDataSource
+com.litebfx.bam.CramDataSource
+com.litebfx.fasta.FastaDataSource
+com.litebfx.bed.BedDataSource
+com.litebfx.vcf.VcfDataSource

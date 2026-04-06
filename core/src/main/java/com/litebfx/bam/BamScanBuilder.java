@@ -1,4 +1,4 @@
-package com.litebfx;
+package com.litebfx.bam;
 
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
@@ -13,6 +13,8 @@ import org.apache.spark.sql.sources.LessThanOrEqual;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Builds a {@link BamScan} for a BAM/SAM DataSource V2 read.
@@ -31,6 +33,8 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 public class BamScanBuilder
         implements ScanBuilder, SupportsPushDownFilters, SupportsPushDownRequiredColumns {
 
+    private static final Logger log = LoggerFactory.getLogger(BamScanBuilder.class);
+
     private final CaseInsensitiveStringMap options;
     private final boolean isCram;
 
@@ -47,6 +51,7 @@ public class BamScanBuilder
     }
 
     BamScanBuilder(CaseInsensitiveStringMap options, boolean isCram) {
+        log.trace("BamScanBuilder(isCram={})", isCram);
         this.options = options;
         this.isCram = isCram;
     }
@@ -57,6 +62,7 @@ public class BamScanBuilder
 
     @Override
     public Filter[] pushFilters(Filter[] filters) {
+        log.trace("pushFilters(filters={})", (Object) filters);
         // Extract filters we can use for BAI-based optimization.
         String refName = null;
         int rangeStart = 1;
@@ -83,6 +89,7 @@ public class BamScanBuilder
             pushedStart = rangeStart;
             pushedEnd = rangeEnd;
         }
+        log.trace("pushFilters() extracted referenceName={} start={} end={}", pushedReferenceName, pushedStart, pushedEnd);
 
         // Return ALL filters as unhandled so Spark post-filters for correctness.
         // BAI-based optimization in BamScan is transparent to Spark's planner.
@@ -91,6 +98,7 @@ public class BamScanBuilder
 
     @Override
     public Filter[] pushedFilters() {
+        log.trace("pushedFilters()");
         return new Filter[0];
     }
 
@@ -100,6 +108,7 @@ public class BamScanBuilder
 
     @Override
     public void pruneColumns(StructType requiredSchema) {
+        log.trace("pruneColumns(requiredSchema={})", requiredSchema);
         this.requiredSchema = requiredSchema;
         boolean found = false;
         for (StructField f : requiredSchema.fields()) {
@@ -109,6 +118,7 @@ public class BamScanBuilder
             }
         }
         this.includeAttributes = found;
+        log.trace("pruneColumns() includeAttributes={}", includeAttributes);
     }
 
     // -------------------------------------------------------------------------
@@ -117,7 +127,8 @@ public class BamScanBuilder
 
     @Override
     public Scan build() {
+        log.trace("build()");
         return new BamScan(options, requiredSchema, includeAttributes,
-                           pushedReferenceName, pushedStart, pushedEnd);
+                           pushedReferenceName, pushedStart, pushedEnd, isCram);
     }
 }

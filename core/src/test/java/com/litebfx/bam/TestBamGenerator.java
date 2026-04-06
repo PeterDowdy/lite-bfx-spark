@@ -1,4 +1,4 @@
-package com.litebfx;
+package com.litebfx.bam;
 
 import htsjdk.samtools.*;
 

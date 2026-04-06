@@ -1,4 +1,4 @@
-package com.litebfx;
+package com.litebfx.bam;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.catalyst.InternalRow;

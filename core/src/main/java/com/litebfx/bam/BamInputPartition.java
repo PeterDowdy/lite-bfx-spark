@@ -1,5 +1,6 @@
-package com.litebfx;
+package com.litebfx.bam;
 
+import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.connector.read.InputPartition;
 

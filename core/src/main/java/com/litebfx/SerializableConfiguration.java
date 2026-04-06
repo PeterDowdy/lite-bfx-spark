@@ -1,6 +1,8 @@
 package com.litebfx;
 
 import org.apache.hadoop.conf.Configuration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
 
@@ -11,24 +13,30 @@ import java.io.*;
  * serializable. This wrapper uses Configuration's own Writable encoding
  * (write/readFields) which serializes only the key-value properties.
  */
-class SerializableConfiguration implements Serializable {
+public class SerializableConfiguration implements Serializable {
+
+    private static final Logger log = LoggerFactory.getLogger(SerializableConfiguration.class);
 
     private transient Configuration value;
 
-    SerializableConfiguration(Configuration conf) {
+    public SerializableConfiguration(Configuration conf) {
+        log.trace("SerializableConfiguration(conf)");
         this.value = conf;
     }
 
-    Configuration get() {
+    public Configuration get() {
+        log.trace("get()");
         return value;
     }
 
     private void writeObject(ObjectOutputStream out) throws IOException {
+        log.trace("writeObject()");
         out.defaultWriteObject();
         value.write(out);
     }
 
     private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        log.trace("readObject()");
         in.defaultReadObject();
         value = new Configuration(false);
         value.readFields(in);

@@ -2,6 +2,8 @@ package com.litebfx;
 
 import htsjdk.samtools.seekablestream.SeekableStream;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 
@@ -12,11 +14,14 @@ import java.io.IOException;
  */
 public class HadoopSeekableStream extends SeekableStream {
 
+    private static final Logger log = LoggerFactory.getLogger(HadoopSeekableStream.class);
+
     private final FSDataInputStream in;
     private final long length;
     private final String source;
 
     public HadoopSeekableStream(FSDataInputStream in, long length, String source) {
+        log.trace("HadoopSeekableStream(source={}, length={})", source, length);
         this.in = in;
         this.length = length;
         this.source = source;
@@ -24,41 +29,53 @@ public class HadoopSeekableStream extends SeekableStream {
 
     @Override
     public long length() {
+        log.trace("length() -> {}", length);
         return length;
     }
 
     @Override
     public long position() throws IOException {
-        return in.getPos();
+        long pos = in.getPos();
+        log.trace("position() -> {}", pos);
+        return pos;
     }
 
     @Override
     public void seek(long position) throws IOException {
+        log.trace("seek(position={})", position);
         in.seek(position);
     }
 
     @Override
     public int read() throws IOException {
-        return in.read();
+        int b = in.read();
+        log.trace("read() -> {}", b);
+        return b;
     }
 
     @Override
     public int read(byte[] buffer, int offset, int length) throws IOException {
-        return in.read(buffer, offset, length);
+        int n = in.read(buffer, offset, length);
+        log.trace("read(offset={}, length={}) -> {} bytes", offset, length, n);
+        return n;
     }
 
     @Override
     public void close() throws IOException {
+        log.trace("close() source={}", source);
         in.close();
     }
 
     @Override
     public boolean eof() throws IOException {
-        return in.getPos() >= length;
+        boolean atEof = in.getPos() >= length;
+        log.trace("eof() -> {}", atEof);
+        return atEof;
     }
 
     @Override
     public String getSource() {
+        log.trace("getSource() -> {}", source);
         return source;
     }
 }

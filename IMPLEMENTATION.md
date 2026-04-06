@@ -24,10 +24,10 @@
 
 ### Source files
 
-- [x] `core/src/main/java/com/litebfx/BamSchema.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamSchema.java`
   - [x] Static `StructType SCHEMA` with all 12 fields (readName, flags, referenceName, start, mappingQuality, cigar, mateReferenceName, mateStart, insertSize, sequence, baseQualities, attributes)
 
-- [x] `core/src/main/java/com/litebfx/SerializableConfiguration.java` _(not in original plan — added during implementation)_
+- [x] `core/src/main/java/com/litebfx/SerializableConfiguration.java` _(shared utility; not in original plan — added during implementation)_
   - [x] Wraps `Configuration` using `Writable.write/readFields` for Java serialization
   - [x] Used by `BamInputPartition` instead of `SerializableWritable` (avoids Hadoop mapred dependency)
 
@@ -41,11 +41,11 @@
   - [x] `eof()` returns `pos >= length`
   - [x] `close()` closes stream
 
-- [x] `core/src/main/java/com/litebfx/BamInputPartition.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamInputPartition.java`
   - [x] Implements `InputPartition` and `Serializable`
   - [x] Fields: `path` (String), `startVirtualOffset` (long), `endVirtualOffset` (long), `hadoopConf` (`SerializableConfiguration`)
 
-- [x] `core/src/main/java/com/litebfx/BamPartitionReader.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamPartitionReader.java`
   - [x] Implements `PartitionReader<InternalRow>`
   - [x] Opens `FileSystem` using partition's serialized Hadoop config
   - [x] Opens BAM/SAM via `SamReaderFactory` (LENIENT) + `HadoopSeekableStream`
@@ -58,27 +58,27 @@
   - [ ] VFO seeking for `startVirtualOffset > 0` _(deferred: htsjdk 4.x `SAMFileSource.getFilePointer()` returns `SAMFileSpan` not `long`; will be resolved in `BamScan`)_
   - [ ] End-boundary enforcement via VFO _(deferred: htsjdk 4.x type resolution pending)_
 
-- [x] `core/src/main/java/com/litebfx/BamDataSource.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamDataSource.java`
   - [x] Implements `TableProvider` and `DataSourceRegister`
   - [x] `shortName()` returns `"bam"`
   - [x] `inferSchema()` returns `BamSchema.SCHEMA`
   - [x] `getTable()` returns new `BamTable`
 
-- [x] `core/src/main/java/com/litebfx/BamTable.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamTable.java`
   - [x] Implements `Table` and `SupportsRead`
   - [x] `name()` returns BAM path from options
   - [x] `schema()` returns `BamSchema.SCHEMA`
   - [x] `capabilities()` returns `BATCH_READ`
   - [x] `newScanBuilder()` returns new `BamScanBuilder`
 
-- [x] `core/src/main/java/com/litebfx/BamScanBuilder.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamScanBuilder.java`
   - [x] Implements `ScanBuilder`, `SupportsPushDownFilters`, `SupportsPushDownRequiredColumns`
   - [x] `pushFilters()` — extracts `referenceName` equality and `start` range; returns ALL filters as unhandled (Spark post-filters for correctness; BAI optimization is transparent)
   - [x] `pushedFilters()` — returns empty (all filters are post-filtered by Spark)
   - [x] `pruneColumns()` — records required schema; sets `includeAttributes` flag
   - [x] `build()` returns `BamScan` with pushed reference, region bounds, required schema, and options
 
-- [x] `core/src/main/java/com/litebfx/BamScan.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamScan.java`
   - [x] Implements `Scan` and `Batch`
   - [x] `readSchema()` returns required schema (pruned or full)
   - [x] `toBatch()` returns `this`
@@ -94,22 +94,22 @@
     - [ ] VFO chunk splitting via `BAMFileSpan` _(deferred: htsjdk 4.x type resolution pending)_
   - [x] `createReaderFactory()` returns new `BamPartitionReaderFactory`
 
-- [x] `core/src/main/java/com/litebfx/BamPartitionReaderFactory.java`
+- [x] `core/src/main/java/com/litebfx/bam/BamPartitionReaderFactory.java`
   - [x] Implements `PartitionReaderFactory`
   - [x] `createReader()` returns new `BamPartitionReader` for given partition
 
 ### Service registration
 
 - [x] `core/src/main/resources/META-INF/services/org.apache.spark.sql.sources.DataSourceRegister`
-  - [x] Contains single line: `com.litebfx.BamDataSource`
+  - [x] Contains: `com.litebfx.bam.BamDataSource`, `com.litebfx.bam.CramDataSource`, `com.litebfx.fasta.FastaDataSource`, `com.litebfx.bed.BedDataSource`, `com.litebfx.vcf.VcfDataSource`
 
 ### Tests
 
 - [x] `core/src/test/resources/range.bam` — real C. elegans Illumina paired-end BAM (htslib test suite, 112 records, 14 KB)
 - [x] `core/src/test/resources/range.bam.bai` — BAI index for range.bam
-- [x] `core/src/test/java/com/litebfx/TestBamGenerator.java` — generates synthetic BAM + BAI + SAM programmatically (10 records on chr1, deterministic)
+- [x] `core/src/test/java/com/litebfx/bam/TestBamGenerator.java` — generates synthetic BAM + BAI + SAM programmatically (10 records on chr1, deterministic)
 
-- [x] `core/src/test/java/com/litebfx/BamPartitionReaderTest.java` _(unit tests, no SparkSession)_
+- [x] `core/src/test/java/com/litebfx/bam/BamPartitionReaderTest.java` _(unit tests, no SparkSession)_
   - [x] Schema: 12 fields, correct names
   - [x] BAM: full-file read count = 10 (synthetic)
   - [x] BAM: first record scalar fields (readName, flags, referenceName, start, MQ, cigar, mateStart, insertSize, sequence, baseQualities)
@@ -121,7 +121,7 @@
   - [x] SAM: first record fields correct
   - [x] Non-zero `startVirtualOffset` throws `UnsupportedOperationException` _(to be lifted when VFO seeking is implemented in `BamScan`)_
 
-- [x] `core/src/test/java/com/litebfx/RangeBamTest.java` _(real-world data, no SparkSession)_
+- [x] `core/src/test/java/com/litebfx/bam/RangeBamTest.java` _(real-world data, no SparkSession)_
   - [x] Total count = 112 (matches `samtools view -c`)
   - [x] Per-chromosome counts: I=18, II=34, III=41, IV=19 (matches samtools)
   - [x] First record: readName, flags=145, CHROMOSOME_I:914, MQ=23, CIGAR=78M1D22M
@@ -131,7 +131,7 @@
   - [x] CIGAR variety: deletion (D), soft-clip (S), 100M all present
   - [x] All 112 reads have non-null readName and referenceName
 
-- [x] `core/src/test/java/com/litebfx/BamDataSourceTest.java`
+- [x] `core/src/test/java/com/litebfx/bam/BamDataSourceTest.java`
   - [x] BAM read via `spark.read.format("bam").load(path)`: schema matches `BamSchema.SCHEMA`
   - [x] BAM read: `df.count()` = 112
   - [x] BAM predicate pushdown: `referenceName = 'CHROMOSOME_I'` → count = 18
@@ -146,35 +146,37 @@
 
 ---
 
-## CRAM module (`core/src/main/java/com/litebfx/cram/`)
+## CRAM module (`core/src/main/java/com/litebfx/bam/`)
 
-- [ ] `core/src/main/java/com/litebfx/cram/CramDataSource.java`
-  - [ ] Implements `TableProvider` and `DataSourceRegister`
-  - [ ] `shortName()` returns `"cram"`
-  - [ ] `getTable()` returns `BamTable` constructed with `isCram=true` flag and `referenceFile` option forwarded
+- [x] `core/src/main/java/com/litebfx/bam/CramDataSource.java`
+  - [x] Implements `TableProvider` and `DataSourceRegister`
+  - [x] `shortName()` returns `"cram"`
+  - [x] `getTable()` returns `BamTable` constructed with `isCram=true` flag and `referenceFile` option forwarded
 
 _All remaining CRAM logic lives in existing `Bam*` classes; `isCram=true` gates CRAI resolution and `SamReaderFactory.referenceSource()` configuration._
 
-- [ ] `core/src/main/resources/META-INF/services/org.apache.spark.sql.sources.DataSourceRegister`
-  - [ ] Add line: `com.litebfx.cram.CramDataSource`
+- [x] `core/src/main/resources/META-INF/services/org.apache.spark.sql.sources.DataSourceRegister`
+  - [x] Add line: `com.litebfx.bam.CramDataSource`
 
 ### CRAM changes to existing classes
 
-- [ ] `BamScan.planInputPartitions()` — when `isCram=true`:
-  - [ ] CRAI resolution: `indexPath` option → `indexDir/<name>.cram.crai` → co-located `<path>.cram.crai` → single partition
-  - [ ] Open `CRAIIndex` from resolved path; iterate `CRAIEntry` list to build `BamInputPartition` list with VFO ranges
-  - [ ] Pass `referenceFile` + `referenceMode` into each partition's serialized options
-- [ ] `BamPartitionReader` — when `isCram=true`:
-  - [ ] Configure `SamReaderFactory.referenceSource()` using `referenceFile` option before opening reader
-  - [ ] `referenceMode=none` → `SamReaderFactory.referenceSource(ReferenceSource.NULL_REFERENCE_SOURCE)`
+- [x] `BamScan.planInputPartitions()` — when `isCram=true`:
+  - [x] CRAI resolution: `indexPath` option → `indexDir/<name>.crai` → co-located `<path>.crai` → none (single partition)
+  - [x] `isAcceptedExtension()` returns `.cram` when `isCram=true` (replaces `isBamOrSam`)
+  - [x] Pass `isCram`, `referenceFile`, `referenceMode` into each `BamInputPartition`
+- [x] `BamScanBuilder.build()` — passes `isCram` to `BamScan`
+- [x] `BamPartitionReader.open()` — when `isCram=true`:
+  - [x] Configure `SamReaderFactory.referenceSource()` with `new ReferenceSource(new File(referenceFile))` when `referenceMode=file`
+  - [x] `referenceMode=none` (or null `referenceFile`) → `new ReferenceSource((File) null)` (embedded bases, no external lookup)
 
 ### Tests
 
-- [ ] `core/src/test/java/com/litebfx/cram/CramDataSourceTest.java`
-  - [ ] CRAM read via `spark.read.format("cram").option("referenceFile", ...).load(path)`: schema matches `BamSchema.SCHEMA`
-  - [ ] `df.count()` equals `samtools view -c test.cram`
-  - [ ] Region query returns expected count
-  - [ ] Missing CRAI falls back to single partition and still returns correct count
+- [x] `core/src/test/java/com/litebfx/bam/CramDataSourceTest.java`
+  - [x] Schema matches `BamSchema.SCHEMA`
+  - [x] `df.count()` = 10 (synthetic CRAM, `referenceMode=none`)
+  - [x] `referenceName = 'chr1'` filter returns all 10 records
+  - [x] Column pruning: `select("readName", "start")` succeeds
+  - [x] Missing CRAI falls back to single partition (`useIndex=false`) and returns correct count
 
 ---
 
@@ -281,39 +283,45 @@ _All remaining CRAM logic lives in existing `Bam*` classes; `isCram=true` gates 
 
 ### Build
 
-- [ ] No new Maven dependencies — `htsjdk` provides `IndexedFastaSequenceFile` and `ReferenceSequenceFile`
+- [x] No new Maven dependencies — `htsjdk` provides `ReferenceSequenceFileFactory` and `ReferenceSequenceFile`
 
 ### Source files
 
-- [ ] `FastaSchema.java`
-  - [ ] Static `StructType SCHEMA`: `name` (String), `sequence` (String), `length` (Long)
+- [x] `FastaSchema.java`
+  - [x] Static `StructType SCHEMA`: `name` (String), `sequence` (String), `length` (Long)
 
-- [ ] `FastaInputPartition.java`
-  - [ ] Fields: `path` (String), `contigName` (String nullable — null means full-file single partition), `hadoopConf` (SerializableConfiguration)
+- [x] `FastaInputPartition.java`
+  - [x] Fields: `path` (String), `contigName` (String nullable — null means full-file single partition), `hadoopConf` (SerializableConfiguration)
 
-- [ ] `FastaPartitionReader.java`
-  - [ ] If `contigName != null`: opens `IndexedFastaSequenceFile`, calls `getSequence(contigName)`
-  - [ ] If `contigName == null`: opens `ReferenceSequenceFile`, iterates all sequences
-  - [ ] `get()` maps `ReferenceSequence` → `InternalRow`: `name`, `sequence.getBases()` as String, `length`
+- [x] `FastaPartitionReader.java`
+  - [x] If `contigName != null`: opens `ReferenceSequenceFile` (indexed), calls `getSequence(contigName)`, produces one row
+  - [x] If `contigName == null`: opens `ReferenceSequenceFile`, iterates via `nextSequence()`
+  - [x] `get()` maps `ReferenceSequence` → `InternalRow`: `name`, `getBases()` as UTF8String, `length`
+  - [x] `toNioPath()` converts Hadoop URI string to `java.nio.file.Path` for htsjdk
 
-- [ ] `FastaScan.java`
-  - [ ] `planInputPartitions()`:
-    - [ ] FAI resolution: `indexPath` → co-located `<path>.fai` → single partition
-    - [ ] With FAI: read `.fai` to get contig list; one `FastaInputPartition` per contig (respects `numPartitions` cap — merge small contigs if needed)
-    - [ ] No FAI: single partition with `contigName=null`
+- [x] `FastaScanBuilder.java`
+  - [x] Implements `ScanBuilder`, `SupportsPushDownRequiredColumns`
+  - [x] No filter pushdown (FASTA has no genomic-coordinate index for contig bodies)
 
-- [ ] `FastaPartitionReaderFactory.java`, `FastaTable.java`, `FastaDataSource.java` — standard boilerplate
+- [x] `FastaScan.java`
+  - [x] `planInputPartitions()`:
+    - [x] FAI resolution: `indexPath` option → co-located `<path>.fai` → none (single partition)
+    - [x] With FAI: reads contig names via Hadoop FS; one `FastaInputPartition` per contig
+    - [x] No FAI: single partition with `contigName=null`
 
-- [ ] `DataSourceRegister` entry: `com.litebfx.fasta.FastaDataSource`
+- [x] `FastaPartitionReaderFactory.java`, `FastaTable.java`, `FastaDataSource.java` — standard boilerplate
+
+- [x] `DataSourceRegister` entry: `com.litebfx.fasta.FastaDataSource`
 
 ### Tests
 
-- [ ] `core/src/test/java/com/litebfx/fasta/FastaDataSourceTest.java`
-  - [ ] Schema: 3 fields
-  - [ ] Contig count matches `grep -c '^>' ref.fa`
-  - [ ] Each row's `length` matches `.fai` length column
-  - [ ] `sequence` for a known contig matches `samtools faidx ref.fa contigName`
-  - [ ] No-FAI fallback: single partition, all contigs present
+- [x] `core/src/test/java/com/litebfx/fasta/FastaDataSourceTest.java` (uses `realn01.fa` + `realn01.fa.fai` — 1 contig `000000F`, length 686)
+  - [x] Schema: 3 fields, correct names
+  - [x] Contig count with FAI = 1
+  - [x] `length` of `000000F` = 686 (matches `.fai`)
+  - [x] Sequence starts with expected 60-base prefix (matches raw file)
+  - [x] Explicit `indexPath` option resolves correctly
+  - [x] Column pruning: `select("name", "length")` returns 2-column schema with correct values
 
 ---
 
@@ -321,49 +329,54 @@ _All remaining CRAM logic lives in existing `Bam*` classes; `isCram=true` gates 
 
 ### Build
 
-- [ ] No new Maven dependencies — `htsjdk` Tribble includes `BEDCodec` and `AbstractFeatureReader`
+- [x] No new Maven dependencies — `htsjdk` Tribble includes `BEDCodec` and `AbstractFeatureReader`
 
 ### Source files
 
-- [ ] `BedSchema.java`
-  - [ ] Static `StructType SCHEMA` with 12 nullable fields (see schema table in PLAN.md)
-  - [ ] All fields beyond `chromEnd` are nullable
+- [x] `BedSchema.java`
+  - [x] Static `StructType SCHEMA` with 12 nullable fields (see schema table in PLAN.md)
+  - [x] All fields beyond `chromEnd` are nullable
 
-- [ ] `BedInputPartition.java`
-  - [ ] Fields: `path` (String), `startVirtualOffset` (long), `endVirtualOffset` (long), `queryChrom` (String nullable), `queryStart` (long), `queryEnd` (long), `hadoopConf` (SerializableConfiguration)
+- [x] `BedInputPartition.java`
+  - [x] Fields: `path` (String), `startVirtualOffset` (long), `endVirtualOffset` (long), `queryChrom` (String nullable), `queryStart` (long), `queryEnd` (long), `hadoopConf` (SerializableConfiguration)
 
-- [ ] `BedPartitionReader.java`
-  - [ ] Opens `AbstractFeatureReader<BEDFeature, LineIterator>` via `AbstractFeatureReader.getFeatureReader(path, new BEDCodec(), index)`
-  - [ ] If `queryChrom != null`: calls `reader.query(queryChrom, (int)queryStart, (int)queryEnd)`; else `reader.iterator()`
-  - [ ] `get()` maps `BEDFeature` → `InternalRow`:
-    - [ ] `chrom`, `chromStart` (0-based), `chromEnd`, `name` (null if `.`), `score`, `strand`
-    - [ ] `thickStart`, `thickEnd`, `itemRgb`, `blockCount`, `blockSizes`, `blockStarts` (null when not present)
-  - [ ] Column count detected on first record; sets `numColumns` field used to null-fill missing columns
+- [x] `BedPartitionReader.java`
+  - [x] Opens `AbstractFeatureReader<BEDFeature, LineIterator>` via `AbstractFeatureReader.getFeatureReader(path, new BEDCodec(), index)`
+  - [x] If `queryChrom != null`: calls `reader.query(queryChrom, (int)queryStart, (int)queryEnd)`; else `reader.iterator()`
+  - [x] `get()` maps `BEDFeature` → `InternalRow`:
+    - [x] `chrom`, `chromStart` (0-based), `chromEnd`, `name` (null if `.`), `score`, `strand`
+    - [x] `thickStart`, `thickEnd`, `itemRgb`, `blockCount`, `blockSizes`, `blockStarts` (null when not present)
+  - [x] Column count detected on first record; sets `numColumns` field used to null-fill missing columns
 
-- [ ] `BedScanBuilder.java`
-  - [ ] Pushable filters: `chrom = 'X'` (EqualTo), `chromStart >= A` (GreaterThanOrEqual), `chromEnd <= B` (LessThanOrEqual)
-  - [ ] All pushed filters returned as unhandled (Spark post-filters for safety)
+- [x] `BedScanBuilder.java`
+  - [x] Pushable filters: `chrom = 'X'` (EqualTo), `chromStart >= A` (GreaterThanOrEqual), `chromEnd <= B` (LessThanOrEqual)
+  - [x] All pushed filters returned as unhandled (Spark post-filters for safety)
 
-- [ ] `BedScan.java`
-  - [ ] `planInputPartitions()`:
-    - [ ] Tabix resolution: `indexPath` → co-located `.tbi` → co-located `.csi` → single partition
-    - [ ] With tabix + pushed region: `TabixIndex.getBlocks(chrom, start, end)` → one or more partitions with VFO ranges
-    - [ ] No index or no region: single partition `[0, MAX_VALUE]`
+- [x] `BedScan.java`
+  - [x] `planInputPartitions()`:
+    - [x] Tabix resolution: `indexPath` → co-located `.tbi` → co-located `.csi` → single partition
+    - [x] With tabix + pushed region: `TabixIndex.getBlocks(chrom, start, end)` → one or more partitions with VFO ranges
+    - [x] No index or no region: single partition `[0, MAX_VALUE]`
 
-- [ ] `BedPartitionReaderFactory.java`, `BedTable.java`, `BedDataSource.java` — standard boilerplate
+- [x] `BedPartitionReaderFactory.java`, `BedTable.java`, `BedDataSource.java` — standard boilerplate
 
-- [ ] `DataSourceRegister` entry: `com.litebfx.bed.BedDataSource`
+- [x] `DataSourceRegister` entry: `com.litebfx.bed.BedDataSource`
 
 ### Tests
 
-- [ ] `core/src/test/java/com/litebfx/bed/BedDataSourceTest.java`
-  - [ ] Schema: 12 fields, correct types
-  - [ ] Count matches line count of test `.bed` file
-  - [ ] Region query returns expected count (tabix path)
-  - [ ] BED3 file: fields beyond `chromEnd` are all null
-  - [ ] BED12 file: `blockCount`, `blockSizes`, `blockStarts` populated
-  - [ ] No-tabix fallback: single partition, correct count
-  - [ ] Gzipped `.bed.gz` without tabix: single partition
+- [x] `core/src/test/java/com/litebfx/bed/BedTestGenerator.java` — generates deterministic BED3, BED6 (bgzf+tabix), and BED12 fixtures
+- [x] `core/src/test/resources/example.bed.gz` — real-world BED fixture (3432 records, gzipped, no tabix index)
+- [x] `core/src/test/java/com/litebfx/bed/BedDataSourceTest.java`
+  - [x] Schema: 12 fields, correct types
+  - [x] Count of `example.bed.gz` = 3432 (gzipped, no tabix — single partition)
+  - [x] Tabix region query: `chrom = 'chr1'` returns expected count
+  - [x] Tabix region query: `chrom = 'chr1' AND chromStart >= 500` returns expected count
+  - [x] Total count via tabix path matches `BED6_TOTAL`
+  - [x] No-tabix fallback: `useIndex=false` returns all records
+  - [x] BED3 file: fields beyond `chromEnd` are all null
+  - [x] BED12 file: `blockCount`, `blockSizes`, `blockStarts` populated
+  - [x] BED6 field values: first record `chrom`, `chromStart`, `chromEnd`, `name`, `score`, `strand` correct
+  - [x] Column pruning: `select("chrom", "chromStart", "chromEnd")` returns 3-column schema
 
 ---
 

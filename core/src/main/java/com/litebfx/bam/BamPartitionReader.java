@@ -1,5 +1,6 @@
-package com.litebfx;
+package com.litebfx.bam;
 
+import com.litebfx.HadoopSeekableStream;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SAMSequenceRecord;
@@ -7,6 +8,7 @@ import htsjdk.samtools.SamInputResource;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.ValidationStringency;
+import htsjdk.samtools.cram.ref.ReferenceSource;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -17,6 +19,8 @@ import org.apache.spark.sql.catalyst.util.ArrayBasedMapData;
 import org.apache.spark.sql.catalyst.util.GenericArrayData;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.List;
@@ -36,6 +40,8 @@ import java.util.List;
  */
 public class BamPartitionReader implements PartitionReader<InternalRow> {
 
+    private static final Logger log = LoggerFactory.getLogger(BamPartitionReader.class);
+
     private final BamInputPartition partition;
     private final boolean includeAttributes;
 
@@ -46,6 +52,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private SAMRecord current;
 
     public BamPartitionReader(BamInputPartition partition, boolean includeAttributes) {
+        log.trace("BamPartitionReader(path={}, includeAttributes={})", partition.getPath(), includeAttributes);
         this.partition = partition;
         this.includeAttributes = includeAttributes;
     }
@@ -56,17 +63,20 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     @Override
     public boolean next() throws IOException {
+        log.trace("next()");
         if (!opened) {
             open();
             opened = true;
         }
         if (!iterator.hasNext()) return false;
         current = iterator.next();
+        log.trace("next() -> read record readName={}", current.getReadName());
         return true;
     }
 
     @Override
     public InternalRow get() {
+        log.trace("get() readName={}", current.getReadName());
         Object[] values = new Object[12];
         values[0]  = toUTF8(current.getReadName());
         values[1]  = current.getFlags();
@@ -85,6 +95,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     @Override
     public void close() throws IOException {
+        log.trace("close() path={}", partition.getPath());
         try {
             if (iterator != null) iterator.close();
             if (samReader != null) samReader.close();
@@ -98,6 +109,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     // -------------------------------------------------------------------------
 
     private void open() throws IOException {
+        log.trace("open() path={}", partition.getPath());
         long startVFO = partition.getStartVirtualOffset();
         if (startVFO > 0) {
             throw new UnsupportedOperationException(
@@ -109,16 +121,30 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         Path hadoopPath = new Path(partition.getPath());
         FileSystem fs = hadoopPath.getFileSystem(conf);
         long fileLength = fs.getFileStatus(hadoopPath).getLen();
+        log.trace("open() fileLength={}", fileLength);
 
         fsInputStream = fs.open(hadoopPath);
         HadoopSeekableStream seekable = new HadoopSeekableStream(
             fsInputStream, fileLength, partition.getPath());
 
-        samReader = SamReaderFactory.makeDefault()
-            .validationStringency(ValidationStringency.LENIENT)
-            .open(SamInputResource.of(seekable));
+        SamReaderFactory factory = SamReaderFactory.makeDefault()
+            .validationStringency(ValidationStringency.LENIENT);
+
+        if (partition.isCram()) {
+            String referenceFile = partition.getReferenceFile();
+            if (referenceFile != null && !"none".equals(partition.getReferenceMode())) {
+                log.trace("open() CRAM with referenceFile={}", referenceFile);
+                factory = factory.referenceSource(new ReferenceSource(new java.io.File(referenceFile)));
+            } else {
+                log.trace("open() CRAM with no external reference");
+                factory = factory.referenceSource(new ReferenceSource((java.io.File) null));
+            }
+        }
+
+        samReader = factory.open(SamInputResource.of(seekable));
 
         iterator = samReader.iterator();
+        log.trace("open() SamReader opened successfully");
     }
 
     /** Returns a UTF8String for non-null input, or null for null (maps to Spark null). */
