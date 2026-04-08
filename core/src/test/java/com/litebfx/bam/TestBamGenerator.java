@@ -5,6 +5,7 @@ import htsjdk.samtools.*;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Files;
 
 /**
  * Generates deterministic BAM, BAI, and SAM test fixtures using htsjdk.
@@ -48,11 +49,17 @@ public class TestBamGenerator {
         SAMFileHeader header = buildHeader();
         Path bamPath = dir.resolve("test.bam");
         Path samPath = dir.resolve("test.sam");
+        Path baiPath = dir.resolve("test.bam.bai");
 
         writeBam(header, bamPath.toFile());
         writeSam(header, samPath.toFile());
 
-        Path baiPath = dir.resolve("test.bam.bai");
+        // htsjdk may write the index as test.bai instead of test.bam.bai; normalise here.
+        Path altBaiPath = dir.resolve("test.bai");
+        if (!baiPath.toFile().exists() && altBaiPath.toFile().exists()) {
+            Files.move(altBaiPath, baiPath);
+        }
+
         return new Fixtures(bamPath, baiPath, samPath);
     }
 

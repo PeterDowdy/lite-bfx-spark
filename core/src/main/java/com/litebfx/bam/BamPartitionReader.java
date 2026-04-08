@@ -1,6 +1,8 @@
 package com.litebfx.bam;
 
 import com.litebfx.HadoopSeekableStream;
+import htsjdk.samtools.QueryInterval;
+import htsjdk.samtools.SAMFileHeader;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SAMSequenceRecord;
@@ -26,17 +28,22 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * Reads {@link SAMRecord}s from a single BAM/SAM partition and converts them
+ * Reads {@link SAMRecord}s from a single BAM/SAM/CRAM partition and converts them
  * to Spark {@link InternalRow}s matching {@link BamSchema#SCHEMA}.
  *
- * <h3>Partition bounds</h3>
- * The reader always performs a full-file scan via {@code samReader.iterator()}.
- * Region filtering is handled by Spark's post-scan filter pass (all filters are
- * returned as unhandled from {@link BamScanBuilder#pushFilters}).
- *
- * <p>VFO-based seeking (for BAI-split partitions with {@code startVirtualOffset > 0})
- * is deferred — calling such a partition throws {@link UnsupportedOperationException}.
- * End-boundary enforcement via VFO is deferred for the same reason.
+ * <h3>Partition modes</h3>
+ * The mode is determined by fields on {@link BamInputPartition} (checked in order):
+ * <ol>
+ *   <li><b>Unmapped</b>: {@code queryUnmapped=true} → {@code samReader.queryUnmapped()}.
+ *       Reads only unplaced, unmapped reads at the tail of the file.  Requires BAI.</li>
+ *   <li><b>Per-reference VFO</b>: {@code querySequences != null} → builds a
+ *       {@link QueryInterval}{@code []} and calls {@code samReader.query(intervals, false)}.
+ *       htsjdk uses the BAI's virtual file offsets (VFOs) internally to seek directly
+ *       to each reference's data, avoiding a full-file scan.</li>
+ *   <li><b>Region push-down</b>: {@code querySequence != null} + {@code indexPath != null} →
+ *       {@code samReader.query(ref, start, end, false)}.</li>
+ *   <li><b>Full scan</b>: fallback → {@code samReader.iterator()}.</li>
+ * </ol>
  */
 public class BamPartitionReader implements PartitionReader<InternalRow> {
 
@@ -47,6 +54,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private boolean opened = false;
     private FSDataInputStream fsInputStream;
+    private FSDataInputStream baiInputStream;
     private SamReader samReader;
     private SAMRecordIterator iterator;
     private SAMRecord current;
@@ -100,6 +108,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             if (iterator != null) iterator.close();
             if (samReader != null) samReader.close();
         } finally {
+            if (baiInputStream != null) baiInputStream.close();
             if (fsInputStream != null) fsInputStream.close();
         }
     }
@@ -110,12 +119,6 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private void open() throws IOException {
         log.trace("open() path={}", partition.getPath());
-        long startVFO = partition.getStartVirtualOffset();
-        if (startVFO > 0) {
-            throw new UnsupportedOperationException(
-                "VFO-based seeking not yet implemented (startVirtualOffset=" + startVFO + "). " +
-                "BamScan will produce only startVirtualOffset=0 partitions until VFO splitting is wired up.");
-        }
 
         Configuration conf = partition.getHadoopConf();
         Path hadoopPath = new Path(partition.getPath());
@@ -141,10 +144,76 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             }
         }
 
-        samReader = factory.open(SamInputResource.of(seekable));
+        if (partition.isQueryUnmapped()) {
+            // Unplaced unmapped reads — BAI required to locate them in the file.
+            log.trace("open() querying unmapped reads");
+            if (partition.getIndexPath() != null) {
+                HadoopSeekableStream baiSeekable = openBaiStream(conf);
+                samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+            } else {
+                samReader = factory.open(SamInputResource.of(seekable));
+            }
+            iterator = samReader.queryUnmapped();
 
-        iterator = samReader.iterator();
+        } else if (partition.getQuerySequences() != null) {
+            // Per-reference VFO partitioning: htsjdk uses BAI VFO chunks internally.
+            String[] seqs = partition.getQuerySequences();
+            log.trace("open() per-reference VFO query sequences={}", (Object) seqs);
+            if (partition.getIndexPath() != null) {
+                HadoopSeekableStream baiSeekable = openBaiStream(conf);
+                samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+                if (seqs.length == 1) {
+                    iterator = samReader.query(seqs[0], 1, Integer.MAX_VALUE, false);
+                    log.trace("open() single-ref query sequence={}", seqs[0]);
+                } else {
+                    SAMFileHeader header = samReader.getFileHeader();
+                    QueryInterval[] intervals = new QueryInterval[seqs.length];
+                    for (int i = 0; i < seqs.length; i++) {
+                        int refIdx = header.getSequenceIndex(seqs[i]);
+                        intervals[i] = new QueryInterval(refIdx, 1, 0); // 0 = until end of reference
+                    }
+                    intervals = QueryInterval.optimizeIntervals(intervals);
+                    iterator = samReader.query(intervals, false);
+                    log.trace("open() multi-ref query intervals={}", seqs.length);
+                }
+            } else {
+                // No index available; fall back to full-file scan.
+                log.trace("open() querySequences set but no index; falling back to full-file scan");
+                samReader = factory.open(SamInputResource.of(seekable));
+                iterator = samReader.iterator();
+            }
+
+        } else if (partition.getQuerySequence() != null && partition.getIndexPath() != null) {
+            // BAI/CRAI-guided region push-down query.
+            log.trace("open() BAI-guided query sequence={} start={} end={}",
+                    partition.getQuerySequence(), partition.getQueryStart(), partition.getQueryEnd());
+            HadoopSeekableStream baiSeekable = openBaiStream(conf);
+            samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+            iterator = samReader.query(
+                    partition.getQuerySequence(),
+                    partition.getQueryStart(),
+                    partition.getQueryEnd(),
+                    false);
+
+        } else {
+            // Full-file scan (SAM files, BAM without BAI, or useIndex=false).
+            log.trace("open() full-file scan");
+            samReader = factory.open(SamInputResource.of(seekable));
+            iterator = samReader.iterator();
+        }
         log.trace("open() SamReader opened successfully");
+    }
+
+    /**
+     * Opens the BAI/CRAI as a {@link HadoopSeekableStream}.
+     * The returned stream is backed by {@link #baiInputStream} which is closed in {@link #close()}.
+     */
+    private HadoopSeekableStream openBaiStream(Configuration conf) throws IOException {
+        Path baiHadoopPath = new Path(partition.getIndexPath());
+        FileSystem baiFs = baiHadoopPath.getFileSystem(conf);
+        long baiLen = baiFs.getFileStatus(baiHadoopPath).getLen();
+        baiInputStream = baiFs.open(baiHadoopPath);
+        return new HadoopSeekableStream(baiInputStream, baiLen, partition.getIndexPath());
     }
 
     /** Returns a UTF8String for non-null input, or null for null (maps to Spark null). */
