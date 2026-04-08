@@ -127,81 +127,90 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         log.trace("open() fileLength={}", fileLength);
 
         fsInputStream = fs.open(hadoopPath);
-        HadoopSeekableStream seekable = new HadoopSeekableStream(
-            fsInputStream, fileLength, partition.getPath());
+        boolean success = false;
+        try {
+            HadoopSeekableStream seekable = new HadoopSeekableStream(
+                fsInputStream, fileLength, partition.getPath());
 
-        SamReaderFactory factory = SamReaderFactory.makeDefault()
-            .validationStringency(ValidationStringency.LENIENT);
+            SamReaderFactory factory = SamReaderFactory.makeDefault()
+                .validationStringency(ValidationStringency.LENIENT);
 
-        if (partition.isCram()) {
-            String referenceFile = partition.getReferenceFile();
-            if (referenceFile != null && !"none".equals(partition.getReferenceMode())) {
-                log.trace("open() CRAM with referenceFile={}", referenceFile);
-                factory = factory.referenceSource(new ReferenceSource(new java.io.File(referenceFile)));
-            } else {
-                log.trace("open() CRAM with no external reference");
-                factory = factory.referenceSource(new ReferenceSource((java.io.File) null));
-            }
-        }
-
-        if (partition.isQueryUnmapped()) {
-            // Unplaced unmapped reads — BAI required to locate them in the file.
-            log.trace("open() querying unmapped reads");
-            if (partition.getIndexPath() != null) {
-                HadoopSeekableStream baiSeekable = openBaiStream(conf);
-                samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
-            } else {
-                samReader = factory.open(SamInputResource.of(seekable));
-            }
-            iterator = samReader.queryUnmapped();
-
-        } else if (partition.getQuerySequences() != null) {
-            // Per-reference VFO partitioning: htsjdk uses BAI VFO chunks internally.
-            String[] seqs = partition.getQuerySequences();
-            log.trace("open() per-reference VFO query sequences={}", (Object) seqs);
-            if (partition.getIndexPath() != null) {
-                HadoopSeekableStream baiSeekable = openBaiStream(conf);
-                samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
-                if (seqs.length == 1) {
-                    iterator = samReader.query(seqs[0], 1, Integer.MAX_VALUE, false);
-                    log.trace("open() single-ref query sequence={}", seqs[0]);
+            if (partition.isCram()) {
+                String referenceFile = partition.getReferenceFile();
+                if (referenceFile != null && !"none".equals(partition.getReferenceMode())) {
+                    log.trace("open() CRAM with referenceFile={}", referenceFile);
+                    factory = factory.referenceSource(new ReferenceSource(new java.io.File(referenceFile)));
                 } else {
-                    SAMFileHeader header = samReader.getFileHeader();
-                    QueryInterval[] intervals = new QueryInterval[seqs.length];
-                    for (int i = 0; i < seqs.length; i++) {
-                        int refIdx = header.getSequenceIndex(seqs[i]);
-                        intervals[i] = new QueryInterval(refIdx, 1, 0); // 0 = until end of reference
-                    }
-                    intervals = QueryInterval.optimizeIntervals(intervals);
-                    iterator = samReader.query(intervals, false);
-                    log.trace("open() multi-ref query intervals={}", seqs.length);
+                    log.trace("open() CRAM with no external reference");
+                    factory = factory.referenceSource(new ReferenceSource((java.io.File) null));
                 }
+            }
+
+            if (partition.isQueryUnmapped()) {
+                // Unplaced unmapped reads — BAI required to locate them in the file.
+                log.trace("open() querying unmapped reads");
+                if (partition.getIndexPath() != null) {
+                    HadoopSeekableStream baiSeekable = openBaiStream(conf);
+                    samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+                } else {
+                    samReader = factory.open(SamInputResource.of(seekable));
+                }
+                iterator = samReader.queryUnmapped();
+
+            } else if (partition.getQuerySequences() != null) {
+                // Per-reference VFO partitioning: htsjdk uses BAI VFO chunks internally.
+                String[] seqs = partition.getQuerySequences();
+                log.trace("open() per-reference VFO query sequences={}", (Object) seqs);
+                if (partition.getIndexPath() != null) {
+                    HadoopSeekableStream baiSeekable = openBaiStream(conf);
+                    samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+                    if (seqs.length == 1) {
+                        iterator = samReader.query(seqs[0], 1, Integer.MAX_VALUE, false);
+                        log.trace("open() single-ref query sequence={}", seqs[0]);
+                    } else {
+                        SAMFileHeader header = samReader.getFileHeader();
+                        QueryInterval[] intervals = new QueryInterval[seqs.length];
+                        for (int i = 0; i < seqs.length; i++) {
+                            int refIdx = header.getSequenceIndex(seqs[i]);
+                            intervals[i] = new QueryInterval(refIdx, 1, 0); // 0 = until end of reference
+                        }
+                        intervals = QueryInterval.optimizeIntervals(intervals);
+                        iterator = samReader.query(intervals, false);
+                        log.trace("open() multi-ref query intervals={}", seqs.length);
+                    }
+                } else {
+                    // No index available; fall back to full-file scan.
+                    log.trace("open() querySequences set but no index; falling back to full-file scan");
+                    samReader = factory.open(SamInputResource.of(seekable));
+                    iterator = samReader.iterator();
+                }
+
+            } else if (partition.getQuerySequence() != null && partition.getIndexPath() != null) {
+                // BAI/CRAI-guided region push-down query.
+                log.trace("open() BAI-guided query sequence={} start={} end={}",
+                        partition.getQuerySequence(), partition.getQueryStart(), partition.getQueryEnd());
+                HadoopSeekableStream baiSeekable = openBaiStream(conf);
+                samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
+                iterator = samReader.query(
+                        partition.getQuerySequence(),
+                        partition.getQueryStart(),
+                        partition.getQueryEnd(),
+                        false);
+
             } else {
-                // No index available; fall back to full-file scan.
-                log.trace("open() querySequences set but no index; falling back to full-file scan");
+                // Full-file scan (SAM files, BAM without BAI, or useIndex=false).
+                log.trace("open() full-file scan");
                 samReader = factory.open(SamInputResource.of(seekable));
                 iterator = samReader.iterator();
             }
-
-        } else if (partition.getQuerySequence() != null && partition.getIndexPath() != null) {
-            // BAI/CRAI-guided region push-down query.
-            log.trace("open() BAI-guided query sequence={} start={} end={}",
-                    partition.getQuerySequence(), partition.getQueryStart(), partition.getQueryEnd());
-            HadoopSeekableStream baiSeekable = openBaiStream(conf);
-            samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
-            iterator = samReader.query(
-                    partition.getQuerySequence(),
-                    partition.getQueryStart(),
-                    partition.getQueryEnd(),
-                    false);
-
-        } else {
-            // Full-file scan (SAM files, BAM without BAI, or useIndex=false).
-            log.trace("open() full-file scan");
-            samReader = factory.open(SamInputResource.of(seekable));
-            iterator = samReader.iterator();
+            log.trace("open() SamReader opened successfully");
+            success = true;
+        } finally {
+            if (!success) {
+                if (baiInputStream != null) try { baiInputStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAI stream", e); }
+                try { fsInputStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAM stream", e); }
+            }
         }
-        log.trace("open() SamReader opened successfully");
     }
 
     /**

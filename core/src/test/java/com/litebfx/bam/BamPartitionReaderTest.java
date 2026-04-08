@@ -151,19 +151,75 @@ class BamPartitionReaderTest {
     }
 
     // -------------------------------------------------------------------------
-    // Error case
+    // VFO-based per-reference partitioning
     // -------------------------------------------------------------------------
 
+    /**
+     * Verifies that a per-reference partition (querySequences set, no BAI available
+     * in this unit-test context) falls back to a full scan and still reads all records.
+     * With BAI, htsjdk uses the BAI VFOs internally; without BAI, it scans the file.
+     */
     @Test
-    void nonZeroStartOffset_throwsUnsupportedOperationException() {
+    void perRefPartition_singleRef_readsAllRecords() throws IOException {
         BamInputPartition partition = new BamInputPartition(
             fixtures.bam().toUri().toString(),
-            /* startVFO */ 1024L,
-            /* endVFO   */ Long.MAX_VALUE,
-            new Configuration());
+            0L, Long.MAX_VALUE,
+            new Configuration(),
+            /* indexPath */ null,
+            false, null, "none",
+            /* querySequence */ null, 1, Integer.MAX_VALUE,
+            /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
+            /* queryUnmapped  */ false);
 
-        BamPartitionReader reader = new BamPartitionReader(partition, false);
-        assertThrows(UnsupportedOperationException.class, reader::next);
+        List<InternalRow> rows = new ArrayList<>();
+        try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
+            while (reader.next()) rows.add(reader.get());
+        }
+        assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
+            "single-ref partition should return all records for that reference");
+    }
+
+    @Test
+    void perRefPartition_withBaiIndex_readsAllRecords() throws IOException {
+        String baiUri = fixtures.bai().toUri().toString();
+        BamInputPartition partition = new BamInputPartition(
+            fixtures.bam().toUri().toString(),
+            0L, Long.MAX_VALUE,
+            new Configuration(),
+            /* indexPath */ baiUri,
+            false, null, "none",
+            /* querySequence */ null, 1, Integer.MAX_VALUE,
+            /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
+            /* queryUnmapped  */ false);
+
+        List<InternalRow> rows = new ArrayList<>();
+        try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
+            while (reader.next()) rows.add(reader.get());
+        }
+        assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
+            "single-ref BAI-guided partition should return all records for that reference");
+    }
+
+    @Test
+    void unmappedPartition_withBaiIndex_returnsNoRecordsForAllMappedFile() throws IOException {
+        // The synthetic BAM has no unmapped reads; queryUnmapped() should return 0 rows.
+        String baiUri = fixtures.bai().toUri().toString();
+        BamInputPartition partition = new BamInputPartition(
+            fixtures.bam().toUri().toString(),
+            0L, Long.MAX_VALUE,
+            new Configuration(),
+            /* indexPath */ baiUri,
+            false, null, "none",
+            /* querySequence */ null, 1, Integer.MAX_VALUE,
+            /* querySequences */ null,
+            /* queryUnmapped  */ true);
+
+        List<InternalRow> rows = new ArrayList<>();
+        try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
+            while (reader.next()) rows.add(reader.get());
+        }
+        assertEquals(0, rows.size(),
+            "unmapped partition should return 0 records when all reads are mapped");
     }
 
     // -------------------------------------------------------------------------

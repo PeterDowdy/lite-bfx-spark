@@ -152,11 +152,23 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         Path nioPath = toNioPath(pathStr);
 
         if (indexStr != null && chrom != null) {
-            Path nioIndex = toNioPath(indexStr);
-            reader = new VCFFileReader(nioPath, nioIndex, true);
-            iter = reader.query(chrom, partition.getQueryStart(), partition.getQueryEnd());
-            log.trace("open() region query chrom={} start={} end={}",
-                    chrom, partition.getQueryStart(), partition.getQueryEnd());
+            try {
+                Path nioIndex = toNioPath(indexStr);
+                reader = new VCFFileReader(nioPath, nioIndex, true);
+                iter = reader.query(chrom, partition.getQueryStart(), partition.getQueryEnd());
+                log.trace("open() region query chrom={} start={} end={}",
+                        chrom, partition.getQueryStart(), partition.getQueryEnd());
+            } catch (Exception e) {
+                // TabixIndex(File) does not support remote paths (S3A, HDFS, etc.).
+                // Fall back to a full-file scan and let the reader filter in-process.
+                log.warn("Could not open index from {}, falling back to full scan: {}", indexStr, e.getMessage());
+                if (reader != null) {
+                    try { reader.close(); } catch (Exception ex) { log.debug("suppressed exception closing reader", ex); }
+                    reader = null;
+                }
+                reader = new VCFFileReader(nioPath, false);
+                iter = reader.iterator();
+            }
         } else {
             reader = new VCFFileReader(nioPath, false);
             iter = reader.iterator();

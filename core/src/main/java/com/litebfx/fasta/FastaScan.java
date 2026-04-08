@@ -38,11 +38,18 @@ public class FastaScan implements Scan, Batch {
 
     private final CaseInsensitiveStringMap options;
     private final StructType requiredSchema;
+    /** When non-null, only create a partition for the contig whose name matches this value. */
+    private final String pushedName;
 
     FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema) {
-        log.trace("FastaScan(options={})", options);
+        this(options, requiredSchema, null);
+    }
+
+    FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema, String pushedName) {
+        log.trace("FastaScan(options={}, pushedName={})", options, pushedName);
         this.options = options;
         this.requiredSchema = requiredSchema;
+        this.pushedName = pushedName;
     }
 
     @Override
@@ -67,18 +74,32 @@ public class FastaScan implements Scan, Batch {
                 .sessionState().newHadoopConf();
 
         try {
+            int maxMergeGap = FastaInputPartition.DEFAULT_MAX_MERGE_GAP;
+            String maxMergeGapOpt = options.get("maxMergeGap");
+            if (maxMergeGapOpt != null) {
+                maxMergeGap = Integer.parseInt(maxMergeGapOpt);
+                log.trace("planInputPartitions() maxMergeGap={}", maxMergeGap);
+            }
+
             String faiPath = resolveFaiPath(pathStr, hadoopConf);
             if (faiPath != null) {
                 List<String> contigNames = readContigNames(faiPath, hadoopConf);
-                log.trace("planInputPartitions() FAI found, {} contig(s)", contigNames.size());
+                if (pushedName != null) {
+                    contigNames = contigNames.stream()
+                            .filter(pushedName::equals)
+                            .collect(java.util.stream.Collectors.toList());
+                    log.trace("planInputPartitions() name filter applied, {} matching contig(s)", contigNames.size());
+                } else {
+                    log.trace("planInputPartitions() FAI found, {} contig(s)", contigNames.size());
+                }
                 InputPartition[] partitions = new InputPartition[contigNames.size()];
                 for (int i = 0; i < contigNames.size(); i++) {
-                    partitions[i] = new FastaInputPartition(pathStr, contigNames.get(i), hadoopConf);
+                    partitions[i] = new FastaInputPartition(pathStr, contigNames.get(i), faiPath, hadoopConf, maxMergeGap);
                 }
                 return partitions;
             } else {
                 log.trace("planInputPartitions() no FAI found, single full-scan partition");
-                return new InputPartition[]{new FastaInputPartition(pathStr, null, hadoopConf)};
+                return new InputPartition[]{new FastaInputPartition(pathStr, null, null, hadoopConf, maxMergeGap)};
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to plan FASTA input partitions for path: " + pathStr, e);

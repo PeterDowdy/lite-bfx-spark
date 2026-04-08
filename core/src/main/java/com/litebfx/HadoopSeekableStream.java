@@ -36,7 +36,7 @@ public class HadoopSeekableStream extends SeekableStream {
     @Override
     public long position() throws IOException {
         long pos = in.getPos();
-        log.trace("position() -> {}", pos);
+        if (log.isTraceEnabled()) log.trace("position() -> {}", pos);
         return pos;
     }
 
@@ -49,14 +49,14 @@ public class HadoopSeekableStream extends SeekableStream {
     @Override
     public int read() throws IOException {
         int b = in.read();
-        log.trace("read() -> {}", b);
+        if (log.isTraceEnabled()) log.trace("read() -> {}", b);
         return b;
     }
 
     @Override
     public int read(byte[] buffer, int offset, int length) throws IOException {
         int n = in.read(buffer, offset, length);
-        log.trace("read(offset={}, length={}) -> {} bytes", offset, length, n);
+        if (log.isTraceEnabled()) log.trace("read(offset={}, length={}) -> {} bytes", offset, length, n);
         return n;
     }
 
@@ -69,7 +69,7 @@ public class HadoopSeekableStream extends SeekableStream {
     @Override
     public boolean eof() throws IOException {
         boolean atEof = in.getPos() >= length;
-        log.trace("eof() -> {}", atEof);
+        if (log.isTraceEnabled()) log.trace("eof() -> {}", atEof);
         return atEof;
     }
 

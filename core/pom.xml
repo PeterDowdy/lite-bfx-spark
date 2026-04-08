@@ -32,6 +32,77 @@
     </dependency>
   </dependencies>
 
+  <profiles>
+    <profile>
+      <id>s3-integration</id>
+      <properties>
+        <s3.bucket>test-bucket</s3.bucket>
+        <s3.accessKey>minioadmin</s3.accessKey>
+        <s3.secretKey>minioadmin</s3.secretKey>
+      </properties>
+      <!--
+        Run S3 range-access integration tests against MinIO (or real S3).
+
+        Usage:
+          mvn test -Ps3-integration \
+            -Ds3.endpoint=http://localhost:9000 \
+            [-Ds3.bucket=test-bucket] \
+            [-Ds3.accessKey=minioadmin] \
+            [-Ds3.secretKey=minioadmin]
+
+        Via Docker (endpoint reachable at the service name):
+          docker compose run spark-test-s3
+      -->
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-s3-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-s3/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <s3.endpoint>${s3.endpoint}</s3.endpoint>
+                <s3.bucket>${s3.bucket}</s3.bucket>
+                <s3.accessKey>${s3.accessKey}</s3.accessKey>
+                <s3.secretKey>${s3.secretKey}</s3.secretKey>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>hadoop-aws</artifactId>
+          <version>${hadoop.version}</version>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>com.amazonaws</groupId>
+          <artifactId>aws-java-sdk-bundle</artifactId>
+          <version>1.12.367</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+
   <build>
     <plugins>
       <plugin>
@@ -74,6 +145,16 @@
                 </filter>
               </filters>
             </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <executions>
+          <execution>
+            <goals><goal>test-jar</goal></goals>
           </execution>
         </executions>
       </plugin>

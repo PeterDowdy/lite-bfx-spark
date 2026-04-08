@@ -9,21 +9,161 @@
   <version>1.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
+  <name>lite-bfx-spark</name>
+  <description>Native Apache Spark 4.x DataSource V2 readers for BAM, SAM, CRAM, FASTQ, VCF, BCF, FASTA, and BED.</description>
+  <url>https://github.com/PeterDowdy/lite-bfx-spark</url>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>PeterDowdy</id>
+      <name>Peter Dowdy</name>
+      <url>https://github.com/PeterDowdy</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:git://github.com/PeterDowdy/lite-bfx-spark.git</connection>
+    <developerConnection>scm:git:ssh://github.com/PeterDowdy/lite-bfx-spark.git</developerConnection>
+    <url>https://github.com/PeterDowdy/lite-bfx-spark/tree/main</url>
+  </scm>
+
   <modules>
     <module>core</module>
+    <module>scala</module>
   </modules>
 
   <properties>
-    <spark.version>4.0.2</spark.version>
+    <!-- spark.version, hadoop.version, scala.version are set by the active Spark profile below -->
     <scala.binary.version>2.13</scala.binary.version>
-    <hadoop.version>3.3.6</hadoop.version>
     <htsjdk.version>4.3.0</htsjdk.version>
-    <scala.version>2.13.16</scala.version>
     <java.version>17</java.version>
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
+
+  <profiles>
+    <!--
+      Spark 4.0.2 (default)
+        hadoop.version pinned to the version shipped with Spark 4.0.2
+        scala.version  pinned to the Scala runtime bundled with Spark 4.0.2
+
+      Activate explicitly: mvn test -Pspark402
+    -->
+    <profile>
+      <id>spark402</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <properties>
+        <spark.version>4.0.2</spark.version>
+        <hadoop.version>3.4.1</hadoop.version>
+        <scala.version>2.13.16</scala.version>
+      </properties>
+    </profile>
+
+    <!--
+      Spark 4.1.1
+        hadoop.version pinned to the version shipped with Spark 4.1.1
+        scala.version  pinned to the Scala runtime bundled with Spark 4.1.1
+
+      Activate: mvn test -Pspark411
+    -->
+    <profile>
+      <id>spark411</id>
+      <properties>
+        <spark.version>4.1.1</spark.version>
+        <hadoop.version>3.4.2</hadoop.version>
+        <scala.version>2.13.17</scala.version>
+      </properties>
+    </profile>
+
+    <!--
+      Release profile — activated by -Prelease in the publish workflow.
+      Attaches: source JAR, javadoc JAR, GPG signatures.
+      Uploads to Sonatype Central Portal via central-publishing-maven-plugin.
+
+      Required secrets (set in GitHub repository settings):
+        OSSRH_USERNAME  — Central Portal token username
+        OSSRH_TOKEN     — Central Portal token password
+        GPG_PRIVATE_KEY — ASCII-armored GPG private key
+        GPG_PASSPHRASE  — Passphrase for the GPG key
+    -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <!-- Attach sources JAR (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Attach javadoc JAR (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Sign all artifacts with GPG (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <!-- loopback mode reads passphrase from -Dgpg.passphrase in CI -->
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
+          </plugin>
+
+          <!--
+            Upload to Sonatype Central Portal.
+            Credentials supplied via ~/.m2/settings.xml <server id="central">.
+            autoPublish=true releases immediately after validation passes.
+          -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 
   <dependencyManagement>
     <dependencies>
@@ -92,7 +232,75 @@
           <artifactId>maven-shade-plugin</artifactId>
           <version>3.5.2</version>
         </plugin>
+
+        <!--
+          Checkstyle 10.x via plugin 3.3.1.
+          Config lives at .github/checkstyle/checkstyle.xml.
+          Bound to verify phase in <build><plugins> below; inherited by all modules.
+          The scala/ module has no Java source so the check passes silently there.
+        -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-checkstyle-plugin</artifactId>
+          <version>3.3.1</version>
+          <dependencies>
+            <dependency>
+              <groupId>com.puppycrawl.tools</groupId>
+              <artifactId>checkstyle</artifactId>
+              <version>10.17.0</version>
+            </dependency>
+          </dependencies>
+          <configuration>
+            <configLocation>${maven.multiModuleProjectDirectory}/.github/checkstyle/checkstyle.xml</configLocation>
+            <consoleOutput>true</consoleOutput>
+            <failsOnError>true</failsOnError>
+            <includeTestSourceDirectory>false</includeTestSourceDirectory>
+            <sourceDirectories>${project.build.sourceDirectory}</sourceDirectories>
+          </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-source-plugin</artifactId>
+          <version>3.3.0</version>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-javadoc-plugin</artifactId>
+          <version>3.6.3</version>
+          <configuration>
+            <doclint>none</doclint>
+          </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-gpg-plugin</artifactId>
+          <version>3.2.4</version>
+        </plugin>
+
+        <plugin>
+          <groupId>org.sonatype.central</groupId>
+          <artifactId>central-publishing-maven-plugin</artifactId>
+          <version>0.6.0</version>
+        </plugin>
       </plugins>
     </pluginManagement>
+
+    <!-- Bind checkstyle:check to verify for all child modules -->
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-checkstyle-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>checkstyle-verify</id>
+            <phase>verify</phase>
+            <goals><goal>check</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
   </build>
 </project>

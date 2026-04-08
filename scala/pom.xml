@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.litebfx</groupId>
+    <artifactId>lite-bfx-spark-parent</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>lite-bfx-spark-scala_2.13</artifactId>
+
+  <dependencies>
+    <!-- Java core — merged into the fat JAR by maven-shade-plugin -->
+    <dependency>
+      <groupId>com.litebfx</groupId>
+      <artifactId>lite-bfx-spark</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Test dependencies -->
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <version>3.2.18</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Core test-jar: gives access to TestBamGenerator, VcfTestGenerator, etc. -->
+    <dependency>
+      <groupId>com.litebfx</groupId>
+      <artifactId>lite-bfx-spark</artifactId>
+      <version>${project.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <testResources>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+      <!-- Share binary test fixtures (range.bam, realn01.fa, etc.) from core -->
+      <testResource>
+        <directory>../core/src/test/resources</directory>
+      </testResource>
+    </testResources>
+
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+        <version>4.9.2</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>compile</goal>
+              <goal>testCompile</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <scalaVersion>${scala.version}</scalaVersion>
+          <args>
+            <arg>-deprecation</arg>
+            <arg>-feature</arg>
+            <arg>-Xfatal-warnings</arg>
+          </args>
+        </configuration>
+      </plugin>
+
+      <!-- Run ScalaTest suites; surefire finds nothing (no @Test) so no conflict -->
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <version>2.2.0</version>
+        <configuration>
+          <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
+          <junitxml>.</junitxml>
+          <filereports>ScalaTestSuite.txt</filereports>
+          <jvmArgs>
+            <jvmArg>--add-opens=java.base/java.lang=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.lang.invoke=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.lang.reflect=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.io=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.net=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.nio=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.util=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.util.concurrent=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/sun.nio.ch=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/sun.nio.cs=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/sun.security.action=ALL-UNNAMED</jvmArg>
+            <jvmArg>--add-opens=java.base/sun.util.calendar=ALL-UNNAMED</jvmArg>
+          </jvmArgs>
+        </configuration>
+        <executions>
+          <execution>
+            <id>test</id>
+            <goals><goal>test</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        Skip javadoc in this module: source is Scala, not Java.
+        The release profile in the parent would otherwise attempt to run
+        maven-javadoc-plugin over the scala/ source tree and fail.
+        Scaladoc is not currently published as a separate artifact.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <configuration>
+          <skip>true</skip>
+        </configuration>
+      </plugin>
+
+      <!-- Fat JAR: merges lite-bfx-spark (core); excludes Spark/Hadoop/Scala-library -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <artifactSet>
+                <excludes>
+                  <exclude>org.apache.spark:*</exclude>
+                  <exclude>org.apache.hadoop:*</exclude>
+                  <exclude>org.scala-lang:*</exclude>
+                </excludes>
+              </artifactSet>
+              <transformers>
+                <!-- Merge DataSourceRegister SPI entries from core and scala JARs -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

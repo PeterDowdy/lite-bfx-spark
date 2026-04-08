@@ -168,10 +168,14 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
 
         long fileLength = fs.getFileStatus(hadoopPath).getLen();
         fsIn = fs.open(hadoopPath);
-        boolean isBgzip = looksCompressed(path) && isBgzfStream(fsIn);
+        boolean isBgzip;
+        try {
+            isBgzip = looksCompressed(path) && isBgzfStream(fsIn);
+        } finally {
+            fsIn.seek(0); // always reset after detection, even if isBgzfStream throws
+        }
 
         if (isBgzip) {
-            fsIn.seek(0); // reset after header probe
             HadoopSeekableStream seekable = new HadoopSeekableStream(fsIn, fileLength, path);
             bcis = new BlockCompressedInputStream(seekable);
 
@@ -199,8 +203,7 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
             }
             // else: full-file scan from position 0 (default)
         } else if (looksCompressed(path)) {
-            // Regular gzip — seek back to 0 before wrapping
-            fsIn.seek(0);
+            // Regular gzip — position already reset to 0 in the finally above
             plainReader = new BufferedReader(
                     new InputStreamReader(new GZIPInputStream(fsIn), StandardCharsets.UTF_8));
         } else {

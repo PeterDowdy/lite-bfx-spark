@@ -9,18 +9,25 @@ import java.io.Serializable;
 /**
  * Describes a single Spark partition over a BAM/SAM/CRAM file.
  *
- * <p>Virtual file offsets (VFOs) delimit the BGZF chunk range assigned to this
- * partition. For full-file (non-indexed) partitions, {@code startVirtualOffset}
- * is 0 and {@code endVirtualOffset} is {@link Long#MAX_VALUE}.
+ * <p>Virtual file offsets (VFOs) are used indirectly: when a BAI index is available,
+ * {@link BamScan} creates one partition per reference sequence (or group of sequences).
+ * Each partition's reader calls {@code samReader.query()} which has htsjdk use the BAI's
+ * VFO chunks internally for efficient seeking. {@code startVirtualOffset} and
+ * {@code endVirtualOffset} are retained for compatibility but are always 0 / MAX in practice.
+ *
+ * <h3>Partition modes (mutually exclusive, checked in order by {@link BamPartitionReader})</h3>
+ * <ol>
+ *   <li><b>Unmapped</b>: {@code queryUnmapped=true} → {@code samReader.queryUnmapped()}</li>
+ *   <li><b>Per-reference</b>: {@code querySequences != null} → {@code samReader.query(intervals, false)}
+ *       using BAI for VFO-based positioning</li>
+ *   <li><b>Region push-down</b>: {@code querySequence != null} + {@code indexPath != null} →
+ *       {@code samReader.query(ref, start, end, false)}</li>
+ *   <li><b>Full scan</b>: fallback → {@code samReader.iterator()}</li>
+ * </ol>
  *
  * <p>The Hadoop {@link Configuration} is carried per-partition so that executors
  * can reconstruct a {@link org.apache.hadoop.fs.FileSystem} with the correct
  * S3A/ADLS credentials even when they differ from the default Hadoop config.
- *
- * <p>{@code indexPath} records the resolved BAI/CRAI path for the file and will be
- * used by a future VFO-splitting implementation in {@link BamScan}.  The reader
- * does not open the index today — it always performs a full-file scan and relies
- * on Spark's post-scan filter pass for region correctness.
  *
  * <p>CRAM-specific fields: {@code isCram} gates reference-source configuration in
  * {@link BamPartitionReader}. {@code referenceFile} is the path to the FASTA
@@ -33,13 +40,34 @@ public class BamInputPartition implements InputPartition, Serializable {
     private final long startVirtualOffset;
     private final long endVirtualOffset;
     private final SerializableConfiguration hadoopConf;
-    /** Resolved BAI/CRAI path; null when no index is available. Reserved for future VFO splitting. */
+    /** Resolved BAI/CRAI path; null when no index is available. */
     private final String indexPath;
     private final boolean isCram;
     /** Path to FASTA reference file; null when not provided. Used for CRAM only. */
     private final String referenceFile;
     /** Reference resolution mode: "file", "md5", or "none". Used for CRAM only. */
     private final String referenceMode;
+    /**
+     * Reference sequence name for a BAI/CRAI-guided region push-down query; null means
+     * use {@code querySequences} or full scan.  When set, the reader calls
+     * {@code samReader.query(querySequence, queryStart, queryEnd, false)}.
+     */
+    private final String querySequence;
+    private final int queryStart;
+    private final int queryEnd;
+    /**
+     * One or more reference sequence names for VFO-based per-reference partitioning.
+     * When non-null, each element is queried via the BAI index (which uses VFO chunks
+     * internally for seeking). Multiple names are batched into a single
+     * {@code QueryInterval[]} call. Null means fall through to {@code querySequence}
+     * or full scan.
+     */
+    private final String[] querySequences;
+    /**
+     * When true, this partition reads only unplaced unmapped reads via
+     * {@code samReader.queryUnmapped()}. Requires {@code indexPath} to be set.
+     */
+    private final boolean queryUnmapped;
 
     /** Full-file, no-index partition (used by existing tests and SAM files). */
     public BamInputPartition(String path,
@@ -66,6 +94,40 @@ public class BamInputPartition implements InputPartition, Serializable {
                              boolean isCram,
                              String referenceFile,
                              String referenceMode) {
+        this(path, startVirtualOffset, endVirtualOffset, hadoopConf, indexPath,
+             isCram, referenceFile, referenceMode, null, 1, Integer.MAX_VALUE);
+    }
+
+    public BamInputPartition(String path,
+                             long startVirtualOffset,
+                             long endVirtualOffset,
+                             Configuration hadoopConf,
+                             String indexPath,
+                             boolean isCram,
+                             String referenceFile,
+                             String referenceMode,
+                             String querySequence,
+                             int queryStart,
+                             int queryEnd) {
+        this(path, startVirtualOffset, endVirtualOffset, hadoopConf, indexPath,
+             isCram, referenceFile, referenceMode, querySequence, queryStart, queryEnd,
+             null, false);
+    }
+
+    /** Full constructor — includes VFO-splitting fields {@code querySequences} and {@code queryUnmapped}. */
+    public BamInputPartition(String path,
+                             long startVirtualOffset,
+                             long endVirtualOffset,
+                             Configuration hadoopConf,
+                             String indexPath,
+                             boolean isCram,
+                             String referenceFile,
+                             String referenceMode,
+                             String querySequence,
+                             int queryStart,
+                             int queryEnd,
+                             String[] querySequences,
+                             boolean queryUnmapped) {
         this.path = path;
         this.startVirtualOffset = startVirtualOffset;
         this.endVirtualOffset = endVirtualOffset;
@@ -74,6 +136,11 @@ public class BamInputPartition implements InputPartition, Serializable {
         this.isCram = isCram;
         this.referenceFile = referenceFile;
         this.referenceMode = referenceMode;
+        this.querySequence = querySequence;
+        this.queryStart = queryStart;
+        this.queryEnd = queryEnd;
+        this.querySequences = querySequences;
+        this.queryUnmapped = queryUnmapped;
     }
 
     public String getPath() { return path; }
@@ -84,4 +151,11 @@ public class BamInputPartition implements InputPartition, Serializable {
     public boolean isCram() { return isCram; }
     public String getReferenceFile() { return referenceFile; }
     public String getReferenceMode() { return referenceMode; }
+    public String getQuerySequence() { return querySequence; }
+    public int getQueryStart() { return queryStart; }
+    public int getQueryEnd() { return queryEnd; }
+    /** Returns the reference names for per-reference VFO partitioning, or null for other modes. */
+    public String[] getQuerySequences() { return querySequences; }
+    /** Returns true if this partition should read only unplaced unmapped reads. */
+    public boolean isQueryUnmapped() { return queryUnmapped; }
 }

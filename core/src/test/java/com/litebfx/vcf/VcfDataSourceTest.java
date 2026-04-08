@@ -188,6 +188,32 @@ class VcfDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // BCF format
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bcfFile_readWithVcfFormat_correctCountAndSchema() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Dataset<Row> df = spark.read().format("vcf").load(fx.bcf().toString());
+        assertEquals(VcfSchema.SCHEMA, df.schema());
+        assertEquals(VcfTestGenerator.VCF_TOTAL, df.count());
+    }
+
+    @Test
+    void bcfFile_fieldValues_correctForFirstRecord() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Row first = spark.read().format("vcf").load(fx.bcf().toString())
+                .orderBy("chrom", "pos")
+                .first();
+
+        assertEquals("chr1", first.getString(0));  // chrom
+        assertEquals(100,    first.getInt(1));      // pos
+        assertEquals("rs1",  first.getString(2));   // id
+        assertEquals("A",    first.getString(3));   // ref
+        assertEquals("T",    first.getString(4));   // alt
+    }
+
+    // -------------------------------------------------------------------------
     // Column pruning
     // -------------------------------------------------------------------------
 

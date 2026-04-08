@@ -53,13 +53,15 @@ public class VcfTestGenerator {
     public record Fixtures(
         java.net.URI plainVcf,
         java.net.URI bgzVcf,
-        java.net.URI tbiIndex
+        java.net.URI tbiIndex,
+        java.net.URI bcf
     ) {}
 
     public static Fixtures generate(Path tempDir) throws IOException {
         Path plainPath = tempDir.resolve("test.vcf");
         Path bgzPath   = tempDir.resolve("test.vcf.gz");
         Path tbiPath   = tempDir.resolve("test.vcf.gz.tbi");
+        Path bcfPath   = tempDir.resolve("test.bcf");
 
         SAMSequenceDictionary dict = new SAMSequenceDictionary(Arrays.asList(
                 new SAMSequenceRecord("chr1", 248956422),
@@ -81,7 +83,11 @@ public class VcfTestGenerator {
         TabixIndex tbi = IndexFactory.createTabixIndex(bgzPath.toFile(), new VCFCodec(), null);
         tbi.write(tbiPath.toFile());
 
-        return new Fixtures(plainPath.toUri(), bgzPath.toUri(), tbiPath.toUri());
+        // --- BCF ---
+        writeVcf(bcfPath.toFile(), header, dict, variants,
+                VariantContextWriterBuilder.OutputType.BCF);
+
+        return new Fixtures(plainPath.toUri(), bgzPath.toUri(), tbiPath.toUri(), bcfPath.toUri());
     }
 
     // -------------------------------------------------------------------------
@@ -117,12 +123,14 @@ public class VcfTestGenerator {
     private static VariantContext snp(String chrom, int pos, String id,
                                       Allele ref, Allele alt,
                                       int dp, double af) {
+        // QUAL = dp means log10PError = -dp/10 (Phred scale: QUAL = -10 * log10(P_error))
         return new VariantContextBuilder()
                 .chr(chrom)
                 .start(pos)
                 .stop(pos)
                 .alleles(Arrays.asList(ref, alt))
                 .id(id)
+                .log10PError(-dp / 10.0)
                 .attribute("DP", dp)
                 .attribute("AF", af)
                 .genotypes(new GenotypeBuilder(SAMPLE_NAME)

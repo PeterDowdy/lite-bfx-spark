@@ -59,7 +59,7 @@ services:
     volumes: *test-volumes
     working_dir: /workspace
     environment: *maven-opts
-    command: mvn test
+    command: mvn test -Pspark402
 
   # ---------------------------------------------------------------------------
   # spark402: Apache Spark 4.0.2 runtime
@@ -73,7 +73,7 @@ services:
     volumes: *test-volumes
     working_dir: /workspace
     environment: *maven-opts
-    command: mvn test
+    command: mvn test -Pspark402
 
   # ---------------------------------------------------------------------------
   # spark411: Apache Spark 4.1.1 runtime
@@ -87,7 +87,7 @@ services:
     volumes: *test-volumes
     working_dir: /workspace
     environment: *maven-opts
-    command: mvn test
+    command: mvn test -Pspark411
 
   # ---------------------------------------------------------------------------
   # databricks: Databricks Runtime 17.3-LTS, no Unity Catalog
@@ -101,7 +101,7 @@ services:
     volumes: *test-volumes
     working_dir: /workspace
     environment: *maven-opts
-    command: mvn test
+    command: mvn test -Pspark402
 
   # ---------------------------------------------------------------------------
   # databricks-uc: Databricks Runtime 17.3-LTS + Unity Catalog sidecar
@@ -117,7 +117,7 @@ services:
     environment:
       <<: *maven-opts
       UNITY_CATALOG_URI: http://unity-catalog:8080
-    command: mvn test -Puc-integration
+    command: mvn test -Pspark402,uc-integration
     depends_on:
       unity-catalog:
         condition: service_healthy
@@ -136,7 +136,7 @@ services:
     environment:
       <<: *maven-opts
       UNITY_CATALOG_URI: http://unity-catalog:8080
-    command: mvn test -Puc-integration
+    command: mvn test -Pspark402,uc-integration
     depends_on:
       unity-catalog:
         condition: service_healthy
@@ -180,6 +180,33 @@ services:
     command: python3 tests/smoke_serverless.py
 
   # ---------------------------------------------------------------------------
+  # spark-test-s3: run S3 range-access integration tests against MinIO.
+  #
+  # Uploads range.bam/.bai, a synthetic multi-contig FASTA, and a synthetic
+  # CRAM to MinIO, then verifies that BAI/FAI/CRAI-guided reads issue HTTP
+  # Range requests (fewer bytes transferred than a full-file scan).
+  #
+  # MinIO access logs (with Range headers) are visible via:
+  #   docker compose logs minio | grep '"Range"'
+  # ---------------------------------------------------------------------------
+  spark-test-s3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: >-
+      mvn test -Pspark402,s3-integration
+      -Ds3.endpoint=http://minio:9000
+      -Ds3.bucket=test-bucket
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
   # spark-shell: interactive shell for ad-hoc debugging
   # ---------------------------------------------------------------------------
   spark-shell:
@@ -220,7 +247,7 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+    command: server /data --console-address ":9001" --json
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s

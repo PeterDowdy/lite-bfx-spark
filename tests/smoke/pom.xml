@@ -10,10 +10,26 @@
   <packaging>jar</packaging>
 
   <properties>
+    <!-- spark.version is set by the active profile below -->
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
-    <spark.version>4.0.2</spark.version>
   </properties>
+
+  <profiles>
+    <profile>
+      <id>spark402</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <properties>
+        <spark.version>4.0.2</spark.version>
+      </properties>
+    </profile>
+    <profile>
+      <id>spark411</id>
+      <properties>
+        <spark.version>4.1.1</spark.version>
+      </properties>
+    </profile>
+  </profiles>
 
   <dependencies>
     <dependency>

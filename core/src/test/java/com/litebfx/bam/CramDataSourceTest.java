@@ -26,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>Uses a synthetic CRAM file backed by a generated FASTA reference.
  */
-class CramDataSourceTest {
+public class CramDataSourceTest {
 
     static SparkSession spark;
 
@@ -130,7 +130,7 @@ class CramDataSourceTest {
     /**
      * Writes a minimal FASTA reference for chr1 (all 'A' bases) and its .fai index.
      */
-    static Path generateFasta(Path dir) throws IOException {
+    public static Path generateFasta(Path dir) throws IOException {
         Path faPath = dir.resolve("ref.fa");
         try (PrintWriter w = new PrintWriter(faPath.toFile())) {
             w.println(">" + TestBamGenerator.REF_NAME);
@@ -150,7 +150,7 @@ class CramDataSourceTest {
      * Writes a coordinate-sorted CRAM containing the same 10 synthetic records
      * as {@link TestBamGenerator}, backed by the provided FASTA reference.
      */
-    static Path generateCram(Path dir, Path fastaRef) throws IOException {
+    public static Path generateCram(Path dir, Path fastaRef) throws IOException {
         SAMFileHeader header = new SAMFileHeader();
         header.addSequence(new SAMSequenceRecord(TestBamGenerator.REF_NAME, TestBamGenerator.REF_LENGTH));
         header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
