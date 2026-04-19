@@ -89,6 +89,48 @@ public class TestBamGenerator {
         }
     }
 
+    /**
+     * Generates a BAM file with a single record whose read sequence is {@code seqLength}
+     * all-A bases with all-I (Phred 40) quality scores.
+     *
+     * <p>Using uniform bases and quality scores makes the probe heuristic in
+     * {@code findCleanRecordStart} reliable: every continuation block starts with
+     * either packed-A sequence bytes ({@code 0x11111111} ≈ 286 M) or all-I quality
+     * bytes ({@code 0x49494949} ≈ 1.23 B), both exceeding {@code MAX_BAM_RECORD_BODY}
+     * (100 M), so false positives are impossible for these fixtures.
+     *
+     * <p>An 80 000 bp read produces ~120 kB of uncompressed record data → 2 data blocks
+     * + 1 EOF block = 3 BGZF blocks total.  A 200 000 bp read produces ~300 kB →
+     * 4 data blocks + 1 EOF block = 5 BGZF blocks total.
+     */
+    public static java.nio.file.Path generateLargeReadBam(java.nio.file.Path dir, int seqLength)
+            throws IOException {
+        SAMFileHeader header = buildHeader();
+        java.nio.file.Path bamPath = dir.resolve("large_" + seqLength + ".bam");
+        String seq  = "A".repeat(seqLength);
+        String qual = "I".repeat(seqLength);
+
+        SAMRecord r = new SAMRecord(header);
+        r.setReadName("largeread");
+        r.setFlags(0);
+        r.setReferenceIndex(0);
+        r.setAlignmentStart(100);
+        r.setMappingQuality(MAPPING_QUALITY);
+        r.setCigarString(seqLength + "M");
+        r.setReadString(seq);
+        r.setBaseQualityString(qual);
+        r.setMateReferenceIndex(SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX);
+        r.setMateAlignmentStart(0);
+        r.setInferredInsertSize(0);
+
+        try (SAMFileWriter writer = new SAMFileWriterFactory()
+                .setCreateIndex(false)
+                .makeBAMWriter(header, true, bamPath.toFile())) {
+            writer.addAlignment(r);
+        }
+        return bamPath;
+    }
+
     private static SAMRecord[] buildRecords(SAMFileHeader header) {
         SAMRecord[] records = new SAMRecord[RECORD_COUNT];
         for (int i = 0; i < RECORD_COUNT; i++) {

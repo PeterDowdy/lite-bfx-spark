@@ -1,16 +1,23 @@
 package com.litebfx.bam;
 
 import com.litebfx.HadoopSeekableStream;
+import htsjdk.samtools.BAMRecordCodec;
 import htsjdk.samtools.QueryInterval;
 import htsjdk.samtools.SAMFileHeader;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SAMSequenceRecord;
+import htsjdk.samtools.SAMTextHeaderCodec;
 import htsjdk.samtools.SamInputResource;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.ValidationStringency;
 import htsjdk.samtools.cram.ref.ReferenceSource;
+import htsjdk.samtools.util.BinaryCodec;
+import htsjdk.samtools.util.BlockCompressedFilePointerUtil;
+import htsjdk.samtools.util.BlockCompressedInputStream;
+import htsjdk.samtools.util.BlockCompressedStreamConstants;
+import htsjdk.samtools.util.StringLineReader;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -52,12 +59,24 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private final BamInputPartition partition;
     private final boolean includeAttributes;
 
+    /** Minimum plausible BAM record body length in bytes (8 fixed int fields + 2-byte name ".\0"). */
+    private static final int MIN_BAM_RECORD_BODY = 36;
+    /** Maximum plausible BAM record body length used as validity upper bound (100 MB). */
+    private static final int MAX_BAM_RECORD_BODY = 100_000_000;
+    /** BGZF block magic bytes: gzip ID1/ID2, CM=deflate, FLG=extra-field. */
+    private static final byte[] BGZF_MAGIC = {(byte) 0x1f, (byte) 0x8b, 0x08, 0x04};
+
     private boolean opened = false;
     private FSDataInputStream fsInputStream;
     private FSDataInputStream baiInputStream;
     private SamReader samReader;
     private SAMRecordIterator iterator;
     private SAMRecord current;
+
+    // BGZF split mode — non-null only when startVirtualOffset > 0 or endVirtualOffset != MAX_VALUE
+    private BlockCompressedInputStream bcis;
+    private BAMRecordCodec bamRecordCodec;
+    private FSDataInputStream bgzfFsInputStream;
 
     public BamPartitionReader(BamInputPartition partition, boolean includeAttributes) {
         log.trace("BamPartitionReader(path={}, includeAttributes={})", partition.getPath(), includeAttributes);
@@ -76,6 +95,25 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
+
+        // BGZF split mode: use BAMRecordCodec with block-address stop condition.
+        if (bcis != null) {
+            if (bamRecordCodec == null) return false; // empty partition (no clean record start found)
+            long endByte = partition.getEndVirtualOffset();
+            if (endByte != Long.MAX_VALUE) {
+                long blockAddr = BlockCompressedFilePointerUtil.getBlockAddress(bcis.getFilePointer());
+                if (blockAddr >= endByte) {
+                    log.trace("next() BGZF split: reached end boundary blockAddr={} endByte={}", blockAddr, endByte);
+                    return false;
+                }
+            }
+            SAMRecord r = (SAMRecord) bamRecordCodec.decode();
+            if (r == null) return false;
+            current = r;
+            log.trace("next() BGZF split -> readName={}", current.getReadName());
+            return true;
+        }
+
         if (!iterator.hasNext()) return false;
         current = iterator.next();
         log.trace("next() -> read record readName={}", current.getReadName());
@@ -105,9 +143,11 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     public void close() throws IOException {
         log.trace("close() path={}", partition.getPath());
         try {
+            if (bcis != null) bcis.close(); // closes its wrapped HadoopSeekableStream
             if (iterator != null) iterator.close();
             if (samReader != null) samReader.close();
         } finally {
+            if (bgzfFsInputStream != null) bgzfFsInputStream.close();
             if (baiInputStream != null) baiInputStream.close();
             if (fsInputStream != null) fsInputStream.close();
         }
@@ -119,6 +159,16 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private void open() throws IOException {
         log.trace("open() path={}", partition.getPath());
+
+        // BGZF split mode: triggered when the planner set byte-range boundaries.
+        boolean isBgzfSplitMode = partition.getEndVirtualOffset() != Long.MAX_VALUE
+                || partition.getStartVirtualOffset() > 0;
+        if (isBgzfSplitMode) {
+            log.trace("open() BGZF split mode startByte={} endByte={}",
+                    partition.getStartVirtualOffset(), partition.getEndVirtualOffset());
+            openBgzfSplit();
+            return;
+        }
 
         Configuration conf = partition.getHadoopConf();
         Path hadoopPath = new Path(partition.getPath());
@@ -191,11 +241,20 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                         partition.getQuerySequence(), partition.getQueryStart(), partition.getQueryEnd());
                 HadoopSeekableStream baiSeekable = openBaiStream(conf);
                 samReader = factory.open(SamInputResource.of(seekable).index(baiSeekable));
-                iterator = samReader.query(
-                        partition.getQuerySequence(),
-                        partition.getQueryStart(),
-                        partition.getQueryEnd(),
-                        false);
+                // Guard against a pushed reference name that does not exist in this file's header
+                // (e.g. a filter like referenceName = 'NONEXISTENT_CHROM'). htsjdk throws
+                // IllegalArgumentException if the reference index is -1, so return empty iterator.
+                int refIdx = samReader.getFileHeader().getSequenceIndex(partition.getQuerySequence());
+                if (refIdx < 0) {
+                    log.trace("open() reference '{}' not in header — empty partition", partition.getQuerySequence());
+                    iterator = samReader.query(new QueryInterval[0], false);
+                } else {
+                    iterator = samReader.query(
+                            partition.getQuerySequence(),
+                            partition.getQueryStart(),
+                            partition.getQueryEnd(),
+                            false);
+                }
 
             } else {
                 // Full-file scan (SAM files, BAM without BAI, or useIndex=false).
@@ -211,6 +270,166 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                 try { fsInputStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAM stream", e); }
             }
         }
+    }
+
+    /**
+     * Opens the partition in BGZF split mode.
+     *
+     * <p>Reads the BAM header from byte 0 using a temporary stream, then opens a second
+     * stream positioned at the first BGZF block in this partition's byte range whose
+     * decompressed content begins at a clean BAM record boundary. Partitions where no
+     * such block exists are marked empty ({@link #bamRecordCodec} remains null).
+     *
+     * <p>For cross-block records (e.g. PacBio/Nanopore reads > ~65 KB uncompressed),
+     * the record is owned entirely by the partition that holds the block where it starts.
+     * Subsequent partitions skip the tail block(s) by rejecting blocks whose first 4
+     * decompressed bytes do not form a plausible BAM record-body length.
+     */
+    private void openBgzfSplit() throws IOException {
+        Configuration conf = partition.getHadoopConf();
+        Path bamPath = new Path(partition.getPath());
+        FileSystem fs = bamPath.getFileSystem(conf);
+        long fileLength = fs.getFileStatus(bamPath).getLen();
+
+        // ── Step A: parse BAM header from byte 0 to get SAMFileHeader + firstDataVFO ──
+        SAMFileHeader header;
+        long firstDataVFO;
+        FSDataInputStream hdrStream = fs.open(bamPath);
+        try {
+            BlockCompressedInputStream hdrBcis = new BlockCompressedInputStream(
+                    new HadoopSeekableStream(hdrStream, fileLength, partition.getPath()));
+            BinaryCodec bc = new BinaryCodec(hdrBcis);
+
+            byte[] magic = new byte[4];
+            if (hdrBcis.read(magic, 0, 4) < 4) throw new IOException("Truncated BAM magic");
+
+            int lText = bc.readInt();
+            byte[] headerText = new byte[lText];
+            for (int off = 0; off < lText; ) {
+                int r = hdrBcis.read(headerText, off, lText - off);
+                if (r < 0) throw new IOException("Truncated BAM header text");
+                off += r;
+            }
+
+            int nRef = bc.readInt();
+            for (int i = 0; i < nRef; i++) {
+                int lName = bc.readInt();
+                for (long rem = lName + 4; rem > 0; ) {
+                    long sk = hdrBcis.skip(rem);
+                    if (sk <= 0) throw new IOException("Truncated BAM reference section");
+                    rem -= sk;
+                }
+            }
+            firstDataVFO = hdrBcis.getFilePointer();
+            log.trace("openBgzfSplit() firstDataVFO={}", firstDataVFO);
+
+            SAMTextHeaderCodec headerCodec = new SAMTextHeaderCodec();
+            headerCodec.setValidationStringency(ValidationStringency.LENIENT);
+            header = headerCodec.decode(
+                    new StringLineReader(new String(headerText, java.nio.charset.StandardCharsets.US_ASCII)),
+                    partition.getPath());
+            hdrBcis.close();
+        } finally {
+            hdrStream.close();
+        }
+
+        // ── Step B: open data stream, seek to first clean record start in our range ──
+        bgzfFsInputStream = fs.open(bamPath);
+        boolean success = false;
+        try {
+            bcis = new BlockCompressedInputStream(
+                    new HadoopSeekableStream(bgzfFsInputStream, fileLength, partition.getPath()));
+
+            long startVFO;
+            if (partition.getStartVirtualOffset() == 0) {
+                // Partition 0: the header parser already found the first data record.
+                startVFO = firstDataVFO;
+                log.trace("openBgzfSplit() partition 0: startVFO={}", startVFO);
+            } else {
+                long cleanBlockByte = findCleanRecordStart(
+                        bgzfFsInputStream, bcis,
+                        partition.getStartVirtualOffset(),
+                        partition.getEndVirtualOffset());
+                if (cleanBlockByte < 0) {
+                    log.trace("openBgzfSplit() no clean record start found — empty partition");
+                    bamRecordCodec = null;
+                    success = true;
+                    return;
+                }
+                startVFO = BlockCompressedFilePointerUtil.makeFilePointer(cleanBlockByte);
+                log.trace("openBgzfSplit() clean block at byte={} vfo={}", cleanBlockByte, startVFO);
+            }
+
+            bcis.seek(startVFO);
+            bamRecordCodec = new BAMRecordCodec(header);
+            bamRecordCodec.setInputStream(bcis, partition.getPath());
+            success = true;
+        } finally {
+            if (!success) {
+                if (bcis != null) try { bcis.close(); } catch (IOException e) { log.debug("suppressed bcis close", e); }
+                bgzfFsInputStream.close();
+            }
+        }
+    }
+
+    /**
+     * Scans BGZF blocks starting at {@code searchFrom} for the first block whose
+     * decompressed content begins at a clean BAM record boundary (first 4 bytes form a
+     * plausible record-body length). Blocks that start mid-record are skipped.
+     *
+     * @return raw file offset of the qualifying block, or -1 if none found in range
+     */
+    private static long findCleanRecordStart(FSDataInputStream rawStream,
+                                              BlockCompressedInputStream bcis,
+                                              long searchFrom,
+                                              long endByte) throws IOException {
+        long candidate = findNextBgzfBlockStart(rawStream, searchFrom);
+        while (candidate >= 0) {
+            if (endByte != Long.MAX_VALUE && candidate >= endByte) return -1L;
+
+            bcis.seek(BlockCompressedFilePointerUtil.makeFilePointer(candidate));
+            byte[] probe = new byte[4];
+            int n = bcis.read(probe, 0, 4);
+            if (n == 4) {
+                int bodyLen = ((probe[3] & 0xff) << 24) | ((probe[2] & 0xff) << 16)
+                            | ((probe[1] & 0xff) << 8)  |  (probe[0] & 0xff);
+                if (bodyLen >= MIN_BAM_RECORD_BODY && bodyLen <= MAX_BAM_RECORD_BODY) {
+                    return candidate;
+                }
+            }
+            // Block starts mid-record; advance past it to try the next one.
+            candidate = findNextBgzfBlockStart(rawStream, candidate + 1);
+        }
+        return -1L;
+    }
+
+    /**
+     * Scans raw bytes starting at {@code startByte} for the first occurrence of the
+     * BGZF 4-byte magic ({@code 0x1f 0x8b 0x08 0x04}).
+     *
+     * <p>Reads one buffer of {@code MAX_COMPRESSED_BLOCK_SIZE + 4} bytes — sufficient
+     * to always contain the start of the next contiguous BGZF block.
+     *
+     * @return file offset of the first magic match, or -1 if not found
+     */
+    private static long findNextBgzfBlockStart(FSDataInputStream stream, long startByte)
+            throws IOException {
+        stream.seek(startByte);
+        int bufSize = BlockCompressedStreamConstants.MAX_COMPRESSED_BLOCK_SIZE + 4;
+        byte[] buf = new byte[bufSize];
+        int total = 0;
+        while (total < bufSize) {
+            int n = stream.read(buf, total, bufSize - total);
+            if (n < 0) break;
+            total += n;
+        }
+        for (int i = 0; i <= total - 4; i++) {
+            if (buf[i] == BGZF_MAGIC[0] && buf[i + 1] == BGZF_MAGIC[1]
+                    && buf[i + 2] == BGZF_MAGIC[2] && buf[i + 3] == BGZF_MAGIC[3]) {
+                return startByte + i;
+            }
+        }
+        return -1L;
     }
 
     /**

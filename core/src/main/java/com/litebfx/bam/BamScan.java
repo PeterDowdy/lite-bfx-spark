@@ -144,8 +144,12 @@ public class BamScan implements Scan, Batch {
                     // plus one unmapped partition. htsjdk uses BAI VFOs internally.
                     planVfoPartitions(fileUri, filePath, indexPath, hadoopConf,
                             referenceFile, referenceMode, maxPartitions, partitions);
+                } else if (!isCram && !isSam && indexPath == null && pushedReferenceName == null) {
+                    // Unindexed BAM: BGZF block-level splitting into fixed-size chunks.
+                    planBgzfSplitPartitions(fileUri, filePath, hadoopConf,
+                            referenceFile, referenceMode, partitions);
                 } else {
-                    // Region push-down (single partition) or full-file fallback.
+                    // Region push-down (single partition), SAM, or CRAM fallback.
                     String querySequence = (pushedReferenceName != null && indexPath != null)
                             ? pushedReferenceName : null;
                     int queryStart = querySequence != null ? pushedStart : 1;
@@ -208,6 +212,40 @@ public class BamScan implements Scan, Batch {
                 indexPath, false, referenceFile, referenceMode,
                 null, 1, Integer.MAX_VALUE,
                 null, true));
+    }
+
+    /**
+     * Plans fixed-size byte-range partitions for an unindexed BAM file.
+     *
+     * <p>Each executor will seek to its chunk boundary, scan forward for the first BGZF
+     * block whose decompressed content starts at a clean BAM record boundary, and read
+     * records from there until it reaches the next chunk boundary. Chunks that contain
+     * no clean record start produce zero rows (safe — Spark unions all partitions).
+     *
+     * <p>The split size is controlled by the {@code bgzfSplitSize} option (default 128 MB).
+     */
+    private void planBgzfSplitPartitions(String fileUri,
+                                         Path filePath,
+                                         Configuration conf,
+                                         String referenceFile,
+                                         String referenceMode,
+                                         List<BamInputPartition> out) throws IOException {
+        long splitSize = Long.parseLong(options.getOrDefault("bgzfSplitSize", "134217728"));
+        long fileSize = filePath.getFileSystem(conf).getFileStatus(filePath).getLen();
+        int numChunks = (int) Math.max(1, (long) Math.ceil((double) fileSize / splitSize));
+        log.trace("planBgzfSplitPartitions() fileSize={} splitSize={} numChunks={}",
+                fileSize, splitSize, numChunks);
+
+        for (int i = 0; i < numChunks; i++) {
+            long startByte = (long) i * splitSize;
+            long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long)(i + 1) * splitSize;
+            log.trace("planBgzfSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
+            out.add(new BamInputPartition(
+                    fileUri, startByte, endByte, conf,
+                    null, false, referenceFile, referenceMode,
+                    null, 1, Integer.MAX_VALUE,
+                    null, false));
+        }
     }
 
     /**

@@ -96,7 +96,7 @@ class BamDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
-    // No-index fallback
+    // No-index fallback / BGZF split
     // -------------------------------------------------------------------------
 
     @Test
@@ -106,6 +106,32 @@ class BamDataSourceTest {
                 .load(bamPath)
                 .count();
         assertEquals(112L, count);
+    }
+
+    @Test
+    void bgzfSplit_smallSplitSize_correctTotalCount() throws java.io.IOException {
+        // Use the synthetic 10-record BAM (small file) with a 1-byte split size to force
+        // many partitions and exercise the full BGZF block-scanning path.
+        TestBamGenerator.Fixtures fx = TestBamGenerator.generate(tempDir);
+        long count = spark.read().format("bam")
+                .option("useIndex", "false")
+                .option("bgzfSplitSize", "1")
+                .load(fx.bam().toUri().toString())
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+    }
+
+    @Test
+    void bgzfSplit_largeRead_correctTotalCount() throws java.io.IOException {
+        // A single 80 000 bp read spans multiple BGZF blocks.
+        // Splitting at 1 byte forces many partitions; only one should yield the record.
+        java.nio.file.Path largeBam = TestBamGenerator.generateLargeReadBam(tempDir, 80_000);
+        long count = spark.read().format("bam")
+                .option("useIndex", "false")
+                .option("bgzfSplitSize", "1")
+                .load(largeBam.toUri().toString())
+                .count();
+        assertEquals(1L, count);
     }
 
     // -------------------------------------------------------------------------
