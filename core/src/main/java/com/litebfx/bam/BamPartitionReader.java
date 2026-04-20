@@ -266,8 +266,12 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             success = true;
         } finally {
             if (!success) {
-                if (baiInputStream != null) try { baiInputStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAI stream", e); }
-                try { fsInputStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAM stream", e); }
+                if (baiInputStream != null) try { baiInputStream.close(); } catch (IOException e) {
+                    log.debug("suppressed exception closing BAI stream", e);
+                }
+                try { fsInputStream.close(); } catch (IOException e) {
+                    log.debug("suppressed exception closing BAM stream", e);
+                }
             }
         }
     }

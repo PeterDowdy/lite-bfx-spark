@@ -282,8 +282,12 @@ public class BamScan implements Scan, Batch {
             return refs;
         } finally {
             // SamReader.close() closes the seekable wrappers, but close underlying streams too.
-            if (bamStream != null) try { bamStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAM stream", e); }
-            if (baiStream != null) try { baiStream.close(); } catch (IOException e) { log.debug("suppressed exception closing BAI stream", e); }
+            if (bamStream != null) try { bamStream.close(); } catch (IOException e) {
+                log.debug("suppressed exception closing BAM stream", e);
+            }
+            if (baiStream != null) try { baiStream.close(); } catch (IOException e) {
+                log.debug("suppressed exception closing BAI stream", e);
+            }
         }
     }
 
