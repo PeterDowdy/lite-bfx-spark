@@ -4,6 +4,7 @@ import com.litebfx.HadoopSeekableStream;
 import htsjdk.samtools.BAMRecordCodec;
 import htsjdk.samtools.QueryInterval;
 import htsjdk.samtools.SAMFileHeader;
+import htsjdk.samtools.SAMLineParser;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMRecordIterator;
 import htsjdk.samtools.SAMSequenceRecord;
@@ -78,6 +79,11 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private BAMRecordCodec bamRecordCodec;
     private FSDataInputStream bgzfFsInputStream;
 
+    // SAM line-split mode — active when partition.isSamSplit()
+    private boolean isSamSplitMode = false;
+    private SAMLineParser samLineParser;  // null → empty partition
+    private long samEndByte;
+
     public BamPartitionReader(BamInputPartition partition, boolean includeAttributes) {
         log.trace("BamPartitionReader(path={}, includeAttributes={})", partition.getPath(), includeAttributes);
         this.partition = partition;
@@ -94,6 +100,21 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         if (!opened) {
             open();
             opened = true;
+        }
+
+        // SAM line-split mode: read one text line per record, stop at endByte.
+        if (isSamSplitMode) {
+            if (samLineParser == null) return false; // empty partition
+            while (true) {
+                long lineStart = fsInputStream.getPos();
+                if (samEndByte != Long.MAX_VALUE && lineStart >= samEndByte) return false;
+                String line = readSamLine();
+                if (line == null) return false; // EOF
+                if (line.isEmpty() || line.startsWith("@")) continue; // header or blank
+                current = samLineParser.parseLine(line);
+                log.trace("next() SAM split -> readName={}", current.getReadName());
+                return true;
+            }
         }
 
         // BGZF split mode: use BAMRecordCodec with block-address stop condition.
@@ -163,6 +184,14 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private void open() throws IOException {
         log.trace("open() path={}", partition.getPath());
+
+        // SAM line-split mode: must be checked before BGZF detection because both use startByte/endByte.
+        if (partition.isSamSplit()) {
+            log.trace("open() SAM line-split mode startByte={} endByte={}",
+                    partition.getStartByte(), partition.getEndByte());
+            openSamSplit();
+            return;
+        }
 
         // BGZF split mode: triggered when the planner set byte-range boundaries.
         boolean isBgzfSplitMode = partition.getEndByte() != Long.MAX_VALUE
@@ -382,6 +411,137 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                 }
             }
         }
+    }
+
+    /**
+     * Opens the partition in SAM line-split mode.
+     *
+     * <p>Reads the SAM header from byte 0 using a temporary stream (to obtain the
+     * {@link SAMFileHeader} needed by {@link SAMLineParser}), then opens a second stream
+     * positioned at the first data line within this partition's byte range.
+     *
+     * <ul>
+     *   <li>Partition 0 ({@code startByte == 0}): seeks to {@code dataStartByte}, the byte
+     *       immediately after the last {@code @}-prefixed header line.</li>
+     *   <li>Partitions &gt; 0: seeks to {@code startByte}, discards bytes up to and including
+     *       the next {@code \n} (we may have landed mid-line), then begins reading.</li>
+     * </ul>
+     *
+     * <p>If the resulting position is at or past {@code endByte}, the partition is marked empty
+     * ({@link #samLineParser} remains null) and {@link #next()} returns false immediately.
+     */
+    private void openSamSplit() throws IOException {
+        isSamSplitMode = true;
+        samEndByte = partition.getEndByte();
+
+        Configuration conf = partition.getHadoopConf();
+        Path samPath = new Path(partition.getPath());
+        FileSystem fs = samPath.getFileSystem(conf);
+
+        // ── Step A: parse SAM header from byte 0 ──
+        SAMFileHeader header;
+        long dataStartByte;
+        FSDataInputStream hdrStream = fs.open(samPath);
+        try {
+            StringBuilder headerText = new StringBuilder();
+            long lineEndPos = 0;
+            while (true) {
+                long lineStartPos = hdrStream.getPos();
+                String line = readLineFrom(hdrStream);
+                if (line == null) {
+                    // File is entirely header (or empty) — data starts at EOF.
+                    dataStartByte = lineEndPos;
+                    break;
+                }
+                if (line.startsWith("@")) {
+                    headerText.append(line).append('\n');
+                    lineEndPos = hdrStream.getPos();
+                } else {
+                    // First non-header line: data starts at lineStartPos.
+                    dataStartByte = lineStartPos;
+                    break;
+                }
+            }
+            SAMTextHeaderCodec headerCodec = new SAMTextHeaderCodec();
+            headerCodec.setValidationStringency(ValidationStringency.LENIENT);
+            header = headerCodec.decode(
+                    new StringLineReader(headerText.toString()), partition.getPath());
+            log.trace("openSamSplit() header parsed, dataStartByte={}", dataStartByte);
+        } finally {
+            hdrStream.close();
+        }
+
+        // ── Step B: open data stream and seek to our start position ──
+        long fileLength = fs.getFileStatus(samPath).getLen();
+
+        // Guard: startByte past EOF → empty partition (avoid seek-after-EOF exception).
+        if (partition.getStartByte() > 0 && partition.getStartByte() >= fileLength) {
+            log.trace("openSamSplit() startByte={} >= fileLength={} — empty partition",
+                    partition.getStartByte(), fileLength);
+            return; // samLineParser stays null
+        }
+
+        fsInputStream = fs.open(samPath);
+        boolean success = false;
+        try {
+            if (partition.getStartByte() == 0) {
+                // Partition 0: skip over the header to the first data line.
+                fsInputStream.seek(dataStartByte);
+            } else {
+                // Partitions > 0: peek at the byte immediately before startByte.
+                // If it is '\n', startByte falls exactly on a line boundary and no
+                // skipping is needed.  Otherwise we landed mid-line and must discard
+                // through the next '\n'.
+                fsInputStream.seek(partition.getStartByte() - 1);
+                int prev = fsInputStream.read(); // advances position to startByte
+                if (prev != '\n') {
+                    int b;
+                    while ((b = fsInputStream.read()) != -1 && b != '\n') { /* discard partial line */ }
+                }
+            }
+
+            long pos = fsInputStream.getPos();
+            if (samEndByte != Long.MAX_VALUE && pos >= samEndByte) {
+                log.trace("openSamSplit() position {} already at or past endByte {} — empty partition",
+                        pos, samEndByte);
+                // samLineParser stays null → empty partition
+                success = true;
+                return;
+            }
+
+            samLineParser = new SAMLineParser(header);
+            log.trace("openSamSplit() ready at position={}", pos);
+            success = true;
+        } finally {
+            if (!success && fsInputStream != null) fsInputStream.close();
+        }
+    }
+
+    /**
+     * Reads one line byte-by-byte from the given stream, returning the line content
+     * without the trailing {@code \n} (or {@code \r\n}). Returns null at EOF when
+     * no bytes were read.
+     *
+     * <p>Byte-by-byte reading ensures {@link FSDataInputStream#getPos()} accurately
+     * reflects the start of each line before the call — no buffering layer obscures
+     * the position.
+     */
+    private static String readLineFrom(FSDataInputStream stream) throws IOException {
+        StringBuilder sb = new StringBuilder(256);
+        int b;
+        while ((b = stream.read()) != -1) {
+            if (b == '\n') return sb.toString();
+            if (b != '\r') sb.append((char) b);
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /**
+     * Reads one SAM data line from {@link #fsInputStream}.
+     * Delegates to {@link #readLineFrom(FSDataInputStream)} using the partition's data stream.
+     */
+    private String readSamLine() throws IOException {
+        return readLineFrom(fsInputStream);
     }
 
     /**

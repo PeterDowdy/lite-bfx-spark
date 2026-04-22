@@ -75,7 +75,7 @@ When a region filter is active, the scan produces a single partition with a BAI-
 
 ## Reading SAM files
 
-SAM files are detected automatically from the `@HD` / `@SQ` header magic. Because SAM is plain text with no BGZF framing, no index is possible and reads always use a single full-file partition.
+SAM files are detected automatically from the `@HD` / `@SQ` header magic. Because SAM is plain text with no BGZF framing, no index is possible. SAM files are split into fixed-size byte-range partitions: each executor seeks to its chunk boundary, discards bytes up to the next newline to land on a clean line start, and reads records until the next line would begin at or past its chunk end. Chunks that contain no data lines produce zero rows. The split size is controlled by the `samSplitSize` option (default 128 MB).
 
 ```python
 df = spark.read.format("bam").load("/data/sample.sam")
@@ -132,7 +132,7 @@ df = spark.read.format("bam") \
 df = spark.read.format("bam").load("s3a://bucket/cohort/*.bam")
 ```
 
-Index resolution runs per-file. If some files have a BAI and others do not, files with a BAI get VFO-split partitions and files without get single-partition full scans.
+Index resolution runs per-file. If some files have a BAI and others do not, files with a BAI get VFO-split partitions and files without get BGZF-split partitions.
 
 ---
 
@@ -142,7 +142,9 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 |---|---|---|
 | `indexPath` | — | Explicit BAI (BAM) or CRAI (CRAM) path. Applies to single-file reads only; ignored for directories and globs. |
 | `indexDir` | — | Directory containing index files. Resolved as `<indexDir>/<filename>.bai` or `<indexDir>/<filename>.cram.crai` per data file. |
-| `numPartitions` | `200` | Maximum partitions per file when VFO-based splitting is active. References are grouped into `min(numPartitions, numRefs)` partitions, plus one unmapped partition. Has no effect when a region filter is pushed or when no index is found. |
+| `numPartitions` | `200` | Maximum partitions per file when VFO-based splitting is active. References are grouped into `min(numPartitions, numRefs)` partitions, plus one unmapped partition. Has no effect when a region filter is pushed. Unindexed BAM files use `bgzfSplitSize` instead. |
+| `bgzfSplitSize` | `134217728` (128 MB) | Byte size of each BGZF-split partition for unindexed BAM files. Has no effect when a BAI index is found or when `useIndex` is false. |
+| `samSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for SAM files. Has no effect for BAM or CRAM. |
 | `useIndex` | `true` | Set `false` to skip index resolution and force a single full-scan partition. |
 | `referenceFile` | — | CRAM only. Path to FASTA reference (`.fai` must be co-located). |
 | `referenceMode` | `"file"` / `"none"` | CRAM only. Controls how the CRAM decoder resolves reference sequences. |
@@ -155,8 +157,9 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 |---|---|
 | BAM + BAI, no region filter | `min(numPartitions, numRefs)` per-reference partitions + 1 unmapped partition |
 | BAM + BAI + region filter | 1 partition (BAI-guided region query) |
-| BAM, no BAI | 1 partition (full scan) |
-| SAM (any) | 1 partition (full scan) |
+| BAM, no BAI | `ceil(fileSize / bgzfSplitSize)` BGZF-split partitions (default split: 128 MB) |
+| SAM, no region filter | `ceil(fileSize / samSplitSize)` line-split partitions (default split: 128 MB) |
+| SAM + region filter | 1 partition (full scan) |
 | CRAM + CRAI, no region filter | 1 partition per CRAI entry |
 | CRAM + CRAI + region filter | 1 partition (CRAI-guided region query) |
 | CRAM, no CRAI | 1 partition (full scan) |
@@ -168,7 +171,7 @@ For each file in the read:
 1. `indexPath` option (single-file reads only)
 2. `indexDir/<filename>.bai`
 3. Co-located `<bamPath>.bai`
-4. No index found → single partition
+4. No index found → BGZF block-level splitting (see partition planning table)
 
 ### CRAI index resolution order
 

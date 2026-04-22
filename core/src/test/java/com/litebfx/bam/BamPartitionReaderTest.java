@@ -171,7 +171,8 @@ class BamPartitionReaderTest {
             false, null, "none",
             /* querySequence */ null, 1, Integer.MAX_VALUE,
             /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
-            /* queryUnmapped  */ false);
+            /* queryUnmapped  */ false,
+            /* samSplit       */ false);
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -192,7 +193,8 @@ class BamPartitionReaderTest {
             false, null, "none",
             /* querySequence */ null, 1, Integer.MAX_VALUE,
             /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
-            /* queryUnmapped  */ false);
+            /* queryUnmapped  */ false,
+            /* samSplit       */ false);
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -214,7 +216,8 @@ class BamPartitionReaderTest {
             false, null, "none",
             /* querySequence */ null, 1, Integer.MAX_VALUE,
             /* querySequences */ null,
-            /* queryUnmapped  */ true);
+            /* queryUnmapped  */ true,
+            /* samSplit       */ false);
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -326,6 +329,88 @@ class BamPartitionReaderTest {
     }
 
     // -------------------------------------------------------------------------
+    // SAM line-split mode
+    // -------------------------------------------------------------------------
+
+    @Test
+    void samSplit_singleChunk_matchesFullScan() throws IOException {
+        List<InternalRow> rows = readSamPartition(fixtures.sam(), 0L, Long.MAX_VALUE);
+        assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
+            "single SAM chunk (0 → MAX) should return all records");
+    }
+
+    /**
+     * Three roughly equal byte-range partitions over the generated SAM file
+     * (boundaries at ~33 % and ~66 % of file size).
+     *
+     * <p>Each worker must return at least one record, proving that lines are
+     * distributed across all three partitions and no records are lost or duplicated.
+     */
+    @Test
+    void samSplit_threeWorkers_eachGetsMultipleRecords() throws IOException {
+        long fileSize = Files.size(fixtures.sam());
+        long split1 = fileSize / 3;
+        long split2 = (fileSize / 3) * 2;
+
+        List<InternalRow> chunk0 = readSamPartition(fixtures.sam(), 0L,     split1);
+        List<InternalRow> chunk1 = readSamPartition(fixtures.sam(), split1, split2);
+        List<InternalRow> chunk2 = readSamPartition(fixtures.sam(), split2, Long.MAX_VALUE);
+
+        int total = chunk0.size() + chunk1.size() + chunk2.size();
+        assertEquals(TestBamGenerator.RECORD_COUNT, total,
+            "union of 3 SAM chunks must yield exactly " + TestBamGenerator.RECORD_COUNT + " records");
+        assertTrue(chunk0.size() > 0, "chunk0 (0 → 33%) should contain at least one record");
+        assertTrue(chunk1.size() > 0, "chunk1 (33% → 66%) should contain at least one record");
+        assertTrue(chunk2.size() > 0, "chunk2 (66% → EOF) should contain at least one record");
+
+        // No duplicates: all read names across all chunks are distinct.
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (List<InternalRow> chunk : java.util.List.of(chunk0, chunk1, chunk2)) {
+            for (InternalRow row : chunk) {
+                assertTrue(names.add(row.getUTF8String(0).toString()),
+                    "duplicate readName detected — record counted twice");
+            }
+        }
+    }
+
+    /**
+     * Splits the SAM into 1-byte chunks (one per byte of the file) and unions all
+     * partitions. The total record count must equal the full-scan count, and every
+     * expected read name must appear exactly once.
+     */
+    @Test
+    void samSplit_multipleChunks_noLossNoDuplication() throws IOException {
+        long fileSize = Files.size(fixtures.sam());
+        long splitSize = 1L;
+        int numChunks = (int) Math.ceil((double) fileSize / splitSize);
+
+        List<InternalRow> all = new ArrayList<>();
+        for (int i = 0; i < numChunks; i++) {
+            long start = (long) i * splitSize;
+            long end   = (i == numChunks - 1) ? Long.MAX_VALUE : (long) (i + 1) * splitSize;
+            all.addAll(readSamPartition(fixtures.sam(), start, end));
+        }
+
+        assertEquals(TestBamGenerator.RECORD_COUNT, all.size(),
+            "union of 1-byte SAM chunks must yield exactly " + TestBamGenerator.RECORD_COUNT + " records");
+
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (InternalRow row : all) {
+            assertTrue(names.add(row.getUTF8String(0).toString()),
+                "duplicate readName detected — record counted twice");
+        }
+        assertEquals(TestBamGenerator.RECORD_COUNT, names.size(),
+            "all expected read names must be present");
+    }
+
+    @Test
+    void samSplit_chunkPastEndOfFile_isEmpty() throws IOException {
+        long fileSize = Files.size(fixtures.sam());
+        List<InternalRow> rows = readSamPartition(fixtures.sam(), fileSize + 1, Long.MAX_VALUE);
+        assertEquals(0, rows.size(), "partition starting past EOF should be empty");
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
@@ -367,6 +452,24 @@ class BamPartitionReaderTest {
             throws IOException {
         BamInputPartition partition = new BamInputPartition(
             bamPath.toUri().toString(), startByte, endByte, new Configuration());
+        List<InternalRow> rows = new ArrayList<>();
+        try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
+            while (reader.next()) rows.add(reader.get());
+        }
+        return rows;
+    }
+
+    /**
+     * Opens a SAM line-split partition for the given path and byte range, and collects all rows.
+     * Setting {@code endByte = Long.MAX_VALUE} makes this an open-ended partition that runs to EOF.
+     */
+    private static List<InternalRow> readSamPartition(Path samPath, long startByte, long endByte)
+            throws IOException {
+        BamInputPartition partition = new BamInputPartition(
+            samPath.toUri().toString(), startByte, endByte, new Configuration(),
+            null, false, null, "none",
+            null, 1, Integer.MAX_VALUE,
+            null, false, /* samSplit */ true);
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
             while (reader.next()) rows.add(reader.get());

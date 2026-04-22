@@ -18,6 +18,11 @@ import java.io.Serializable;
  *
  * <h3>Partition modes (mutually exclusive, checked in order by {@link BamPartitionReader})</h3>
  * <ol>
+ *   <li><b>SAM line-split</b>: {@code samSplit=true} → seeks to {@code startByte}, scans forward
+ *       for the first non-header line, reads one line per record until {@code endByte}.</li>
+ *   <li><b>BGZF split</b>: {@code startByte > 0} or {@code endByte != MAX_VALUE} (and not samSplit)
+ *       → seeks to the first clean BGZF block boundary in the byte range and uses
+ *       {@link htsjdk.samtools.BAMRecordCodec} directly.</li>
  *   <li><b>Unmapped</b>: {@code queryUnmapped=true} → {@code samReader.queryUnmapped()}</li>
  *   <li><b>Per-reference</b>: {@code querySequences != null} → {@code samReader.query(intervals, false)}
  *       using BAI for VFO-based positioning</li>
@@ -69,6 +74,14 @@ public class BamInputPartition implements InputPartition, Serializable {
      * {@code samReader.queryUnmapped()}. Requires {@code indexPath} to be set.
      */
     private final boolean queryUnmapped;
+    /**
+     * When true, this partition uses SAM line-based splitting: the reader seeks to
+     * {@code startByte}, discards bytes up to the next newline (landing on a clean
+     * line boundary), then reads SAM text lines until the line-start position reaches
+     * {@code endByte}. Distinct from BGZF split mode, which also uses
+     * {@code startByte}/{@code endByte} but operates on compressed BAM blocks.
+     */
+    private final boolean samSplit;
 
     /** Full-file, no-index partition (used by existing tests and SAM files). */
     public BamInputPartition(String path,
@@ -112,10 +125,11 @@ public class BamInputPartition implements InputPartition, Serializable {
                              int queryEnd) {
         this(path, startVirtualOffset, endVirtualOffset, hadoopConf, indexPath,
              isCram, referenceFile, referenceMode, querySequence, queryStart, queryEnd,
-             null, false);
+             null, false, false);
     }
 
-    /** Full constructor — includes VFO-splitting fields {@code querySequences} and {@code queryUnmapped}. */
+    /** Full constructor — includes VFO-splitting fields {@code querySequences}, {@code queryUnmapped},
+     *  and {@code samSplit}. */
     public BamInputPartition(String path,
                              long startVirtualOffset,
                              long endVirtualOffset,
@@ -128,7 +142,8 @@ public class BamInputPartition implements InputPartition, Serializable {
                              int queryStart,
                              int queryEnd,
                              String[] querySequences,
-                             boolean queryUnmapped) {
+                             boolean queryUnmapped,
+                             boolean samSplit) {
         this.path = path;
         this.startByte = startVirtualOffset;
         this.endByte = endVirtualOffset;
@@ -142,6 +157,7 @@ public class BamInputPartition implements InputPartition, Serializable {
         this.queryEnd = queryEnd;
         this.querySequences = querySequences;
         this.queryUnmapped = queryUnmapped;
+        this.samSplit = samSplit;
     }
 
     public String getPath() { return path; }
@@ -159,4 +175,6 @@ public class BamInputPartition implements InputPartition, Serializable {
     public String[] getQuerySequences() { return querySequences; }
     /** Returns true if this partition should read only unplaced unmapped reads. */
     public boolean isQueryUnmapped() { return queryUnmapped; }
+    /** Returns true if this partition uses SAM line-based splitting. */
+    public boolean isSamSplit() { return samSplit; }
 }

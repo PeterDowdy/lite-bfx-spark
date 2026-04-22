@@ -148,6 +148,9 @@ public class BamScan implements Scan, Batch {
                     // Unindexed BAM: BGZF block-level splitting into fixed-size chunks.
                     planBgzfSplitPartitions(fileUri, filePath, hadoopConf,
                             referenceFile, referenceMode, partitions);
+                } else if (isSam && pushedReferenceName == null) {
+                    // SAM: plain-text line-based splitting into fixed-size chunks.
+                    planSamSplitPartitions(fileUri, filePath, hadoopConf, partitions);
                 } else {
                     // Region push-down (single partition), SAM, or CRAM fallback.
                     String querySequence = (pushedReferenceName != null && indexPath != null)
@@ -202,7 +205,7 @@ public class BamScan implements Scan, Batch {
                     fileUri, 0L, Long.MAX_VALUE, conf,
                     indexPath, false, referenceFile, referenceMode,
                     null, 1, Integer.MAX_VALUE,
-                    seqs, false));
+                    seqs, false, false));
         }
 
         // Unmapped partition: reads unplaced unmapped reads via samReader.queryUnmapped().
@@ -211,7 +214,7 @@ public class BamScan implements Scan, Batch {
                 fileUri, 0L, Long.MAX_VALUE, conf,
                 indexPath, false, referenceFile, referenceMode,
                 null, 1, Integer.MAX_VALUE,
-                null, true));
+                null, true, false));
     }
 
     /**
@@ -248,7 +251,44 @@ public class BamScan implements Scan, Batch {
                     fileUri, startByte, endByte, conf,
                     null, false, referenceFile, referenceMode,
                     null, 1, Integer.MAX_VALUE,
-                    null, false));
+                    null, false, false));
+        }
+    }
+
+    /**
+     * Plans fixed-size byte-range partitions for a SAM file.
+     *
+     * <p>SAM is plain text with no BGZF framing, so blocks cannot be located by magic bytes.
+     * Instead each executor seeks to its chunk boundary, discards bytes up to the next newline
+     * to land on a clean line start, and reads SAM text lines (parsed via
+     * {@link htsjdk.samtools.SAMLineParser}) until the next line would begin at or past
+     * {@code endByte}. Chunks that contain no data lines produce zero rows.
+     *
+     * <p>The split size is controlled by the {@code samSplitSize} option (default 128 MB).
+     */
+    private void planSamSplitPartitions(String fileUri,
+                                        Path filePath,
+                                        Configuration conf,
+                                        List<BamInputPartition> out) throws IOException {
+        long splitSize = Long.parseLong(options.getOrDefault("samSplitSize", "134217728"));
+        if (splitSize <= 0) {
+            throw new IllegalArgumentException(
+                    "samSplitSize must be a positive integer, got: " + splitSize);
+        }
+        long fileSize = filePath.getFileSystem(conf).getFileStatus(filePath).getLen();
+        int numChunks = (int) Math.max(1, (long) Math.ceil((double) fileSize / splitSize));
+        log.trace("planSamSplitPartitions() fileSize={} splitSize={} numChunks={}",
+                fileSize, splitSize, numChunks);
+
+        for (int i = 0; i < numChunks; i++) {
+            long startByte = (long) i * splitSize;
+            long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long) (i + 1) * splitSize;
+            log.trace("planSamSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
+            out.add(new BamInputPartition(
+                    fileUri, startByte, endByte, conf,
+                    null, false, null, "none",
+                    null, 1, Integer.MAX_VALUE,
+                    null, false, true));
         }
     }
 
