@@ -99,7 +99,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         // BGZF split mode: use BAMRecordCodec with block-address stop condition.
         if (bcis != null) {
             if (bamRecordCodec == null) return false; // empty partition (no clean record start found)
-            long endByte = partition.getEndVirtualOffset();
+            long endByte = partition.getEndByte();
             if (endByte != Long.MAX_VALUE) {
                 long blockAddr = BlockCompressedFilePointerUtil.getBlockAddress(bcis.getFilePointer());
                 if (blockAddr >= endByte) {
@@ -143,10 +143,14 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     public void close() throws IOException {
         log.trace("close() path={}", partition.getPath());
         try {
-            if (bcis != null) bcis.close(); // closes its wrapped HadoopSeekableStream
+            if (bcis != null) {
+                bcis.close(); // closes its wrapped HadoopSeekableStream → bgzfFsInputStream
+                bgzfFsInputStream = null; // prevent double-close in finally
+            }
             if (iterator != null) iterator.close();
             if (samReader != null) samReader.close();
         } finally {
+            // bgzfFsInputStream is non-null only if bcis.close() threw above
             if (bgzfFsInputStream != null) bgzfFsInputStream.close();
             if (baiInputStream != null) baiInputStream.close();
             if (fsInputStream != null) fsInputStream.close();
@@ -161,11 +165,11 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         log.trace("open() path={}", partition.getPath());
 
         // BGZF split mode: triggered when the planner set byte-range boundaries.
-        boolean isBgzfSplitMode = partition.getEndVirtualOffset() != Long.MAX_VALUE
-                || partition.getStartVirtualOffset() > 0;
+        boolean isBgzfSplitMode = partition.getEndByte() != Long.MAX_VALUE
+                || partition.getStartByte() > 0;
         if (isBgzfSplitMode) {
             log.trace("open() BGZF split mode startByte={} endByte={}",
-                    partition.getStartVirtualOffset(), partition.getEndVirtualOffset());
+                    partition.getStartByte(), partition.getEndByte());
             openBgzfSplit();
             return;
         }
@@ -345,15 +349,15 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                     new HadoopSeekableStream(bgzfFsInputStream, fileLength, partition.getPath()));
 
             long startVFO;
-            if (partition.getStartVirtualOffset() == 0) {
+            if (partition.getStartByte() == 0) {
                 // Partition 0: the header parser already found the first data record.
                 startVFO = firstDataVFO;
                 log.trace("openBgzfSplit() partition 0: startVFO={}", startVFO);
             } else {
                 long cleanBlockByte = findCleanRecordStart(
                         bgzfFsInputStream, bcis,
-                        partition.getStartVirtualOffset(),
-                        partition.getEndVirtualOffset());
+                        partition.getStartByte(),
+                        partition.getEndByte());
                 if (cleanBlockByte < 0) {
                     log.trace("openBgzfSplit() no clean record start found — empty partition");
                     bamRecordCodec = null;
@@ -370,8 +374,12 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             success = true;
         } finally {
             if (!success) {
-                if (bcis != null) try { bcis.close(); } catch (IOException e) { log.debug("suppressed bcis close", e); }
-                bgzfFsInputStream.close();
+                if (bcis != null) {
+                    try { bcis.close(); } catch (IOException e) { log.debug("suppressed bcis close", e); }
+                    // bcis.close() closed bgzfFsInputStream via HadoopSeekableStream
+                } else {
+                    bgzfFsInputStream.close();
+                }
             }
         }
     }

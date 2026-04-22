@@ -12,8 +12,9 @@ import java.io.Serializable;
  * <p>Virtual file offsets (VFOs) are used indirectly: when a BAI index is available,
  * {@link BamScan} creates one partition per reference sequence (or group of sequences).
  * Each partition's reader calls {@code samReader.query()} which has htsjdk use the BAI's
- * VFO chunks internally for efficient seeking. {@code startVirtualOffset} and
- * {@code endVirtualOffset} are retained for compatibility but are always 0 / MAX in practice.
+ * VFO chunks internally for efficient seeking. {@code startByte} and {@code endByte} are
+ * raw file byte offsets used in BGZF split mode; they are 0 and {@code Long.MAX_VALUE}
+ * respectively for all other partition modes.
  *
  * <h3>Partition modes (mutually exclusive, checked in order by {@link BamPartitionReader})</h3>
  * <ol>
@@ -37,8 +38,8 @@ import java.io.Serializable;
 public class BamInputPartition implements InputPartition, Serializable {
 
     private final String path;
-    private final long startVirtualOffset;
-    private final long endVirtualOffset;
+    private final long startByte;
+    private final long endByte;
     private final SerializableConfiguration hadoopConf;
     /** Resolved BAI/CRAI path; null when no index is available. */
     private final String indexPath;
@@ -129,8 +130,8 @@ public class BamInputPartition implements InputPartition, Serializable {
                              String[] querySequences,
                              boolean queryUnmapped) {
         this.path = path;
-        this.startVirtualOffset = startVirtualOffset;
-        this.endVirtualOffset = endVirtualOffset;
+        this.startByte = startVirtualOffset;
+        this.endByte = endVirtualOffset;
         this.hadoopConf = new SerializableConfiguration(hadoopConf);
         this.indexPath = indexPath;
         this.isCram = isCram;
@@ -144,8 +145,8 @@ public class BamInputPartition implements InputPartition, Serializable {
     }
 
     public String getPath() { return path; }
-    public long getStartVirtualOffset() { return startVirtualOffset; }
-    public long getEndVirtualOffset() { return endVirtualOffset; }
+    public long getStartByte() { return startByte; }
+    public long getEndByte() { return endByte; }
     public Configuration getHadoopConf() { return hadoopConf.get(); }
     public String getIndexPath() { return indexPath; }
     public boolean isCram() { return isCram; }

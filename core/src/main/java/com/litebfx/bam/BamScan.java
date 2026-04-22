@@ -231,6 +231,10 @@ public class BamScan implements Scan, Batch {
                                          String referenceMode,
                                          List<BamInputPartition> out) throws IOException {
         long splitSize = Long.parseLong(options.getOrDefault("bgzfSplitSize", "134217728"));
+        if (splitSize <= 0) {
+            throw new IllegalArgumentException(
+                    "bgzfSplitSize must be a positive integer, got: " + splitSize);
+        }
         long fileSize = filePath.getFileSystem(conf).getFileStatus(filePath).getLen();
         int numChunks = (int) Math.max(1, (long) Math.ceil((double) fileSize / splitSize));
         log.trace("planBgzfSplitPartitions() fileSize={} splitSize={} numChunks={}",

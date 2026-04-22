@@ -17,6 +17,8 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Plans one or more {@link FastqInputPartition}s for a FASTQ file.
@@ -167,7 +169,7 @@ public class FastqScan implements Scan, Batch {
     /**
      * Detects the read number (1 for R1, 2 for R2) from a FASTQ filename.
      *
-     * <p>Recognised patterns (case-insensitive):
+     * <p>Recognised patterns (case-insensitive): {@code _(R?0*[12])[._]}
      * <ul>
      *   <li>{@code _R1_} / {@code _R2_} — Illumina BCL2FASTQ naming, e.g.
      *       {@code sample_R1_001.fastq.gz}</li>
@@ -175,17 +177,19 @@ public class FastqScan implements Scan, Batch {
      *       {@code sample_R1.fastq.gz}</li>
      *   <li>{@code _1.} / {@code _2.} — alternative suffix, e.g.
      *       {@code sample_1.fastq.gz}</li>
+     *   <li>{@code _01.} / {@code _02.} / {@code _R01_} — zero-padded variants, e.g.
+     *       {@code sample_01.fastq.gz}</li>
      * </ul>
      *
      * @return 1, 2, or null when the read number cannot be determined
      */
     static Integer detectReadNumber(String filename) {
-        String lower = filename.toLowerCase();
-        if (lower.contains("_r1_") || lower.contains("_r1.")) return 1;
-        if (lower.contains("_r2_") || lower.contains("_r2.")) return 2;
-        // Alternative: _1. / _2. patterns (e.g. sample_1.fastq.gz)
-        if (lower.contains("_1.")) return 1;
-        if (lower.contains("_2.")) return 2;
-        return null;
+        Matcher m = READ_NUMBER_PATTERN.matcher(filename);
+        if (!m.find()) return null;
+        return Integer.parseInt(m.group(2));
     }
+
+    /** Matches {@code _(R?0*[12])[._]} case-insensitively to detect R1/R2 read numbers. */
+    private static final Pattern READ_NUMBER_PATTERN =
+            Pattern.compile("_(R?0*([12]))[._]", Pattern.CASE_INSENSITIVE);
 }

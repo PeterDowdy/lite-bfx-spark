@@ -239,6 +239,16 @@ class FastqDataSourceTest {
     }
 
     @Test
+    void detectReadNumber_zeroPadded01_returns1() {
+        assertEquals(Integer.valueOf(1), FastqScan.detectReadNumber("sample_01.fastq.gz"));
+    }
+
+    @Test
+    void detectReadNumber_zeroPaddedR02Underscore_returns2() {
+        assertEquals(Integer.valueOf(2), FastqScan.detectReadNumber("sample_R02_001.fastq.gz"));
+    }
+
+    @Test
     void detectReadNumber_noPattern_returnsNull() {
         assertNull(FastqScan.detectReadNumber("sample.fastq.gz"));
     }
