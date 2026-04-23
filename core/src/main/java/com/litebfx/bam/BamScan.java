@@ -156,8 +156,10 @@ public class BamScan implements Scan, Batch {
                     // Unindexed BAM: BGZF block-level splitting into fixed-size chunks.
                     planBgzfSplitPartitions(fileUri, filePath, hadoopConf,
                             referenceFile, referenceMode, partitions);
-                } else if (isSam && pushedReferenceName == null) {
+                } else if (isSam) {
                     // SAM: plain-text line-based splitting into fixed-size chunks.
+                    // When a region filter is pushed, each worker applies it independently —
+                    // there is no index to skip I/O, but we still get parallel reads.
                     planSamSplitPartitions(fileUri, filePath, hadoopConf, partitions);
                 } else if (isCram && pushedReferenceName == null) {
                     // CRAM: container-level splitting via CRAI index (if available) or header scan.

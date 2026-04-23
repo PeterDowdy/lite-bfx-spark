@@ -159,7 +159,7 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 | BAM + BAI + region filter | 1 partition (BAI-guided region query) |
 | BAM, no BAI | `ceil(fileSize / bgzfSplitSize)` BGZF-split partitions (default split: 128 MB) |
 | SAM, no region filter | `ceil(fileSize / samSplitSize)` line-split partitions (default split: 128 MB) |
-| SAM + region filter | 1 partition (full scan) |
+| SAM + region filter | `ceil(fileSize / samSplitSize)` line-split partitions; each worker applies the region filter independently |
 | CRAM + CRAI, no region filter | `min(numPartitions, numContainers)` container-split partitions |
 | CRAM + CRAI + region filter | 1 partition (CRAI-guided region query) |
 | CRAM, no CRAI | `min(numPartitions, numContainers)` container-split partitions (header scan) |
