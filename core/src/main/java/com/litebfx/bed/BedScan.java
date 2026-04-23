@@ -14,6 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Plans one {@link BedInputPartition} per BED file (full-file or tabix region).
@@ -75,11 +77,22 @@ public class BedScan implements Scan, Batch {
                 .sessionState().newHadoopConf();
 
         try {
+            // Plain-text BED: split into fixed-size byte-range chunks so multiple
+            // workers read in parallel. Each worker seeks to its chunk boundary,
+            // discards bytes up to the next newline, and reads records until its
+            // end boundary. A region filter (pushedChrom) is applied as a Spark
+            // post-filter on top of each partition's output.
+            boolean isCompressed = pathStr.toLowerCase().endsWith(".gz")
+                    || pathStr.toLowerCase().endsWith(".bgz")
+                    || pathStr.toLowerCase().endsWith(".bgzf");
+            if (!isCompressed) {
+                return planBedSplitPartitions(pathStr, hadoopConf);
+            }
+
+            // Bgzipped BED: tabix region query or single full-file scan.
             String indexPath = useIndex ? resolveIndexPath(pathStr, hadoopConf) : null;
             log.trace("planInputPartitions() indexPath={}", indexPath);
 
-            // Determine query parameters: only apply region query when we have
-            // both a tabix index and a pushed chromosome filter.
             String queryChrom = (indexPath != null && pushedChrom != null) ? pushedChrom : null;
             long   queryStart = queryChrom != null ? pushedStart : 0L;
             long   queryEnd   = queryChrom != null ? pushedEnd   : Long.MAX_VALUE;
@@ -90,6 +103,39 @@ public class BedScan implements Scan, Batch {
         } catch (IOException e) {
             throw new RuntimeException("Failed to plan BED input partitions for path: " + pathStr, e);
         }
+    }
+
+    /**
+     * Plans fixed-size byte-range partitions for a plain-text BED file.
+     *
+     * <p>Each executor seeks to its chunk boundary, discards bytes up to the next
+     * newline to land on a clean line start, and reads records until the next line
+     * would begin at or past {@code endByte}.  Chunks that contain no data lines
+     * produce zero rows.  Any pushed region filter is applied by Spark as a
+     * post-filter on top of each partition's output.
+     *
+     * <p>The split size is controlled by the {@code bedSplitSize} option (default 128 MB).
+     */
+    private InputPartition[] planBedSplitPartitions(String pathStr,
+                                                    Configuration conf) throws IOException {
+        long splitSize = Long.parseLong(options.getOrDefault("bedSplitSize", "134217728"));
+        if (splitSize <= 0) {
+            throw new IllegalArgumentException(
+                    "bedSplitSize must be a positive integer, got: " + splitSize);
+        }
+        long fileSize = new Path(pathStr).getFileSystem(conf).getFileStatus(new Path(pathStr)).getLen();
+        int numChunks = (int) Math.max(1, (long) Math.ceil((double) fileSize / splitSize));
+        log.trace("planBedSplitPartitions() fileSize={} splitSize={} numChunks={}", fileSize, splitSize, numChunks);
+
+        List<BedInputPartition> partitions = new ArrayList<>();
+        for (int i = 0; i < numChunks; i++) {
+            long startByte = (long) i * splitSize;
+            long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long) (i + 1) * splitSize;
+            log.trace("planBedSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
+            partitions.add(new BedInputPartition(
+                    pathStr, null, null, 0L, Long.MAX_VALUE, startByte, endByte, conf));
+        }
+        return partitions.toArray(new InputPartition[0]);
     }
 
     @Override

@@ -56,6 +56,10 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
     private Iterator<Block> blockIterator;
     private long currentBlockEnd = Long.MAX_VALUE;
 
+    // Line-split state (plain-text uncompressed BED with startByte/endByte)
+    private boolean isBedSplitMode = false;
+    private long bedEndByte = Long.MAX_VALUE;
+
     private String[] currentColumns;
     private boolean opened = false;
 
@@ -175,6 +179,30 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
             fsIn.seek(0); // always reset after detection, even if isBgzfStream throws
         }
 
+        // Plain-text line-split mode: seek to chunk boundary, skip partial line.
+        long startByte = partition.getStartByte();
+        long endByte   = partition.getEndByte();
+        if (!looksCompressed(path) && (startByte > 0 || endByte != Long.MAX_VALUE)) {
+            isBedSplitMode = true;
+            bedEndByte = endByte;
+            if (startByte > 0 && startByte >= fileLength) {
+                // Chunk starts past EOF — empty partition.
+                return;
+            }
+            if (startByte > 0) {
+                // Peek at the byte just before startByte. If it is '\n' we are already
+                // on a line boundary; otherwise discard through the next '\n'.
+                fsIn.seek(startByte - 1);
+                int prev = fsIn.read(); // advances position to startByte
+                if (prev != '\n') {
+                    int b;
+                    while ((b = fsIn.read()) != -1 && b != '\n') { /* skip partial line */ }
+                }
+            }
+            // plainReader stays null; readLine() will use fsIn directly.
+            return;
+        }
+
         if (isBgzip) {
             HadoopSeekableStream seekable = new HadoopSeekableStream(fsIn, fileLength, path);
             bcis = new BlockCompressedInputStream(seekable);
@@ -229,9 +257,28 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
                 return null; // signal caller to advance to next block
             }
             return bcis.readLine();
-        } else {
-            return plainReader.readLine();
         }
+        if (isBedSplitMode) {
+            if (bedEndByte != Long.MAX_VALUE && fsIn.getPos() >= bedEndByte) return null;
+            return readLineFromStream(fsIn);
+        }
+        return plainReader.readLine();
+    }
+
+    /**
+     * Reads one text line from {@code stream} byte-by-byte, consuming the terminating
+     * {@code \n}.  Returns the line content without the line terminator, or {@code null}
+     * at EOF with no bytes read.  Using direct stream reads (rather than BufferedReader)
+     * keeps {@code stream.getPos()} accurate so the caller can enforce byte-range boundaries.
+     */
+    private static String readLineFromStream(FSDataInputStream stream) throws IOException {
+        StringBuilder sb = new StringBuilder(256);
+        int b;
+        while ((b = stream.read()) != -1) {
+            if (b == '\n') return sb.toString();
+            if (b != '\r') sb.append((char) b);
+        }
+        return sb.length() > 0 ? sb.toString() : null;
     }
 
     private static boolean looksCompressed(String path) {

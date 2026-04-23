@@ -35,12 +35,21 @@ Column count is detected from the first record in each partition. Missing traili
 
 ### Uncompressed BED
 
-Uncompressed BED files have no index. They always produce a single partition.
+Uncompressed BED files have no index. They are split into fixed-size byte-range
+partitions: each executor seeks to its chunk boundary, discards bytes up to the
+next newline to land on a clean line start, and reads records until the next line
+would begin at or past its chunk end. Chunks that contain no data lines produce
+zero rows. The split size is controlled by the `bedSplitSize` option (default 128 MB).
 
 ```python
 df = spark.read.format("bed").load("/data/peaks.bed")
 df.printSchema()
 df.show(5)
+
+# Control partition count for a large uncompressed file
+df = spark.read.format("bed") \
+    .option("bedSplitSize", str(32 * 1024 * 1024)) \
+    .load("/data/peaks.bed")
 ```
 
 ### Bgzipped BED with tabix
@@ -111,8 +120,9 @@ df = spark.read.format("bed") \
 |---|---|---|
 | `indexPath` | — | Explicit tabix index path (`.tbi` or `.csi`). Single-file reads only. |
 | `indexDir` | — | Directory of tabix index files. Resolved as `<indexDir>/<filename>.tbi`. |
+| `bedSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for uncompressed BED files. Has no effect for `.bed.gz`. |
 | `numPartitions` | `200` | Reserved for future multi-block tabix splitting. Currently one partition is planned per query. |
-| `useIndex` | `true` | Set `false` to force a full-file single-partition scan. |
+| `useIndex` | `true` | Set `false` to force a full-file single-partition scan for bgzipped BED. |
 
 ---
 
