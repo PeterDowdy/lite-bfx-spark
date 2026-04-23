@@ -22,9 +22,17 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import htsjdk.samtools.cram.CRAIEntry;
+import htsjdk.samtools.cram.build.CramContainerHeaderIterator;
+import htsjdk.samtools.cram.structure.Container;
+
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.TreeSet;
+import java.util.zip.GZIPInputStream;
 
 /**
  * Resolves BAM/SAM input files and plans {@link BamInputPartition}s.
@@ -151,8 +159,17 @@ public class BamScan implements Scan, Batch {
                 } else if (isSam && pushedReferenceName == null) {
                     // SAM: plain-text line-based splitting into fixed-size chunks.
                     planSamSplitPartitions(fileUri, filePath, hadoopConf, partitions);
+                } else if (isCram && pushedReferenceName == null) {
+                    // CRAM: container-level splitting via CRAI index (if available) or header scan.
+                    if (indexPath != null) {
+                        planCraiPartitions(fileUri, filePath, indexPath, hadoopConf,
+                                referenceFile, referenceMode, maxPartitions, partitions);
+                    } else {
+                        planCramContainerSplitPartitions(fileUri, filePath, hadoopConf,
+                                referenceFile, referenceMode, maxPartitions, partitions);
+                    }
                 } else {
-                    // Region push-down (single partition), SAM, or CRAM fallback.
+                    // Single partition: region push-down with BAI/CRAI.
                     String querySequence = (pushedReferenceName != null && indexPath != null)
                             ? pushedReferenceName : null;
                     int queryStart = querySequence != null ? pushedStart : 1;
@@ -289,6 +306,144 @@ public class BamScan implements Scan, Batch {
                     null, false, null, "none",
                     null, 1, Integer.MAX_VALUE,
                     null, false, true));
+        }
+    }
+
+    /**
+     * Plans container-level partitions for a CRAM file that has a CRAI index.
+     *
+     * <p>Parses the CRAI (a gzip-compressed tab-separated text file) to collect the unique
+     * container byte offsets.  Multiple CRAI entries that share the same container offset
+     * (slices within one container) are deduplicated via a {@link TreeSet}.  The sorted
+     * offsets are then distributed into at most {@code maxPartitions} groups; each group
+     * becomes one {@link BamInputPartition} whose reader will use {@code CRAMIterator} with
+     * the {@code [start, end]} byte-span pair for its assigned containers.
+     */
+    private void planCraiPartitions(String fileUri,
+                                     Path filePath,
+                                     String indexPath,
+                                     Configuration conf,
+                                     String referenceFile,
+                                     String referenceMode,
+                                     int maxPartitions,
+                                     List<BamInputPartition> out) throws IOException {
+        log.trace("planCraiPartitions() fileUri={} indexPath={}", fileUri, indexPath);
+
+        TreeSet<Long> seen = new TreeSet<>();
+        Path craiPath = new Path(indexPath);
+        FileSystem craiFs = craiPath.getFileSystem(conf);
+        try (FSDataInputStream craiStream = craiFs.open(craiPath);
+             GZIPInputStream gzis = new GZIPInputStream(craiStream);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(gzis))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                try {
+                    seen.add(new CRAIEntry(line).getContainerStartByteOffset());
+                } catch (Exception e) {
+                    log.debug("planCraiPartitions() skipping unparseable CRAI line: {}", line);
+                }
+            }
+        }
+
+        if (seen.isEmpty()) {
+            log.trace("planCraiPartitions() no containers in CRAI — single full-scan partition");
+            out.add(new BamInputPartition(fileUri, 0L, Long.MAX_VALUE, conf,
+                    indexPath, true, referenceFile, referenceMode));
+            return;
+        }
+
+        List<Long> offsets = new ArrayList<>(seen);
+        long fileSize = filePath.getFileSystem(conf).getFileStatus(filePath).getLen();
+        log.trace("planCraiPartitions() {} unique containers, fileSize={}", offsets.size(), fileSize);
+
+        addCramContainerPartitions(fileUri, offsets, fileSize, conf, indexPath,
+                referenceFile, referenceMode, maxPartitions, out);
+    }
+
+    /**
+     * Plans container-level partitions for a CRAM file without a CRAI index.
+     *
+     * <p>Uses {@link CramContainerHeaderIterator} to scan container headers sequentially
+     * (no record decoding), collecting each container's byte offset.  The offsets are then
+     * distributed across at most {@code maxPartitions} groups exactly as in
+     * {@link #planCraiPartitions}.
+     */
+    private void planCramContainerSplitPartitions(String fileUri,
+                                                   Path filePath,
+                                                   Configuration conf,
+                                                   String referenceFile,
+                                                   String referenceMode,
+                                                   int maxPartitions,
+                                                   List<BamInputPartition> out) throws IOException {
+        log.trace("planCramContainerSplitPartitions() fileUri={}", fileUri);
+
+        FileSystem cramFs = filePath.getFileSystem(conf);
+        long fileSize = cramFs.getFileStatus(filePath).getLen();
+        List<Long> offsets = new ArrayList<>();
+        try (FSDataInputStream cramStream = cramFs.open(filePath);
+             CramContainerHeaderIterator iter = new CramContainerHeaderIterator(cramStream)) {
+            while (iter.hasNext()) {
+                Container container = iter.next();
+                if (!container.isEOF()) {
+                    offsets.add(container.getContainerByteOffset());
+                }
+            }
+        }
+
+        if (offsets.isEmpty()) {
+            log.trace("planCramContainerSplitPartitions() no containers — single full-scan partition");
+            out.add(new BamInputPartition(fileUri, 0L, Long.MAX_VALUE, conf,
+                    null, true, referenceFile, referenceMode));
+            return;
+        }
+
+        log.trace("planCramContainerSplitPartitions() {} containers, fileSize={}", offsets.size(), fileSize);
+        addCramContainerPartitions(fileUri, offsets, fileSize, conf, null,
+                referenceFile, referenceMode, maxPartitions, out);
+    }
+
+    /**
+     * Groups a sorted list of CRAM container byte offsets into at most {@code maxPartitions}
+     * partitions and appends a {@link BamInputPartition} for each group.
+     * Each partition carries a two-element {@code cramContainerSpans} array
+     * {@code [groupStart, groupEnd]} that the reader passes to {@code CRAMIterator}.
+     */
+    private void addCramContainerPartitions(String fileUri,
+                                             List<Long> offsets,
+                                             long fileSize,
+                                             Configuration conf,
+                                             String indexPath,
+                                             String referenceFile,
+                                             String referenceMode,
+                                             int maxPartitions,
+                                             List<BamInputPartition> out) {
+        int n = offsets.size();
+        int numGroups = Math.max(1, Math.min(maxPartitions, n));
+        int base  = n / numGroups;
+        int extra = n % numGroups;
+        int idx = 0;
+        for (int g = 0; g < numGroups; g++) {
+            int size = base + (g < extra ? 1 : 0);
+            // CramSpanContainerIterator.Boundary uses VFO encoding (rawByteOffset << 16).
+            // Boundary.hasNext() checks: streamPosition <= end >>> 16 (inclusive).
+            // After reading a container, position advances to the START of the next container.
+            // So for non-last partitions we use (nextContainerStart - 1) << 16 as the
+            // exclusive-end sentinel to prevent spilling into the next partition.
+            // For the last partition, fileSize << 16 is fine: CRAMIterator stops on EOF container.
+            long groupStart = offsets.get(idx) << 16;
+            long groupEnd   = (idx + size < n)
+                    ? (offsets.get(idx + size) - 1) << 16
+                    : fileSize << 16;
+            long[] spans = new long[]{groupStart, groupEnd};
+            log.trace("addCramContainerPartitions() group={} spans=[{}, {}]", g, groupStart, groupEnd);
+            out.add(new BamInputPartition(
+                    fileUri, 0L, Long.MAX_VALUE, conf,
+                    indexPath, true, referenceFile, referenceMode,
+                    null, 1, Integer.MAX_VALUE,
+                    null, false, false, spans));
+            idx += size;
         }
     }
 

@@ -39,6 +39,10 @@ import java.io.Serializable;
  * {@link BamPartitionReader}. {@code referenceFile} is the path to the FASTA
  * reference (may be null). {@code referenceMode} is one of {@code "file"},
  * {@code "md5"}, or {@code "none"}.
+ *
+ * <li><b>CRAM container-split</b>: {@code cramContainerSpans != null} → the reader creates a
+ *     {@code CRAMIterator} over the specified container byte-offset spans and yields all records
+ *     in those containers. Spans are alternating {@code [start₀, end₀, start₁, end₁, …]} pairs.</li>
  */
 public class BamInputPartition implements InputPartition, Serializable {
 
@@ -82,6 +86,13 @@ public class BamInputPartition implements InputPartition, Serializable {
      * {@code startByte}/{@code endByte} but operates on compressed BAM blocks.
      */
     private final boolean samSplit;
+    /**
+     * Alternating {@code [start₀, end₀, start₁, end₁, …]} container byte-offset pairs for
+     * CRAM container-split mode. When non-null, the reader creates a {@code CRAMIterator}
+     * over these spans and yields all records in those containers. Null for all other modes.
+     * An empty array (length 0) produces an empty partition.
+     */
+    private final long[] cramContainerSpans;
 
     /** Full-file, no-index partition (used by existing tests and SAM files). */
     public BamInputPartition(String path,
@@ -129,7 +140,7 @@ public class BamInputPartition implements InputPartition, Serializable {
     }
 
     /** Full constructor — includes VFO-splitting fields {@code querySequences}, {@code queryUnmapped},
-     *  and {@code samSplit}. */
+     *  {@code samSplit}, and CRAM container-split field {@code cramContainerSpans}. */
     public BamInputPartition(String path,
                              long startVirtualOffset,
                              long endVirtualOffset,
@@ -144,6 +155,27 @@ public class BamInputPartition implements InputPartition, Serializable {
                              String[] querySequences,
                              boolean queryUnmapped,
                              boolean samSplit) {
+        this(path, startVirtualOffset, endVirtualOffset, hadoopConf, indexPath,
+             isCram, referenceFile, referenceMode, querySequence, queryStart, queryEnd,
+             querySequences, queryUnmapped, samSplit, null);
+    }
+
+    /** Full constructor with CRAM container-split support. */
+    public BamInputPartition(String path,
+                             long startVirtualOffset,
+                             long endVirtualOffset,
+                             Configuration hadoopConf,
+                             String indexPath,
+                             boolean isCram,
+                             String referenceFile,
+                             String referenceMode,
+                             String querySequence,
+                             int queryStart,
+                             int queryEnd,
+                             String[] querySequences,
+                             boolean queryUnmapped,
+                             boolean samSplit,
+                             long[] cramContainerSpans) {
         this.path = path;
         this.startByte = startVirtualOffset;
         this.endByte = endVirtualOffset;
@@ -158,6 +190,7 @@ public class BamInputPartition implements InputPartition, Serializable {
         this.querySequences = querySequences;
         this.queryUnmapped = queryUnmapped;
         this.samSplit = samSplit;
+        this.cramContainerSpans = cramContainerSpans;
     }
 
     public String getPath() { return path; }
@@ -177,4 +210,9 @@ public class BamInputPartition implements InputPartition, Serializable {
     public boolean isQueryUnmapped() { return queryUnmapped; }
     /** Returns true if this partition uses SAM line-based splitting. */
     public boolean isSamSplit() { return samSplit; }
+    /**
+     * Returns the alternating {@code [start, end]} container byte-offset spans for CRAM
+     * container-split mode, or {@code null} for all other partition modes.
+     */
+    public long[] getCramContainerSpans() { return cramContainerSpans; }
 }

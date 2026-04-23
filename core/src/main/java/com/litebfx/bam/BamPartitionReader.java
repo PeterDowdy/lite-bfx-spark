@@ -13,6 +13,7 @@ import htsjdk.samtools.SamInputResource;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
 import htsjdk.samtools.ValidationStringency;
+import htsjdk.samtools.CRAMIterator;
 import htsjdk.samtools.cram.ref.ReferenceSource;
 import htsjdk.samtools.util.BinaryCodec;
 import htsjdk.samtools.util.BlockCompressedFilePointerUtil;
@@ -185,6 +186,14 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private void open() throws IOException {
         log.trace("open() path={}", partition.getPath());
 
+        // CRAM container-split mode: checked first since isCram partitions never use BGZF/SAM paths.
+        if (partition.getCramContainerSpans() != null) {
+            log.trace("open() CRAM container-split mode spans=[{}, {}]",
+                    partition.getCramContainerSpans()[0], partition.getCramContainerSpans()[1]);
+            openCramContainerSplit();
+            return;
+        }
+
         // SAM line-split mode: must be checked before BGZF detection because both use startByte/endByte.
         if (partition.isSamSplit()) {
             log.trace("open() SAM line-split mode startByte={} endByte={}",
@@ -304,6 +313,57 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                 }
                 try { fsInputStream.close(); } catch (IOException e) {
                     log.debug("suppressed exception closing BAM stream", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens the partition in CRAM container-split mode.
+     *
+     * <p>Creates a {@link CRAMIterator} over the container byte-span pair stored in
+     * {@link BamInputPartition#getCramContainerSpans()}.  The iterator handles all
+     * reference-lookup and record decoding internally; the existing {@link #next()} /
+     * {@link #close()} paths work without modification because {@code iterator} is a plain
+     * {@link SAMRecordIterator}.  An empty spans array ({@code length == 0}) leaves
+     * {@code iterator} null, producing an empty partition.
+     */
+    private void openCramContainerSplit() throws IOException {
+        long[] spans = partition.getCramContainerSpans();
+        if (spans.length == 0) {
+            log.trace("openCramContainerSplit() empty spans — empty partition");
+            return;
+        }
+
+        Configuration conf = partition.getHadoopConf();
+        Path cramPath = new Path(partition.getPath());
+        FileSystem fs = cramPath.getFileSystem(conf);
+        long fileLength = fs.getFileStatus(cramPath).getLen();
+
+        fsInputStream = fs.open(cramPath);
+        boolean success = false;
+        try {
+            HadoopSeekableStream seekable = new HadoopSeekableStream(
+                    fsInputStream, fileLength, partition.getPath());
+
+            ReferenceSource referenceSource;
+            String referenceFile = partition.getReferenceFile();
+            if (referenceFile != null && !"none".equals(partition.getReferenceMode())) {
+                log.trace("openCramContainerSplit() CRAM with referenceFile={}", referenceFile);
+                referenceSource = new ReferenceSource(new java.io.File(referenceFile));
+            } else {
+                log.trace("openCramContainerSplit() CRAM with no external reference");
+                referenceSource = new ReferenceSource((java.io.File) null);
+            }
+
+            iterator = new CRAMIterator(seekable, referenceSource, ValidationStringency.LENIENT,
+                    null, spans);
+            log.trace("openCramContainerSplit() CRAMIterator opened spans=[{}, {}]", spans[0], spans[1]);
+            success = true;
+        } finally {
+            if (!success) {
+                try { fsInputStream.close(); } catch (IOException e) {
+                    log.debug("suppressed exception closing CRAM stream", e);
                 }
             }
         }

@@ -1,23 +1,31 @@
 package com.litebfx.bam;
 
+import htsjdk.samtools.CRAMCRAIIndexer;
+import htsjdk.samtools.CRAMContainerStreamWriter;
 import htsjdk.samtools.SAMFileHeader;
 import htsjdk.samtools.SAMFileWriter;
 import htsjdk.samtools.SAMFileWriterFactory;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMSequenceRecord;
 import htsjdk.samtools.cram.ref.ReferenceSource;
+import htsjdk.samtools.cram.structure.CRAMEncodingStrategy;
 import htsjdk.samtools.reference.FastaSequenceIndexCreator;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -35,6 +43,8 @@ public class CramDataSourceTest {
 
     static String cramPath;
     static String fastaPath;
+    /** CRAM with multiple containers (2 reads/slice, 1 slice/container) for split tests. */
+    static String multiCramPath;
 
     @BeforeAll
     static void setUp() throws Exception {
@@ -48,6 +58,7 @@ public class CramDataSourceTest {
         Path faPath = generateFasta(tempDir);
         fastaPath = faPath.toAbsolutePath().toString();
         cramPath = generateCram(tempDir, faPath).toUri().toString();
+        multiCramPath = generateMultiContainerCram(tempDir, faPath).toUri().toString();
     }
 
     @AfterAll
@@ -124,6 +135,54 @@ public class CramDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Multi-partition (CRAI-based container splitting)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void multiPartition_withIndex_plansMultiplePartitions() {
+        Map<String, String> opts = new HashMap<>();
+        opts.put("path", multiCramPath);
+        opts.put("referenceFile", fastaPath);
+        BamScan scan = new BamScan(new CaseInsensitiveStringMap(opts),
+                BamSchema.SCHEMA, true, null, 1, Integer.MAX_VALUE, true);
+        InputPartition[] partitions = scan.planInputPartitions();
+        assertTrue(partitions.length > 1,
+                "Expected >1 partitions from CRAI-based split, got " + partitions.length);
+    }
+
+    @Test
+    void multiPartition_withIndex_allRecordsRead() {
+        long count = spark.read().format("cram")
+                .option("referenceFile", fastaPath)
+                .load(multiCramPath)
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+    }
+
+    @Test
+    void multiPartition_noIndex_plansMultiplePartitions() {
+        Map<String, String> opts = new HashMap<>();
+        opts.put("path", multiCramPath);
+        opts.put("referenceFile", fastaPath);
+        opts.put("useIndex", "false");
+        BamScan scan = new BamScan(new CaseInsensitiveStringMap(opts),
+                BamSchema.SCHEMA, true, null, 1, Integer.MAX_VALUE, true);
+        InputPartition[] partitions = scan.planInputPartitions();
+        assertTrue(partitions.length > 1,
+                "Expected >1 partitions from container header scan, got " + partitions.length);
+    }
+
+    @Test
+    void multiPartition_noIndex_allRecordsRead() {
+        long count = spark.read().format("cram")
+                .option("referenceFile", fastaPath)
+                .option("useIndex", "false")
+                .load(multiCramPath)
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
@@ -162,6 +221,42 @@ public class CramDataSourceTest {
             for (SAMRecord r : buildRecords(header)) {
                 writer.addAlignment(r);
             }
+        }
+        return cramFile.toPath();
+    }
+
+    /**
+     * Writes a CRAM file backed by {@code fastaRef} using a small encoding strategy
+     * (2 reads per slice, 1 slice per container) so that {@value TestBamGenerator#RECORD_COUNT}
+     * records are spread across multiple containers.  A co-located {@code .crai} index is
+     * also written (as {@code <file>.cram.crai}).
+     */
+    static Path generateMultiContainerCram(Path dir, Path fastaRef) throws IOException {
+        SAMFileHeader header = new SAMFileHeader();
+        header.addSequence(new SAMSequenceRecord(TestBamGenerator.REF_NAME, TestBamGenerator.REF_LENGTH));
+        header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
+
+        // setMinimumSingleReferenceSliceSize must be called before setReadsPerSlice
+        // because htsjdk validates readsPerSlice >= minimumSingleReferenceSliceSize.
+        CRAMEncodingStrategy strategy = new CRAMEncodingStrategy()
+                .setMinimumSingleReferenceSliceSize(2)
+                .setReadsPerSlice(2)
+                .setSlicesPerContainer(1);
+
+        File cramFile = dir.resolve("multi.cram").toFile();
+        File craiFile = dir.resolve("multi.cram.crai").toFile();
+
+        ReferenceSource refSource = new ReferenceSource(fastaRef.toFile());
+        try (FileOutputStream cramOut = new FileOutputStream(cramFile);
+             FileOutputStream craiOut = new FileOutputStream(craiFile)) {
+            CRAMCRAIIndexer indexer = new CRAMCRAIIndexer(craiOut, header);
+            CRAMContainerStreamWriter writer = new CRAMContainerStreamWriter(
+                    strategy, refSource, header, cramOut, indexer, cramFile.getName());
+            writer.writeHeader(header);
+            for (SAMRecord r : buildRecords(header)) {
+                writer.writeAlignment(r);
+            }
+            writer.finish(true); // also calls indexer.finish() internally
         }
         return cramFile.toPath();
     }
