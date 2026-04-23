@@ -142,10 +142,10 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 |---|---|---|
 | `indexPath` | — | Explicit BAI (BAM) or CRAI (CRAM) path. Applies to single-file reads only; ignored for directories and globs. |
 | `indexDir` | — | Directory containing index files. Resolved as `<indexDir>/<filename>.bai` or `<indexDir>/<filename>.cram.crai` per data file. |
-| `numPartitions` | `200` | Maximum partitions per file when VFO-based splitting is active. References are grouped into `min(numPartitions, numRefs)` partitions, plus one unmapped partition. Has no effect when a region filter is pushed. Unindexed BAM files use `bgzfSplitSize` instead. |
+| `numPartitions` | `200` | Maximum partitions per file for index-guided splitting. For BAM + BAI: references are grouped into `min(numPartitions, numRefs)` partitions plus one unmapped partition. For CRAM (with or without CRAI): containers are grouped into `min(numPartitions, numContainers)` partitions. Has no effect when a region filter is pushed. Unindexed BAM files use `bgzfSplitSize` instead. |
 | `bgzfSplitSize` | `134217728` (128 MB) | Byte size of each BGZF-split partition for unindexed BAM files. Has no effect when a BAI index is found or when `useIndex` is false. |
 | `samSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for SAM files. Has no effect for BAM or CRAM. |
-| `useIndex` | `true` | Set `false` to skip index resolution and force a single full-scan partition. |
+| `useIndex` | `true` | Set `false` to skip index resolution. For BAM this forces a single BGZF-split scan. For CRAM this falls back to container header scanning (still multi-partition, but without seeking via CRAI). |
 | `referenceFile` | — | CRAM only. Path to FASTA reference (`.fai` must be co-located). |
 | `referenceMode` | `"file"` / `"none"` | CRAM only. Controls how the CRAM decoder resolves reference sequences. |
 
@@ -160,9 +160,9 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 | BAM, no BAI | `ceil(fileSize / bgzfSplitSize)` BGZF-split partitions (default split: 128 MB) |
 | SAM, no region filter | `ceil(fileSize / samSplitSize)` line-split partitions (default split: 128 MB) |
 | SAM + region filter | 1 partition (full scan) |
-| CRAM + CRAI, no region filter | 1 partition per CRAI entry |
+| CRAM + CRAI, no region filter | `min(numPartitions, numContainers)` container-split partitions |
 | CRAM + CRAI + region filter | 1 partition (CRAI-guided region query) |
-| CRAM, no CRAI | 1 partition (full scan) |
+| CRAM, no CRAI | `min(numPartitions, numContainers)` container-split partitions (header scan) |
 
 ### BAI index resolution order
 
@@ -178,7 +178,7 @@ For each file in the read:
 1. `indexPath` option (single-file reads only)
 2. `indexDir/<filename>.cram.crai`
 3. Co-located `<cramPath>.cram.crai`
-4. No index found → single partition
+4. No index found → container header scan (multiple partitions, same `numPartitions` cap)
 
 ---
 
