@@ -98,6 +98,37 @@ jobs:
             scala/target/surefire-reports/
           if-no-files-found: ignore
 
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.spark-profile }}
+          path: |
+            core/target/site/jacoco/
+            scala/target/site/jacoco/
+          if-no-files-found: ignore
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo "## Coverage — ${{ matrix.spark-label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Module | Instruction % | Branch % |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------------|----------|" >> "$GITHUB_STEP_SUMMARY"
+          for csv in core/target/site/jacoco/jacoco.csv scala/target/site/jacoco/jacoco.csv; do
+            [ -f "$csv" ] || continue
+            module=$(echo "$csv" | cut -d/ -f1)
+            # Sum covered/missed instruction and branch counts from all rows (skip header)
+            awk -F',' 'NR>1 {ic+=$4; im+=$3; bc+=$8; bm+=$7}
+              END {
+                itot=ic+im; btot=bc+bm
+                ipct = itot>0 ? int(ic*100/itot) : 0
+                bpct = btot>0 ? int(bc*100/btot) : 0
+                printf "| %s | %d%% (%d/%d) | %d%% (%d/%d) |\n",
+                  mod, ipct, ic, itot, bpct, bc, btot
+              }' mod="$module" "$csv" >> "$GITHUB_STEP_SUMMARY"
+          done
+
       - name: Upload JVM crash logs
         if: failure()
         uses: actions/upload-artifact@v4

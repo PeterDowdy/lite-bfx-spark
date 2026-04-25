@@ -276,7 +276,12 @@
           <artifactId>maven-surefire-plugin</artifactId>
           <version>3.2.5</version>
           <configuration>
-            <argLine>
+            <!--
+              @{argLine} is a late-binding reference resolved at test-execution time;
+              it picks up the JaCoCo agent string injected by jacoco:prepare-agent.
+              When JaCoCo is not active the property resolves to an empty string.
+            -->
+            <argLine>@{argLine}
               --add-opens=java.base/java.lang=ALL-UNNAMED
               --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
               --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
@@ -292,6 +297,12 @@
               --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
             </argLine>
           </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.jacoco</groupId>
+          <artifactId>jacoco-maven-plugin</artifactId>
+          <version>0.8.12</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -354,7 +365,7 @@
       </plugins>
     </pluginManagement>
 
-    <!-- Bind checkstyle:check to verify for all child modules -->
+    <!-- Bind checkstyle:check and JaCoCo to verify for all child modules -->
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -364,6 +375,27 @@
             <id>checkstyle-verify</id>
             <phase>verify</phase>
             <goals><goal>check</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        JaCoCo: inject the coverage agent before tests run, then generate
+        HTML/XML/CSV reports at verify time.  Reports land in
+        <module>/target/site/jacoco/.
+      -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>jacoco-prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>jacoco-report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
           </execution>
         </executions>
       </plugin>
