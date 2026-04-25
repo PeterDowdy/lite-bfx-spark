@@ -12,8 +12,10 @@ import htsjdk.variant.variantcontext.writer.Options;
 import htsjdk.variant.variantcontext.writer.VariantContextWriter;
 import htsjdk.variant.variantcontext.writer.VariantContextWriterBuilder;
 import htsjdk.variant.vcf.VCFCodec;
+import htsjdk.variant.vcf.VCFFilterHeaderLine;
 import htsjdk.variant.vcf.VCFFormatHeaderLine;
 import htsjdk.variant.vcf.VCFHeader;
+import htsjdk.variant.vcf.VCFHeaderLineCount;
 import htsjdk.variant.vcf.VCFHeaderLineType;
 import htsjdk.variant.vcf.VCFInfoHeaderLine;
 
@@ -47,6 +49,11 @@ public class VcfTestGenerator {
     public static final int VCF_CHR2_COUNT    = 2;
     /** Variants on chr1 with pos >= 500. */
     public static final int VCF_CHR1_FROM_500 = 2;
+    /** Number of distinct chromosomes in the test VCF (chr1 + chr2). */
+    public static final int VCF_CHROM_COUNT   = 2;
+
+    /** Total variants in the edge-case fixture (PASS filter + multi-filter). */
+    public static final int EDGE_TOTAL = 2;
 
     public static final String SAMPLE_NAME = "sample1";
 
@@ -138,6 +145,111 @@ public class VcfTestGenerator {
                         .attribute("DP", dp)
                         .make())
                 .make();
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge-case fixture (VCFFileReader path: null alt, null qual, Boolean/List INFO, filters)
+    // -------------------------------------------------------------------------
+
+    /** Bgzipped VCF covering edge cases in {@code getFromVariantContext}. */
+    public record EdgeCaseFixtures(java.net.URI bgzVcf) {}
+
+    /**
+     * Generates a bgzipped VCF with two variants that exercise VCFFileReader edge cases:
+     * <ul>
+     *   <li>Variant 1: PASS filter, flag INFO field (SOMATIC=Boolean.TRUE), multi-value INFO
+     *       field (DP4=List[1,2,3,4]).</li>
+     *   <li>Variant 2: ref-only site (no alt alleles → alt is null), no QUAL (→ qual is null),
+     *       and a non-empty filter string (LowQual).</li>
+     * </ul>
+     */
+    public static EdgeCaseFixtures generateEdgeCases(Path tempDir) throws IOException {
+        Path bgzPath = tempDir.resolve("edge_cases.vcf.gz");
+
+        SAMSequenceDictionary dict = new SAMSequenceDictionary(
+                Arrays.asList(new SAMSequenceRecord("chr1", 248956422)));
+
+        Set<htsjdk.variant.vcf.VCFHeaderLine> lines = new HashSet<>();
+        lines.add(new VCFInfoHeaderLine("DP",     1,                       VCFHeaderLineType.Integer, "Depth"));
+        lines.add(new VCFInfoHeaderLine("SOMATIC", 0,                      VCFHeaderLineType.Flag,    "Somatic variant"));
+        lines.add(new VCFInfoHeaderLine("DP4",    VCFHeaderLineCount.UNBOUNDED, VCFHeaderLineType.Integer, "DP4 counts"));
+        lines.add(new VCFFormatHeaderLine("GT",   1,                       VCFHeaderLineType.String,  "Genotype"));
+        lines.add(new VCFFilterHeaderLine("LowQual", "Low quality variant"));
+        VCFHeader header = new VCFHeader(lines, List.of(SAMPLE_NAME));
+        header.setSequenceDictionary(dict);
+
+        Allele refA = Allele.create("A", true);
+        Allele altT = Allele.create("T", false);
+
+        // Variant 1: PASS filter, Boolean INFO (SOMATIC), List INFO (DP4)
+        VariantContext vc1 = new VariantContextBuilder()
+                .chr("chr1").start(100).stop(100)
+                .alleles(Arrays.asList(refA, altT))
+                .id("rs1")
+                .log10PError(-3.0)
+                .passFilters()
+                .attribute("SOMATIC", Boolean.TRUE)
+                .attribute("DP4", Arrays.asList(1, 2, 3, 4))
+                .genotypes(new GenotypeBuilder(SAMPLE_NAME)
+                        .alleles(Arrays.asList(refA, altT)).make())
+                .make();
+
+        // Variant 2: ref-only (no alt allele → alt = null), no qual, non-empty filter
+        VariantContext vc2 = new VariantContextBuilder()
+                .chr("chr1").start(200).stop(200)
+                .alleles(Arrays.asList(refA))
+                .id(".")
+                .filters(new HashSet<>(List.of("LowQual")))
+                .attribute("DP", 5)
+                .genotypes(new GenotypeBuilder(SAMPLE_NAME)
+                        .alleles(Arrays.asList(refA, refA)).make())
+                .make();
+
+        writeVcf(bgzPath.toFile(), header, dict, Arrays.asList(vc1, vc2),
+                VariantContextWriterBuilder.OutputType.BLOCK_COMPRESSED_VCF);
+
+        return new EdgeCaseFixtures(bgzPath.toUri());
+    }
+
+    // -------------------------------------------------------------------------
+    // Triple-chromosome fixture (exercises groupChroms extra > 0 path)
+    // -------------------------------------------------------------------------
+
+    /** Three-chromosome bgzipped VCF — one SNP per chrom, 3 total. */
+    public record TripleChromFixtures(java.net.URI bgzVcf) {}
+
+    /**
+     * Generates a three-chromosome bgzipped VCF with one variant per chromosome.
+     * Used in tests that need {@code numChroms % numGroups != 0} to exercise the
+     * {@code extra > 0} branch in {@code VcfScan.groupChroms()}.
+     */
+    public static TripleChromFixtures generateTripleChrom(Path tempDir) throws IOException {
+        Path bgzPath = tempDir.resolve("triple_chrom.vcf.gz");
+        Path tbiPath = tempDir.resolve("triple_chrom.vcf.gz.tbi");
+
+        SAMSequenceDictionary dict = new SAMSequenceDictionary(Arrays.asList(
+                new SAMSequenceRecord("chr1", 248956422),
+                new SAMSequenceRecord("chr2", 242193529),
+                new SAMSequenceRecord("chr3", 198295559)
+        ));
+
+        VCFHeader header = buildHeader(dict);
+
+        Allele refA = Allele.create("A", true);
+        Allele altT = Allele.create("T", false);
+        List<VariantContext> variants = Arrays.asList(
+                snp("chr1", 100, "rs1", refA, altT, 30, 0.5),
+                snp("chr2", 100, "rs2", refA, altT, 25, 0.4),
+                snp("chr3", 100, "rs3", refA, altT, 20, 0.3)
+        );
+
+        writeVcf(bgzPath.toFile(), header, dict, variants,
+                VariantContextWriterBuilder.OutputType.BLOCK_COMPRESSED_VCF);
+
+        TabixIndex tbi = IndexFactory.createTabixIndex(bgzPath.toFile(), new VCFCodec(), null);
+        tbi.write(tbiPath.toFile());
+
+        return new TripleChromFixtures(bgzPath.toUri());
     }
 
     private static void writeVcf(File outFile, VCFHeader header,

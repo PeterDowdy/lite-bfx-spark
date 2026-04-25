@@ -4,7 +4,7 @@ VCF (Variant Call Format) stores variant calls from genotyping or variant detect
 
 Supported extensions: `.vcf`, `.vcf.gz`, `.bcf`.
 
-Format detection is automatic: `VCFFileReader` reads the file magic bytes and selects the correct decoder. No format hint or special option is needed to distinguish VCF from BCF.
+For bgzipped (`.vcf.gz`) and BCF files, format detection is automatic: `VCFFileReader` reads the file magic bytes and selects the correct decoder. Plain-text `.vcf` files are parsed directly with a line-split reader that does not require format detection.
 
 ---
 
@@ -29,23 +29,44 @@ Format detection is automatic: `VCFFileReader` reads the file magic bytes and se
 
 ### Uncompressed VCF
 
-Uncompressed `.vcf` files have no seekable index. They always produce a single partition.
+Uncompressed `.vcf` files are split into fixed-size byte-range partitions so multiple executors can read them in parallel. Each executor seeks to its chunk boundary, scans forward to the next newline to land on a clean line start, then parses data lines directly until the end of its chunk. The `#CHROM` header line is read from offset 0 on every executor to recover sample names before seeking to the chunk position.
+
+The split size is controlled by `vcfSplitSize` (default 128 MiB). Files smaller than one split produce a single partition.
 
 ```python
 df = spark.read.format("vcf").load("/data/calls.vcf")
 df.printSchema()
 df.count()
+
+# Force smaller splits for a large plain-text VCF:
+df = spark.read.format("vcf") \
+    .option("vcfSplitSize", str(64 * 1024 * 1024)) \
+    .load("/data/large.vcf")
 ```
+
+Any pushed region filter (`chrom`, `pos`) is applied by Spark as a post-filter over each partition's output — not at the partition-planning level. All partitions are read, but only matching rows are returned. For selective queries on large plain-text VCFs, bgzipped + tabix is more efficient.
 
 ### Bgzipped VCF with tabix
 
-Bgzipped `.vcf.gz` files with a co-located `.tbi` or `.csi` tabix index support region queries. The tabix index is used to produce partition plans and push region filters down to BGZF block level.
+Bgzipped `.vcf.gz` files with a co-located `.tbi` or `.csi` tabix index support both parallel full-file reads and targeted region queries.
+
+**Full-file reads (no filter):** When no `chrom` filter is pushed, the scan reads the chromosome list from the tabix index on the driver and creates one partition per chromosome (grouped into at most `numPartitions`, default 200). Each executor performs a targeted tabix query for its assigned chromosomes — only the relevant BGZF blocks are transferred.
+
+**Region queries (filter pushed):** When a `chrom` filter (and optionally a `pos` range) is pushed, a single partition is created that queries only the matching BGZF blocks.
 
 ```python
 df = spark.read.format("vcf").load("s3a://bucket/calls.vcf.gz")
 
-# Region filter — chrom equality and pos range are pushed to the tabix index
+# Full scan — one Spark partition per chromosome, parallel reads
+df.count()
+
+# Region filter — single partition, tabix-guided I/O
 df.filter("chrom = 'chr1' AND pos >= 1000000 AND pos <= 2000000").show()
+
+# Control the maximum number of partitions for a full scan
+df = spark.read.format("vcf") \
+    .option("numPartitions", "50") \
+    .load("s3a://bucket/calls.vcf.gz")
 ```
 
 ### BCF
@@ -61,25 +82,29 @@ df.count()
 
 ## Predicate pushdown
 
-The scan builder recognizes two filter patterns and uses them to plan tabix-guided partitions:
+Pushdown behavior differs by file type:
 
-| Filter expression | Pushdown effect |
-|---|---|
-| `chrom = '<value>'` | Only tabix blocks for that chromosome are read |
-| `chrom = '<value>' AND pos >= A AND pos <= B` | Only tabix blocks overlapping `[A, B]` are read |
+| File type | Filter expression | Effect |
+|---|---|---|
+| `.vcf.gz` (tabix) | `chrom = '<value>'` | Only tabix blocks for that chromosome are read — reduces I/O |
+| `.vcf.gz` (tabix) | `chrom = '<value>' AND pos >= A AND pos <= B` | Only tabix blocks overlapping `[A, B]` are read — reduces I/O |
+| `.vcf` (plain) | any `chrom` / `pos` filter | Spark post-filter only — all byte-range partitions are read |
 
-All pushed filters are also re-applied by Spark as a post-filter to handle records that span block boundaries. This means the result is always correct, and pushing filters is always safe.
+All pushed filters are re-applied by Spark as a post-filter in all cases, so results are always correct. For selective queries on large files, bgzipped + tabix is more I/O efficient than plain-text.
 
-A `pos` range without a `chrom` filter is not pushable — tabix requires a chromosome to look up blocks.
+A `pos` range without a `chrom` filter is not pushable for tabix — tabix requires a chromosome to look up blocks.
 
 ```python
-# Pushed: only chr17 BGZF blocks are read from the file
+# .vcf.gz: only chr17 BGZF blocks are read from the file
 df.filter("chrom = 'chr17'").count()
 
-# Pushed: only blocks overlapping BRCA1 are read
+# .vcf.gz: only blocks overlapping BRCA1 are read
 df.filter("chrom = 'chr17' AND pos >= 43044295 AND pos <= 43125370")
 
-# Not pushed: pos range without chrom — full scan, Spark post-filters
+# .vcf (plain): all partitions read, Spark post-filters to chr17 rows
+df.filter("chrom = 'chr17'").count()
+
+# Not pushed for tabix: pos range without chrom — full scan
 df.filter("pos >= 1000000 AND pos <= 2000000")
 ```
 
@@ -87,7 +112,9 @@ df.filter("pos >= 1000000 AND pos <= 2000000")
 
 ## Index resolution order
 
-For each VCF/BCF file:
+Index resolution applies only to bgzipped (`.vcf.gz`) and BCF files. Plain-text `.vcf` files always use byte-range splitting regardless of whether an index is present.
+
+For each bgzipped or BCF file:
 
 1. `indexPath` option (single-file reads only)
 2. Co-located `<filePath>.tbi`
@@ -162,7 +189,7 @@ For multi-sample VCF files, all samples appear as keys in the genotypes map with
 
 | Option | Default | Description |
 |---|---|---|
-| `indexPath` | — | Explicit tabix index path (`.tbi` or `.csi`). Single-file reads only. |
-| `indexDir` | — | Directory of tabix index files. Resolved as `<indexDir>/<filename>.tbi`. |
-| `numPartitions` | `200` | Maximum partitions per file when tabix splitting is active. Currently a single partition is always planned per pushed region; this option is reserved for future multi-block splitting. |
-| `useIndex` | `true` | Set `false` to skip index resolution and read the whole file in one partition. |
+| `vcfSplitSize` | `134217728` (128 MiB) | Byte-range split size for plain-text `.vcf` files. Smaller values increase parallelism; ignored for `.vcf.gz` and `.bcf`. |
+| `numPartitions` | `200` | Maximum number of partitions for bgzipped VCF full-file reads (per-chromosome partitioning). Has no effect on plain-text `.vcf` files or region queries. |
+| `indexPath` | — | Explicit tabix index path (`.tbi` or `.csi`). Applies to bgzipped files only. Single-file reads only. |
+| `useIndex` | `true` | Set `false` to skip index resolution for bgzipped/BCF files and read the whole file in one partition. Has no effect on plain-text `.vcf` files. |

@@ -1,6 +1,7 @@
 package com.litebfx.fastq;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -74,6 +75,9 @@ public class FastqScan implements Scan, Batch {
         long minSplitBytes = options.containsKey("minSplitBytes")
                 ? Long.parseLong(options.get("minSplitBytes"))
                 : MIN_SPLIT_BYTES;
+        long bgzfSplitSize = options.containsKey("bgzfSplitSize")
+                ? Long.parseLong(options.get("bgzfSplitSize"))
+                : 128L * 1024 * 1024; // 128 MiB default
 
         Configuration hadoopConf = SparkSession.builder().getOrCreate()
                 .sessionState().newHadoopConf();
@@ -92,8 +96,15 @@ public class FastqScan implements Scan, Batch {
                 Integer readNumber = detectReadNumber(status.getPath().getName());
 
                 if (isGzipped) {
-                    log.trace("planInputPartitions() gzipped -> single partition for {}", filePath);
-                    partitions.add(new FastqInputPartition(filePath, 0L, Long.MAX_VALUE, hadoopConf, readNumber));
+                    long fileSize = status.getLen();
+                    if (fileSize > bgzfSplitSize && isBgzfFile(fs, status.getPath())) {
+                        log.trace("planInputPartitions() BGZF detected -> split partitions for {}", filePath);
+                        planBgzfSplitPartitions(filePath, fileSize, bgzfSplitSize, numPartitions,
+                                hadoopConf, readNumber, partitions);
+                    } else {
+                        log.trace("planInputPartitions() gzipped -> single partition for {}", filePath);
+                        partitions.add(new FastqInputPartition(filePath, 0L, Long.MAX_VALUE, hadoopConf, readNumber));
+                    }
                 } else {
                     long fileSize = status.getLen();
                     int splits = (int) Math.min(numPartitions,
@@ -126,6 +137,65 @@ public class FastqScan implements Scan, Batch {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Plans fixed-size byte-range partitions for a BGZF-compressed FASTQ file.
+     *
+     * <p>Each partition covers a compressed-byte range. The reader seeks to the first
+     * BGZF block at or after its {@code startByte}, scans forward in the decompressed
+     * text to the next {@code @} record boundary, and stops when the BGZF block address
+     * exceeds {@code endByte}.
+     *
+     * <p>The split size (in compressed bytes) is controlled by the {@code bgzfSplitSize}
+     * option (default 128 MiB). The number of chunks is also capped at {@code numPartitions}.
+     */
+    private static void planBgzfSplitPartitions(String filePath,
+                                                long fileSize,
+                                                long splitSize,
+                                                int maxPartitions,
+                                                Configuration conf,
+                                                Integer readNumber,
+                                                List<InputPartition> out) {
+        int numChunks = (int) Math.min(maxPartitions,
+                Math.max(1L, (long) Math.ceil((double) fileSize / splitSize)));
+        long chunkSize = fileSize / numChunks;
+        log.trace("planBgzfSplitPartitions() fileSize={} numChunks={} chunkSize={}", fileSize, numChunks, chunkSize);
+        for (int i = 0; i < numChunks; i++) {
+            long startByte = (long) i * chunkSize;
+            long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long)(i + 1) * chunkSize;
+            log.trace("planBgzfSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
+            out.add(new FastqInputPartition(filePath, startByte, endByte, conf, readNumber, true));
+        }
+    }
+
+    /**
+     * Returns true when the file at {@code path} is BGZF-compressed.
+     *
+     * <p>Reads the first 16 bytes of the file and checks for the BGZF extra-field
+     * subfield identifiers SI1={@code 'B'} (0x42) and SI2={@code 'C'} (0x43) at
+     * the expected offsets in the gzip extra-field header.
+     */
+    private static boolean isBgzfFile(FileSystem fs, Path path) {
+        byte[] header = new byte[16];
+        try (FSDataInputStream in = fs.open(path)) {
+            int n = 0;
+            while (n < header.length) {
+                int r = in.read(header, n, header.length - n);
+                if (r < 0) return false;
+                n += r;
+            }
+        } catch (IOException e) {
+            return false;
+        }
+        // gzip magic (bytes 0-1), CM=deflate (byte 2), FLG has FEXTRA set (byte 3 bit 2),
+        // BGZF extra subfield IDs SI1='B' (byte 12) and SI2='C' (byte 13).
+        return header[0] == (byte) 0x1f
+            && header[1] == (byte) 0x8b
+            && header[2] == 0x08
+            && (header[3] & 0x04) != 0
+            && header[12] == 0x42   // 'B'
+            && header[13] == 0x43;  // 'C'
+    }
 
     private static FileStatus[] resolveFiles(FileSystem fs, Path path) throws IOException {
         FileStatus status = fs.getFileStatus(path);

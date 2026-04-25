@@ -52,13 +52,48 @@ CRAI (CRAM index) files store per-container offset information. The splitting lo
 
 ---
 
-## VCF and BED: tabix-based splitting
+## VCF: byte-range splitting (plain text) and tabix (bgzipped)
+
+### Plain-text VCF (`.vcf`)
+
+Plain-text VCF files use the same byte-range splitting strategy as uncompressed BED and SAM. The scan divides the file into fixed-size chunks (default 128 MiB, controlled by `vcfSplitSize`). Each executor seeks to its chunk boundary, scans forward to the next newline, reads the `#CHROM` header line from offset 0 to recover sample names, then parses data lines until its end boundary.
+
+Because VCF records are fully self-contained per line (all eight mandatory columns plus per-sample genotype columns), the split is lossless: every record is read exactly once, by the partition whose range contains the start of that line.
+
+```
+plain calls.vcf (600 MiB), vcfSplitSize=128 MiB:
+  Partition 0: bytes [0, 128M)    → reads header from offset 0, parses data lines in range
+  Partition 1: bytes [128M, 256M) → reads header from offset 0, seeks to 128M
+  Partition 2: bytes [256M, 384M) → …
+  Partition 3: bytes [384M, 512M) → …
+  Partition 4: bytes [512M, EOF)  → …
+```
+
+Any pushed region filter is applied by Spark as a post-filter over each partition's output. All partitions are read even when a `chrom` filter is present — bgzipped + tabix is more efficient for selective queries.
+
+### Bgzipped VCF (`.vcf.gz`) and BCF
 
 Tabix (`.tbi`, `.csi`) indexes store, for each chromosome block in a bgzipped file, the virtual file offsets of the BGZF blocks that contain records on that chromosome. The htsjdk `TabixIndex` API exposes these.
 
-When a `chrom` filter (and optionally a `pos`/`chromStart`/`chromEnd` range) is pushed down, the scan calls `TabixIndex.getBlocks(chrom, start, end)` to get the VFO spans for the query region. Currently a single partition is planned per query; the partition's byte range covers all relevant BGZF blocks.
+**When a tabix index is present and no region filter is pushed**, the scan reads the chromosome list from the index on the driver (by streaming the small BGZF-compressed index file via Hadoop FS) and groups chromosomes into at most `numPartitions` partitions. Each executor performs targeted tabix queries for its assigned chromosome group — mirroring the BAI VFO-based splitting used for BAM.
 
-Without a tabix index, or when no region filter is pushed, a single full-file partition is planned.
+```
+calls.vcf.gz (tabix, chr1–chr22 + chrX + chrY + chrM = 25 chroms), numPartitions=25:
+  Partition 0:  chr1  → tabix query, reads only chr1 BGZF blocks
+  Partition 1:  chr2  → tabix query, reads only chr2 BGZF blocks
+  …
+  Partition 24: chrM  → tabix query, reads only chrM BGZF blocks
+```
+
+**When a `chrom` filter (and optionally a `pos` range) is pushed down**, a single partition is planned that calls htsjdk's tabix query for the specified region — same targeted BGZF-block access, lower overhead than a full per-chromosome split.
+
+**Without a tabix index**, a single full-file partition is planned.
+
+## BED: byte-range splitting (plain text) and tabix (bgzipped)
+
+Plain-text BED files (no `.gz` suffix) use byte-range splitting with a default split size of 128 MiB (controlled by `bedSplitSize`). Each executor seeks to its chunk start, skips to the next newline, and reads BED records until the end of its chunk. Header lines (`track`, `browser`, `#`) are skipped on every partition.
+
+Bgzipped BED files (`.bed.gz`) use tabix-based partition planning when a co-located `.tbi` or `.csi` index is present — identical to bgzipped VCF.
 
 ---
 
@@ -68,9 +103,13 @@ The FAI (FASTA index) format stores the byte offset of each contig's bases withi
 
 ---
 
-## FASTQ: byte-range splitting
+## FASTQ: BGZF splitting and byte-range splitting
 
-FASTQ has no standard seekable index. For uncompressed files the scan divides the file into byte-range splits of at least 64 MB. Each executor scans forward from its split start to find the next `@` record boundary before beginning iteration. For gzipped files, a single partition is always used.
+FASTQ has no standard seekable index. The split strategy depends on compression:
+
+- **BGZF-compressed** (`.fastq.gz`/`.fq.gz` produced by `bgzip`, BCL2FASTQ, or most modern pipelines): the file is split into multiple partitions of at most `bgzfSplitSize` compressed bytes each (default 128 MiB). Each executor seeks to the first BGZF block at or after its partition boundary, then scans forward in the decompressed stream to the next `@` record.
+- **Plain-gzip** (`.fastq.gz`/`.fq.gz` produced by standard `gzip`): a single partition covers the entire file, read sequentially by one executor.
+- **Uncompressed** (`.fastq`/`.fq`): the file is divided into byte-range splits of at least 64 MB. Each executor scans forward from its split start to find the next `@` record boundary before beginning iteration.
 
 ---
 
@@ -80,16 +119,18 @@ The scan builders implement `SupportsPushDownFilters`. When Spark's query planne
 
 | Format | Pushable | Effect |
 |---|---|---|
-| BAM | `referenceName = 'X'` | BAI region query |
-| BAM | `referenceName = 'X' AND start >= A AND start <= B` | BAI region query with coordinate range |
-| VCF | `chrom = 'X'` | Tabix query |
-| VCF | `chrom = 'X' AND pos >= A AND pos <= B` | Tabix query with range |
-| BED | `chrom = 'X'` | Tabix query |
-| BED | `chrom = 'X' AND chromStart >= A AND chromEnd <= B` | Tabix query with range |
+| BAM | `referenceName = 'X'` | BAI region query — reduces I/O |
+| BAM | `referenceName = 'X' AND start >= A AND start <= B` | BAI region query with coordinate range — reduces I/O |
+| VCF `.vcf.gz` | `chrom = 'X'` | Tabix query — reduces I/O |
+| VCF `.vcf.gz` | `chrom = 'X' AND pos >= A AND pos <= B` | Tabix query with range — reduces I/O |
+| VCF `.vcf` | `chrom = 'X'`, `pos` range | Spark post-filter only — all partitions are read |
+| BED `.bed.gz` | `chrom = 'X'` | Tabix query — reduces I/O |
+| BED `.bed.gz` | `chrom = 'X' AND chromStart >= A AND chromEnd <= B` | Tabix query with range — reduces I/O |
+| BED `.bed` | `chrom = 'X'`, coordinate range | Spark post-filter only — all partitions are read |
 
-**All pushed filters are returned as unhandled from `pushedFilters()`.** This means Spark re-applies every filter as a post-filter on the output rows. The pushdown effect is purely at the partition-planning level (which BGZF blocks to read), not at the row-filtering level. This is intentional: it guarantees correctness for records near block boundaries without requiring the library to re-implement the boundary logic.
+**All pushed filters are returned as unhandled from `pushedFilters()`.** This means Spark re-applies every filter as a post-filter on the output rows regardless of format. For indexed formats (BAM, bgzipped VCF/BED), the pushdown effect additionally reduces which BGZF blocks are fetched from storage. For plain-text formats (uncompressed VCF, uncompressed BED), all byte-range partitions are read and Spark post-filters the rows — there is no I/O reduction, but the partitioning still provides read parallelism.
 
-The practical effect is: pushed filters reduce I/O (fewer BGZF blocks are fetched from object storage), and Spark's post-filter reduces the rows returned to the query. Both happen automatically.
+This design guarantees correctness for records near block boundaries without requiring the library to re-implement the boundary logic.
 
 ---
 
@@ -124,11 +165,18 @@ This is why reads from `s3a://`, `abfss://`, or `gs://` paths work transparently
 `numPartitions` controls the maximum number of partitions per file (excluding the unmapped partition for BAM). The actual count is:
 
 ```
-BAM (with BAI):  min(numPartitions, numReferences) + 1 unmapped partition
-CRAM (with CRAI): number of CRAI entries (not capped — each container is one partition)
-VCF/BED (tabix): 1 per pushed region query (numPartitions reserved for future use)
-FASTA (with FAI): min(numPartitions, numContigs)
-FASTQ (uncompressed): min(numPartitions, ceil(fileSize / 64MB))
+BAM (with BAI):              min(numPartitions, numReferences) + 1 unmapped partition
+CRAM (with CRAI):            number of CRAI entries (not capped — each container is one partition)
+VCF .vcf.gz (tabix, no filter): min(numPartitions, numChroms)
+VCF .vcf.gz (tabix, filter): 1 per pushed region query
+VCF .vcf.gz (no index):      1 (full-file scan)
+VCF .vcf (plain):            ceil(fileSize / vcfSplitSize)
+BED .bed.gz (tabix):         1 per pushed region query
+BED .bed (plain):            ceil(fileSize / bedSplitSize)
+FASTA (with FAI):            min(numPartitions, numContigs)
+FASTQ (BGZF):                min(numPartitions, ceil(fileSize / bgzfSplitSize))
+FASTQ (plain-gzip):          1 (not splittable)
+FASTQ (uncompressed):        min(numPartitions, ceil(fileSize / minSplitBytes))
 ```
 
 Setting `numPartitions` higher than the number of references in a BAM has no effect — you cannot have more partitions than references. Setting it lower groups references together, reducing parallelism but also reducing the number of BAI seeks and task overhead.

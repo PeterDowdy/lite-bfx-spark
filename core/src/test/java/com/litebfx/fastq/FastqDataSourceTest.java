@@ -157,15 +157,100 @@ class FastqDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
-    // Gzipped → single partition
+    // Gzipped → single partition (plain gzip, not BGZF)
     // -------------------------------------------------------------------------
 
     @Test
     void gzipFastq_producesCorrectCount() {
-        // Gzipped files must be read as a single partition and return all records.
+        // Plain gzip (not BGZF) must fall back to a single partition.
         long count = spark.read().format("fastq")
                 .load(fixtures.gzipFastq().toString()).count();
         assertEquals(FastqTestGenerator.GZIP_COUNT, count);
+    }
+
+    @Test
+    void gzipFastq_smallBgzfSplitSize_isBgzfCheckedAndFallsBackToSinglePartition() {
+        // bgzfSplitSize=1 forces the isBgzfFile() check even for tiny files.
+        // test.fastq.gz is plain gzip (not BGZF), so isBgzfFile() returns false
+        // and the reader falls back to the single-partition path.
+        long count = spark.read().format("fastq")
+                .option("bgzfSplitSize", "1")
+                .load(fixtures.gzipFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.GZIP_COUNT, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // BGZF → multi-partition
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bgzfFastq_multiPartition_correctCount() {
+        // bgzfSplitSize=1 forces as many chunks as numPartitions allows, exercising
+        // multi-partition BGZF reads. The total count must equal BGZF_COUNT with no
+        // duplicates and no gaps.
+        long count = spark.read().format("fastq")
+                .option("bgzfSplitSize", "1")
+                .load(fixtures.bgzfFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.BGZF_COUNT, count);
+    }
+
+    @Test
+    void bgzfFastq_multiPartition_noDuplicates() {
+        long distinct = spark.read().format("fastq")
+                .option("bgzfSplitSize", "1")
+                .load(fixtures.bgzfFastq().toString())
+                .select("readName")
+                .distinct()
+                .count();
+        assertEquals(FastqTestGenerator.BGZF_COUNT, distinct);
+    }
+
+    @Test
+    void bgzfFastq_readNumber_detectedFromFilename() {
+        // The BGZF fixture filename contains "_R1_" so readNumber must be 1.
+        int readNum = (int) spark.read().format("fastq")
+                .load(fixtures.bgzfFastq().toString())
+                .first()
+                .getAs("readNumber");
+        assertEquals(1, readNum);
+    }
+
+    @Test
+    void bgzfFastq_readName_doesNotContainAtSign() {
+        // In BGZF mode the header line is read raw (includes leading '@').  The reader
+        // must strip it before constructing FastqRecord so readName never starts with '@'.
+        Row row = spark.read().format("fastq")
+                .load(fixtures.bgzfFastq().toString())
+                .orderBy("readName")
+                .first();
+        String readName = row.getString(row.fieldIndex("readName"));
+        assertFalse(readName.startsWith("@"),
+                "readName from BGZF file should not include the leading '@'");
+    }
+
+    @Test
+    void bgzfFastq_numPartitions2_capsChunks_correctCount() {
+        // numPartitions=2 combined with bgzfSplitSize=1 caps planBgzfSplitPartitions
+        // at 2 chunks; total count must still equal BGZF_COUNT with no duplicates/gaps.
+        long count = spark.read().format("fastq")
+                .option("bgzfSplitSize", "1")
+                .option("numPartitions", "2")
+                .load(fixtures.bgzfFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.BGZF_COUNT, count);
+    }
+
+    @Test
+    void bgzfFastq_singlePartition_correctCount() {
+        // When the file fits in one split (bgzfSplitSize larger than the file),
+        // a single partition is used — same result, different code path.
+        long count = spark.read().format("fastq")
+                .option("bgzfSplitSize", String.valueOf(Long.MAX_VALUE))
+                .load(fixtures.bgzfFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.BGZF_COUNT, count);
     }
 
     // -------------------------------------------------------------------------
@@ -273,6 +358,43 @@ class FastqDataSourceTest {
         List<Row> r2Rows = df.filter("readNumber = 2").limit(1).collectAsList();
         assertFalse(r1Rows.isEmpty(), "Expected rows with readNumber=1 (R1 files)");
         assertFalse(r2Rows.isEmpty(), "Expected rows with readNumber=2 (R2 files)");
+    }
+
+    // -------------------------------------------------------------------------
+    // Uncompressed → multi-partition
+    // -------------------------------------------------------------------------
+
+    @Test
+    void uncompressedFastq_multiPartition_correctCount() {
+        // minSplitBytes=1 forces many byte-range splits, exercising advanceToRecordBoundary
+        // and the per-partition endByte check in FastqPartitionReader.
+        long count = spark.read().format("fastq")
+                .option("minSplitBytes", "1")
+                .load(fixtures.plainFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.PLAIN_COUNT, count);
+    }
+
+    @Test
+    void uncompressedFastq_multiPartition_noDuplicates() {
+        long distinct = spark.read().format("fastq")
+                .option("minSplitBytes", "1")
+                .load(fixtures.plainFastq().toString())
+                .select("readName")
+                .distinct()
+                .count();
+        assertEquals(FastqTestGenerator.PLAIN_COUNT, distinct);
+    }
+
+    @Test
+    void uncompressedFastq_numPartitions_capsAtRequested() {
+        // numPartitions=2 caps splits at 2; minSplitBytes=1 ensures 2 are actually created.
+        long count = spark.read().format("fastq")
+                .option("minSplitBytes", "1")
+                .option("numPartitions", "2")
+                .load(fixtures.plainFastq().toString())
+                .count();
+        assertEquals(FastqTestGenerator.PLAIN_COUNT, count);
     }
 
     // -------------------------------------------------------------------------
