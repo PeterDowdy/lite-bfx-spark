@@ -54,16 +54,26 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
 
     private final FastqInputPartition partition;
 
+    /** Read-buffer size for plain-split mode. Large enough to amortise S3 HTTP overhead. */
+    private static final int PLAIN_SPLIT_BUFFER_SIZE = 256 * 1024; // 256 KB
+
     // ── plain-gzip and uncompressed mode ───────────────────────────────────────
     private FSDataInputStream rawStream;
     private FastqReader fastqReader;
+
+    // ── uncompressed split mode ────────────────────────────────────────────────
+    private boolean plainSplit  = false; // true when uncompressed with endByte != MAX_VALUE
+    private byte[]  plainBuf;            // chunk buffer filled from rawStream in large reads
+    private int     plainBufOff = 0;
+    private int     plainBufLen = 0;
+    private long    plainPos;            // logical file position = bytes consumed so far
 
     // ── BGZF split mode ────────────────────────────────────────────────────────
     private FSDataInputStream bgzfFsStream;
     private BlockCompressedInputStream bcis;
 
     // ── shared ─────────────────────────────────────────────────────────────────
-    private boolean opened   = false;
+    private boolean opened    = false;
     private boolean exhausted = false;
     private FastqRecord current;
 
@@ -89,24 +99,16 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
             return nextBgzf();
         }
 
-        // plain-gzip / uncompressed path via FastqReader
+        if (plainSplit) {
+            return nextPlainSplit();
+        }
+
+        // plain-gzip / uncompressed path via FastqReader (no boundary check needed)
         if (!fastqReader.hasNext()) {
             exhausted = true;
             return false;
         }
         current = fastqReader.next();
-
-        if (partition.getEndByte() != Long.MAX_VALUE) {
-            try {
-                long pos = rawStream.getPos();
-                if (pos > partition.getEndByte()) {
-                    exhausted = true;
-                }
-            } catch (IOException e) {
-                log.trace("next() could not check stream position: {}", e.getMessage());
-            }
-        }
-
         log.trace("next() readName={}", current.getReadName());
         return true;
     }
@@ -177,18 +179,30 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
 
         if (isGzipped) {
             inputStream = new GZIPInputStream(rawStream);
+            fastqReader = new FastqReader(
+                    new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8)));
+            log.trace("open() FastqReader opened, isGzipped=true");
         } else {
             long startByte = partition.getStartByte();
             if (startByte > 0) {
                 rawStream.seek(startByte);
                 advanceToRecordBoundary(rawStream);
             }
+            if (partition.getEndByte() != Long.MAX_VALUE) {
+                // Split partition: buffer large chunks and track position ourselves so
+                // the boundary check is accurate even against object-storage streams.
+                plainSplit = true;
+                plainBuf   = new byte[PLAIN_SPLIT_BUFFER_SIZE];
+                plainPos   = rawStream.getPos(); // accurate: advanceToRecordBoundary read byte-by-byte
+                log.trace("open() plain split mode, startByte={} endByte={} plainPos={}",
+                        partition.getStartByte(), partition.getEndByte(), plainPos);
+                return;
+            }
             inputStream = rawStream;
+            fastqReader = new FastqReader(
+                    new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8)));
+            log.trace("open() FastqReader opened, isGzipped=false");
         }
-
-        fastqReader = new FastqReader(
-                new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8)));
-        log.trace("open() FastqReader opened, isGzipped={}", isGzipped);
     }
 
     /**
@@ -297,6 +311,79 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
         current = new FastqRecord(readHeader, sequence, "+", quals);
         log.trace("nextBgzf() readName={}", current.getReadName());
         return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Uncompressed split record iteration
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reads the next FASTQ record in plain-split mode.
+     *
+     * <p>Uses {@link #plainPos} — a counter maintained by {@link #readPlainByte()} — for
+     * the boundary check rather than {@link FSDataInputStream#getPos()}.  This allows
+     * {@link #rawStream} to be filled in large chunks ({@value #PLAIN_SPLIT_BUFFER_SIZE}
+     * bytes at a time), which is important for object-storage backends like S3 where a
+     * single large {@code read(buf, 0, N)} maps to one HTTP GET, whereas byte-by-byte
+     * reads would thrash the readahead layer.
+     */
+    private boolean nextPlainSplit() throws IOException {
+        if (plainPos >= partition.getEndByte()) {
+            log.trace("nextPlainSplit() reached end boundary plainPos={} endByte={}", plainPos, partition.getEndByte());
+            exhausted = true;
+            return false;
+        }
+
+        String header = readLineRaw();
+        if (header == null) { exhausted = true; return false; }
+        while (header.isEmpty() || header.charAt(0) != '@') {
+            header = readLineRaw();
+            if (header == null) { exhausted = true; return false; }
+        }
+
+        String sequence = readLineRaw();
+        if (sequence == null) { exhausted = true; return false; }
+
+        readLineRaw(); // consume '+' separator
+
+        String quals = readLineRaw();
+        if (quals == null) { exhausted = true; return false; }
+
+        String readHeader = header.charAt(0) == '@' ? header.substring(1) : header;
+        current = new FastqRecord(readHeader, sequence, "+", quals);
+        log.trace("nextPlainSplit() readName={}", current.getReadName());
+        return true;
+    }
+
+    /**
+     * Reads one line from the plain-split chunk buffer, returning the content without
+     * the trailing newline, or {@code null} at EOF when no bytes were read.
+     */
+    private String readLineRaw() throws IOException {
+        StringBuilder sb = new StringBuilder(256);
+        int b;
+        while ((b = readPlainByte()) != -1) {
+            if (b == '\n') return sb.toString();
+            if (b != '\r') sb.append((char) b);
+        }
+        return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /**
+     * Returns the next byte from {@link #plainBuf}, refilling it from {@link #rawStream}
+     * in {@value #PLAIN_SPLIT_BUFFER_SIZE}-byte chunks when empty.  Increments
+     * {@link #plainPos} for every byte returned so the boundary check in
+     * {@link #nextPlainSplit()} remains accurate without calling
+     * {@link FSDataInputStream#getPos()}.
+     */
+    private int readPlainByte() throws IOException {
+        if (plainBufOff >= plainBufLen) {
+            plainBufLen = rawStream.read(plainBuf, 0, plainBuf.length);
+            plainBufOff = 0;
+            if (plainBufLen <= 0) return -1;
+        }
+        plainPos++;
+        return plainBuf[plainBufOff++] & 0xFF;
     }
 
     /**
