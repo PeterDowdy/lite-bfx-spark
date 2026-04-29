@@ -63,6 +63,21 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
         this.partition = partition;
     }
 
+    /** Package-private for testing the Hadoop full-scan path without a real FS. */
+    FastaPartitionReader(FastaInputPartition partition, java.io.BufferedReader lineReader) {
+        this.partition = partition;
+        this.hadoopLineReader = lineReader;
+    }
+
+    /** Package-private for testing the Hadoop indexed-read path without a real remote FS. */
+    FastaPartitionReader(FastaInputPartition partition,
+                         HadoopSeekableStream hadoopStream,
+                         FaiEntry faiEntry) {
+        this.partition      = partition;
+        this.hadoopStream   = hadoopStream;
+        this.hadoopFaiEntry = faiEntry;
+    }
+
     @Override
     public boolean next() throws IOException {
         if (!isOpened()) open();
@@ -241,7 +256,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
      * Reads the next FASTA record from a sequential {@link BufferedReader}.
      * Returns null at end of file.
      */
-    private ReferenceSequence readNextContigViaHadoop() throws IOException {
+    ReferenceSequence readNextContigViaHadoop() throws IOException {
         // Consume or re-use the buffered header from the previous call
         String header = hadoopBufferedHeader;
         hadoopBufferedHeader = null;
@@ -278,8 +293,8 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
      * {@code contigName}.
      * <p>FAI format: NAME\tLENGTH\tOFFSET\tBASES_PER_LINE\tBYTES_PER_LINE
      */
-    private static FaiEntry readFaiEntry(String faiPath, String contigName,
-                                         org.apache.hadoop.conf.Configuration conf)
+    static FaiEntry readFaiEntry(String faiPath, String contigName,
+                                 org.apache.hadoop.conf.Configuration conf)
             throws IOException {
         Path path = new Path(faiPath);
         try (FSDataInputStream in = path.getFileSystem(conf).open(path);
@@ -318,7 +333,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
     // Path helpers
     // -------------------------------------------------------------------------
 
-    private static boolean isLocalPath(String pathStr) {
+    static boolean isLocalPath(String pathStr) {
         try {
             URI uri = URI.create(pathStr);
             String scheme = uri.getScheme();
@@ -328,7 +343,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
         }
     }
 
-    private static java.nio.file.Path toNioPath(String pathStr) {
+    static java.nio.file.Path toNioPath(String pathStr) {
         try {
             URI uri = URI.create(pathStr);
             if (uri.getScheme() == null) {
@@ -344,7 +359,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
     // FAI entry value type
     // -------------------------------------------------------------------------
 
-    private static final class FaiEntry {
+    static final class FaiEntry {
         final long size;         // total bases in contig
         final long offset;       // byte offset of first base in FASTA file
         final int  basesPerLine; // bases per wrapped line

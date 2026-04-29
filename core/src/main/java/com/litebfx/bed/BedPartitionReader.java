@@ -252,8 +252,10 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
 
     private String readLine() throws IOException {
         if (bcis != null) {
+            // -1 is the sentinel set when tabixBlocks.isEmpty() — no blocks to read.
+            if (currentBlockEnd < 0) return null;
             // Check end-of-block boundary
-            if (currentBlockEnd >= 0 && bcis.getPosition() >= currentBlockEnd) {
+            if (currentBlockEnd != Long.MAX_VALUE && bcis.getPosition() >= currentBlockEnd) {
                 return null; // signal caller to advance to next block
             }
             return bcis.readLine();
