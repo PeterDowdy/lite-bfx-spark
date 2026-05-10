@@ -208,18 +208,19 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
             bcis = new BlockCompressedInputStream(seekable);
 
             if (indexPath != null && queryChrom != null) {
-                // Load tabix index. TabixIndex(File) wraps in BlockCompressedInputStream
-                // internally; TabixIndex(InputStream) does not, so we use File for local paths.
-                try {
-                    java.io.File idxFile = new java.io.File(new java.net.URI(indexPath));
-                    TabixIndex tabix = new TabixIndex(idxFile);
+                // Load tabix index via Hadoop FS so cloud URIs (s3a://, gs://, wasb://) work.
+                // TabixIndex(InputStream) reads raw bytes; we wrap in BlockCompressedInputStream
+                // to decompress the BGZF-encoded .tbi file before parsing.
+                Path idxHadoopPath = new Path(indexPath);
+                FileSystem idxFs = idxHadoopPath.getFileSystem(conf);
+                try (FSDataInputStream idxIn = idxFs.open(idxHadoopPath);
+                     BlockCompressedInputStream bgzf = new BlockCompressedInputStream(idxIn)) {
+                    TabixIndex tabix = new TabixIndex(bgzf);
                     // Convert 0-based queryStart to 1-based for tabix
                     int htsjdkStart = (int) Math.min(partition.getQueryStart() + 1, Integer.MAX_VALUE);
                     int htsjdkEnd   = (int) Math.min(partition.getQueryEnd(),       Integer.MAX_VALUE);
                     tabixBlocks = tabix.getBlocks(queryChrom, htsjdkStart, htsjdkEnd);
                     log.trace("open() tabix blocks={}", tabixBlocks.size());
-                } catch (java.net.URISyntaxException e) {
-                    throw new IOException("Invalid index path URI: " + indexPath, e);
                 }
                 if (tabixBlocks.isEmpty()) {
                     // No matching blocks — reader will return nothing

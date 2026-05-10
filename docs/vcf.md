@@ -185,6 +185,44 @@ For multi-sample VCF files, all samples appear as keys in the genotypes map with
 
 ---
 
+## Spark SQL
+
+VCF and BCF files can be queried directly from Spark SQL without building a `DataFrameReader`.
+
+### Direct path reference
+
+For reads that need no options, use the `format.\`path\`` backtick syntax:
+
+```sql
+SELECT chrom, count(*) AS variants
+FROM vcf.`s3a://bucket/calls.vcf.gz`
+GROUP BY chrom
+ORDER BY variants DESC;
+```
+
+### CREATE TEMPORARY VIEW (with options)
+
+To pass options such as `indexPath`, `numPartitions`, or `useIndex`, create a temporary view first, then query it with standard SQL including `WHERE` clauses for region filtering:
+
+```sql
+CREATE TEMPORARY VIEW variants
+USING vcf
+OPTIONS (
+  path 's3a://bucket/calls.vcf.gz'
+);
+
+-- Region filter — pushed to tabix index; only chr17 BGZF blocks are read
+SELECT chrom, pos, ref, alt
+FROM variants
+WHERE chrom = 'chr17'
+  AND pos >= 43044295
+  AND pos <= 43125370;
+```
+
+Region filters in the `WHERE` clause trigger the same tabix-guided partition optimization as the DataFrame API.
+
+---
+
 ## Options reference
 
 | Option | Default | Description |

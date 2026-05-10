@@ -77,6 +77,39 @@ Split 1:  bytes [64MB,  128MB)  → scans to first @, reads until position > 128
 
 ---
 
+## Spark SQL
+
+FASTQ files can be queried directly from Spark SQL without building a `DataFrameReader`.
+
+### Direct path reference
+
+For reads that need no options, use the `format.\`path\`` backtick syntax:
+
+```sql
+SELECT readName, sequence, baseQualities
+FROM fastq.`s3a://bucket/reads_R1.fastq.gz`
+LIMIT 10;
+```
+
+### CREATE TEMPORARY VIEW (with options)
+
+To pass options such as `numPartitions` or `bgzfSplitSize`, create a temporary view first:
+
+```sql
+CREATE TEMPORARY VIEW reads_r1
+USING fastq
+OPTIONS (
+  path           's3a://bucket/reads_R1.fastq.gz',
+  numPartitions  '64'
+);
+
+SELECT readName, length(sequence) AS readLength
+FROM reads_r1
+WHERE description LIKE '%:N:%';
+```
+
+---
+
 ## Options reference
 
 | Option | Default | Description |

@@ -9,9 +9,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.OutputStream;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -398,6 +402,32 @@ class FastqDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_countMatchesExpected() {
+        String path = fixtures.plainFastq().toString();
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW fastq_view USING fastq"
+                + " OPTIONS (path '" + path + "')");
+        long count = spark.sql("SELECT count(*) FROM fastq_view").first().getLong(0);
+        assertEquals(FastqTestGenerator.PLAIN_COUNT, count);
+        spark.sql("DROP VIEW IF EXISTS fastq_view");
+    }
+
+    @Test
+    void sql_createTempView_selectFields_returnsExpectedSchema() {
+        String path = fixtures.plainFastq().toString();
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW fastq_schema_view USING fastq"
+                + " OPTIONS (path '" + path + "')");
+        Dataset<Row> df = spark.sql("SELECT readName, sequence FROM fastq_schema_view");
+        assertEquals(2, df.schema().length());
+        assertEquals("readName", df.schema().apply(0).name());
+        assertEquals("sequence", df.schema().apply(1).name());
+        spark.sql("DROP VIEW IF EXISTS fastq_schema_view");
+    }
+
+    // -------------------------------------------------------------------------
     // Error conditions
     // -------------------------------------------------------------------------
 
@@ -405,5 +435,111 @@ class FastqDataSourceTest {
     void missingFile_throwsException() {
         assertThrows(Exception.class, () ->
             spark.read().format("fastq").load("/no/such/file.fastq").count());
+    }
+
+    // -------------------------------------------------------------------------
+    // .fq.gz extension — covers isGzipped ".fq.gz" branch in planInputPartitions
+    // -------------------------------------------------------------------------
+
+    @Test
+    void fqGzExtension_singleFile_readsCorrectly() throws Exception {
+        // File ends with .fq.gz: isGzipped = endsWith(".fastq.gz") [F] || endsWith(".fq.gz") [T]
+        // This covers the second OR branch in the isGzipped assignment.
+        Path fqGz = tempDir.resolve("reads_R2_001.fq.gz");
+        try (OutputStream os = new GZIPOutputStream(Files.newOutputStream(fqGz))) {
+            for (int i = 0; i < 3; i++) {
+                os.write(("@read" + i + "\nACGTACGTAC\n+\nIIIIIIIIII\n")
+                        .getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        long count = spark.read().format("fastq").load(fqGz.toUri().toString()).count();
+        assertEquals(3L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Directory loads — isFastqExtension branch coverage
+    // -------------------------------------------------------------------------
+
+    @Test
+    void directory_plainFastqFile_extensionRecognized() throws Exception {
+        // Directory contains a .fastq file: isFastqExtension checks endsWith(".fastq") [T]
+        // first condition is true → short-circuits (B1 true branch).
+        Path dir = tempDir.resolve("dir_fastq");
+        Files.createDirectory(dir);
+        Files.writeString(dir.resolve("reads.fastq"),
+                "@r1\nACGT\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n", StandardCharsets.UTF_8);
+        long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
+        assertEquals(2L, count);
+    }
+
+    @Test
+    void directory_fqFile_extensionRecognized() throws Exception {
+        // Directory contains a .fq file: endsWith(".fastq") [F], endsWith(".fq") [T]
+        // Covers the B3 true branch of isFastqExtension.
+        Path dir = tempDir.resolve("dir_fq");
+        Files.createDirectory(dir);
+        Files.writeString(dir.resolve("reads_R1_001.fq"),
+                "@r1\nACGT\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n@r3\nGGGG\n+\nJJJJ\n",
+                StandardCharsets.UTF_8);
+        long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
+        assertEquals(3L, count);
+    }
+
+    @Test
+    void directory_fqGzFile_extensionRecognized() throws Exception {
+        // Directory contains a .fq.gz file: .fastq[F], .fq[F], .fastq.gz[F], .fq.gz[T]
+        // Covers the B7 true branch of isFastqExtension.
+        Path dir = tempDir.resolve("dir_fq_gz");
+        Files.createDirectory(dir);
+        Path fqGz = dir.resolve("reads_R1.fq.gz");
+        try (OutputStream os = new GZIPOutputStream(Files.newOutputStream(fqGz))) {
+            for (int i = 0; i < 2; i++) {
+                os.write(("@r" + i + "\nACGT\n+\nIIII\n").getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
+        assertEquals(2L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Directory with no FASTQ files — covers !files.isEmpty() false branch
+    // (fallback listStatus path in resolveFiles) and empty statuses loop
+    // in planInputPartitions
+    // -------------------------------------------------------------------------
+
+    @Test
+    void directory_noFastqFiles_returnsEmpty() throws Exception {
+        // All children fail isFastqExtension → files list stays empty after the glob
+        // loop → !files.isEmpty() = false → fallback listStatus path is taken.
+        // planInputPartitions receives an empty statuses array → for-each loop never
+        // enters → 0 partitions → 0 rows.
+        Path dir = tempDir.resolve("dir_no_fastq");
+        Files.createDirectory(dir);
+        Files.writeString(dir.resolve("notes.txt"), "not fastq content", StandardCharsets.UTF_8);
+        long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
+        assertEquals(0L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // resolveFiles() — child.isFile() == false branch
+    // A subdirectory inside the target directory is a non-file child; it must be
+    // skipped (child.isFile() = false → AND short-circuits → not added to files).
+    // -------------------------------------------------------------------------
+
+    @Test
+    void directory_withSubdirectory_subdirSkipped_fastqFileRead() throws Exception {
+        // Directory contains a subdirectory (child.isFile() = false → skip) and
+        // a .fastq file (child.isFile() = true, extension OK → added).
+        // The s.isDirectory() branch in resolveFiles() calls listStatus() on the
+        // parent; the subdirectory child exercises the child.isFile() == false path.
+        Path dir = tempDir.resolve("dir_with_subdir");
+        Files.createDirectory(dir);
+        Files.createDirectory(dir.resolve("subdir")); // non-file child
+        Files.writeString(dir.resolve("reads_R1_001.fastq"),
+                "@r1\nACGT\n+\nIIII\n@r2\nCCCC\n+\nJJJJ\n",
+                StandardCharsets.UTF_8);
+
+        long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
+        assertEquals(2L, count);
     }
 }

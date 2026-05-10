@@ -7,8 +7,13 @@ import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -23,6 +28,9 @@ class FastaDataSourceTest {
     static SparkSession spark;
     static String fastaPath;
     static String faiPath;
+
+    @TempDir
+    static Path tempDir;
 
     /** Sequence read from the raw file for byte-for-byte comparison. */
     static final String EXPECTED_CONTIG = "000000F";
@@ -115,6 +123,132 @@ class FastaDataSourceTest {
         long count = spark.read().format("fasta")
                 .option("indexPath", faiPath)
                 .load(fastaPath)
+                .count();
+        assertEquals(1L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_filterByName_returnsCorrectLength() {
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW fasta_view USING fasta"
+                + " OPTIONS (path '" + fastaPath + "')");
+        long length = spark.sql(
+                "SELECT length FROM fasta_view WHERE name = '" + EXPECTED_CONTIG + "'")
+                .first().getLong(0);
+        assertEquals(EXPECTED_LENGTH, length);
+        spark.sql("DROP VIEW IF EXISTS fasta_view");
+    }
+
+    // -------------------------------------------------------------------------
+    // No-FAI fallback — single full-scan partition
+    // Covers the faiPath == null branch in FastaScan.planInputPartitions()
+    // -------------------------------------------------------------------------
+
+    @Test
+    void noFaiFallback_noIndex_singlePartitionScan() throws Exception {
+        // Copy realn01.fa to a temp path without a co-located .fai and with no
+        // explicit indexPath option — resolveFaiPath() returns null → single
+        // full-scan partition (the faiPath == null else-branch).
+        Path fastaNoIdx = tempDir.resolve("noidx.fa");
+        Files.copy(Paths.get(java.net.URI.create(fastaPath)), fastaNoIdx);
+        // Do NOT write a .fai alongside it
+
+        long count = spark.read().format("fasta")
+                .load(fastaNoIdx.toUri().toString())
+                .count();
+        // Full-scan reads all contigs; realn01.fa has 1 contig
+        assertEquals(1L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Explicit non-existent indexPath — resolveFaiPath() falls through to co-located
+    // Covers the explicit != null && !exists(p) branch
+    // -------------------------------------------------------------------------
+
+    @Test
+    void explicitIndexPath_nonExistentFile_fallsBackToColocated() throws Exception {
+        // Provide an explicit indexPath that doesn't exist → resolveFaiPath() falls
+        // through to the co-located .fai check (which succeeds for realn01.fa).
+        String badIndexPath = tempDir.resolve("no_such.fai").toUri().toString();
+
+        long count = spark.read().format("fasta")
+                .option("indexPath", badIndexPath)
+                .load(fastaPath)
+                .count();
+        assertEquals(1L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // maxMergeGap option — exercises the maxMergeGapOpt != null branch
+    // -------------------------------------------------------------------------
+
+    @Test
+    void maxMergeGap_customValue_readsCorrectly() {
+        // Setting maxMergeGap triggers the maxMergeGapOpt != null branch in
+        // planInputPartitions(), exercising the parseInt + assignment path.
+        long count = spark.read().format("fasta")
+                .option("maxMergeGap", "0")
+                .load(fastaPath)
+                .count();
+        assertEquals(1L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pushed-name filter that matches nothing — empty partition array
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushedNameFilter_noMatch_returnsEmpty() {
+        // Filter by a contig name that does not exist in the FASTA — the pushed
+        // name filter removes all contig names from the list, resulting in zero
+        // partitions and zero rows.
+        long count = spark.read().format("fasta")
+                .load(fastaPath)
+                .filter("name = 'nonexistent_contig'")
+                .count();
+        assertEquals(0L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // readContigNames — FAI file with an empty line (skipped)
+    // Covers the line.isEmpty() branch in readContigNames()
+    // -------------------------------------------------------------------------
+
+    @Test
+    void readContigNames_faiWithEmptyLine_emptyLineSkipped() throws Exception {
+        // Strategy: provide two FAI files.
+        //   • co-located  <fa>.fai  — valid, no blank lines; htsjdk reads this when
+        //     FastaPartitionReader.openWithNio() auto-discovers the index.
+        //   • explicit    blank.fai — has a blank line before the entry; FastaScan
+        //     reads this via the "indexPath" option in readContigNames().
+        // The blank line triggers line.isEmpty() = true → skip in readContigNames().
+        // htsjdk never sees the blank-line FAI so it does not reject the file.
+        Path fa           = tempDir.resolve("emptyline.fa");
+        Path colocatedFai = tempDir.resolve("emptyline.fa.fai");
+        Path blankLineFai = tempDir.resolve("emptyline_blank.fai");
+
+        String seq60    = "ACGT".repeat(15);
+        String faContent = ">chr1\n" + seq60 + "\n";
+        Files.writeString(fa, faContent, StandardCharsets.UTF_8);
+
+        long offset = (">chr1\n").length(); // 6 bytes to first base
+        // Valid FAI for htsjdk (co-located, no blank lines)
+        Files.writeString(colocatedFai,
+                "chr1\t60\t" + offset + "\t60\t61\n",
+                StandardCharsets.UTF_8);
+        // FAI with blank line for FastaScan.readContigNames()
+        Files.writeString(blankLineFai,
+                "\nchr1\t60\t" + offset + "\t60\t61\n",
+                StandardCharsets.UTF_8);
+
+        // indexPath → FastaScan.readContigNames() reads blankLineFai (blank line skipped).
+        // FastaPartitionReader.openWithNio() uses htsjdk which auto-discovers emptyline.fa.fai.
+        long count = spark.read().format("fasta")
+                .option("indexPath", blankLineFai.toUri().toString())
+                .load(fa.toUri().toString())
                 .count();
         assertEquals(1L, count);
     }

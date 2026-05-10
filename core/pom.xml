@@ -101,6 +101,141 @@
         </dependency>
       </dependencies>
     </profile>
+    <!--
+      GCS integration profile — activated by -Pgcs-integration.
+      Compiles src/test-gcs/java and runs tests against fake-gcs-server.
+
+      Usage:
+        mvn test -Pgcs-integration \
+          -Dgcs.endpoint=http://localhost:4443 \
+          [-Dgcs.bucket=test-bucket] \
+          [-Dgcs.project=test-project]
+
+      Via Docker:
+        docker compose run spark-test-gcs
+    -->
+    <profile>
+      <id>gcs-integration</id>
+      <properties>
+        <gcs.bucket>test-bucket</gcs.bucket>
+        <gcs.project>test-project</gcs.project>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-gcs-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-gcs/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <!-- GCE_METADATA_HOST points the Google auth library to a local mock server
+                   (started in @BeforeAll by each GCS test class) that returns a fake Bearer
+                   token. fake-gcs-server accepts any Bearer token without validation. -->
+              <environmentVariables>
+                <GCE_METADATA_HOST>127.0.0.1:21999</GCE_METADATA_HOST>
+              </environmentVariables>
+              <systemPropertyVariables>
+                <gcs.endpoint>${gcs.endpoint}</gcs.endpoint>
+                <gcs.bucket>${gcs.bucket}</gcs.bucket>
+                <gcs.project>${gcs.project}</gcs.project>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>com.google.cloud.bigdataoss</groupId>
+          <artifactId>gcs-connector</artifactId>
+          <version>hadoop3-2.2.22</version>
+          <classifier>shaded</classifier>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <!--
+      Azure ABFS integration profile — activated by -Pazure-integration.
+      Compiles src/test-azure/java and runs tests against Azurite.
+
+      The ABFS connector resolves the storage account as a DNS hostname
+      ({account}.dfs.core.windows.net).  In Docker, the azurite service
+      exposes network aliases for these hostnames.  For local runs, add
+      entries to /etc/hosts pointing to 127.0.0.1.
+
+      Usage:
+        mvn test -Pazure-integration \
+          [-Dazure.account=devstoreaccount1] \
+          [-Dazure.container=test-container]
+
+      Via Docker:
+        docker compose run spark-test-azure
+    -->
+    <profile>
+      <id>azure-integration</id>
+      <properties>
+        <azure.account>devstoreaccount1</azure.account>
+        <azure.container>test-container</azure.container>
+        <!-- Well-known Azurite shared key -->
+        <azure.key>Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==</azure.key>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-azure-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-azure/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <azure.account>${azure.account}</azure.account>
+                <azure.container>${azure.container}</azure.container>
+                <azure.key>${azure.key}</azure.key>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>hadoop-azure</artifactId>
+          <version>${hadoop.version}</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
   </profiles>
 
   <build>

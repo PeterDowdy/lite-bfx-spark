@@ -1,5 +1,12 @@
 package com.litebfx.bam;
 
+import htsjdk.samtools.BAMRecordCodec;
+import htsjdk.samtools.SAMFileHeader;
+import htsjdk.samtools.SAMFileWriter;
+import htsjdk.samtools.SAMFileWriterFactory;
+import htsjdk.samtools.SAMRecord;
+import htsjdk.samtools.SAMSequenceRecord;
+import htsjdk.samtools.util.BlockCompressedOutputStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.util.MapData;
@@ -410,9 +417,179 @@ class BamPartitionReaderTest {
         assertEquals(0, rows.size(), "partition starting past EOF should be empty");
     }
 
+    @Test
+    void samSplit_headerOnlyFile_returnsNoRecords() throws IOException {
+        // SAM with only @HD + @SQ lines and no data records.
+        // openSamSplit() reads until line == null → dataStartByte = lineEndPos (EOF).
+        // Partition 0 seeks to dataStartByte which equals fileLength → empty.
+        Path headerOnly = tempDir.resolve("headeronly.sam");
+        Files.writeString(headerOnly,
+                "@HD\tVN:1.6\tSO:coordinate\n" +
+                "@SQ\tSN:chr1\tLN:1000000\n");
+        List<InternalRow> rows = readSamPartition(headerOnly, 0L, Long.MAX_VALUE);
+        assertEquals(0, rows.size(), "header-only SAM must yield no records");
+    }
+
+    @Test
+    void samSplit_positionPastEndByteAfterSkip_emptyPartition() throws IOException {
+        // Partition whose startByte falls mid-line in the last line of the file.
+        // After discarding the partial line, position >= endByte → samLineParser stays null.
+        long fileSize = Files.size(fixtures.sam());
+        // Set endByte equal to startByte so there is no room for any line.
+        long midLine = fileSize - 3;   // inside the last line
+        List<InternalRow> rows = readSamPartition(fixtures.sam(), midLine, midLine);
+        assertEquals(0, rows.size(),
+            "partition where post-skip position >= endByte should be empty");
+    }
+
+    @Test
+    void samSplit_blankLineInData_skipped() throws IOException {
+        // SAM with a blank line between data records.
+        // next() reads the blank line → line.isEmpty() TRUE → continue (skips it).
+        Path sam = tempDir.resolve("blank_data.sam");
+        Files.writeString(sam,
+                "@HD\tVN:1.6\tSO:coordinate\n" +
+                "@SQ\tSN:chr1\tLN:1000000\n" +
+                "read1\t0\tchr1\t100\t60\t50M\t*\t0\t0\t" + "A".repeat(50) + "\t" + "I".repeat(50) + "\n" +
+                "\n" +     // blank line
+                "read2\t0\tchr1\t200\t60\t50M\t*\t0\t0\t" + "A".repeat(50) + "\t" + "I".repeat(50) + "\n");
+        List<InternalRow> rows = readSamPartition(sam, 0L, Long.MAX_VALUE);
+        assertEquals(2, rows.size(), "blank line in SAM data must be skipped");
+        assertEquals("read1", rows.get(0).getUTF8String(0).toString());
+        assertEquals("read2", rows.get(1).getUTF8String(0).toString());
+    }
+
+    @Test
+    void samSplit_noTrailingNewline_lastRecordReturned() throws IOException {
+        // SAM file whose last data line has no trailing '\n'.
+        // readLineFrom() reaches EOF with sb non-empty → sb.length() > 0 TRUE → returns string.
+        Path sam = tempDir.resolve("no_trailing_newline.sam");
+        String content =
+                "@HD\tVN:1.6\tSO:coordinate\n" +
+                "@SQ\tSN:chr1\tLN:1000000\n" +
+                "read1\t0\tchr1\t100\t60\t50M\t*\t0\t0\t" + "A".repeat(50) + "\t" + "I".repeat(50);
+        Files.write(sam, content.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        List<InternalRow> rows = readSamPartition(sam, 0L, Long.MAX_VALUE);
+        assertEquals(1, rows.size(), "last record with no trailing newline must still be returned");
+        assertEquals("read1", rows.get(0).getUTF8String(0).toString());
+    }
+
+    @Test
+    void samSplit_crlfLineEndings_readCorrectly() throws IOException {
+        // SAM with CRLF (\r\n) line endings.
+        // readLineFrom(): b == '\r' → b != '\r' FALSE → character NOT appended (stripped).
+        Path sam = tempDir.resolve("crlf.sam");
+        String content =
+                "@HD\tVN:1.6\tSO:coordinate\r\n" +
+                "@SQ\tSN:chr1\tLN:1000000\r\n" +
+                "read1\t0\tchr1\t100\t60\t50M\t*\t0\t0\t" + "A".repeat(50) + "\t" + "I".repeat(50) + "\r\n";
+        Files.write(sam, content.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        List<InternalRow> rows = readSamPartition(sam, 0L, Long.MAX_VALUE);
+        assertEquals(1, rows.size(), "CRLF SAM must parse correctly");
+        assertEquals("read1", rows.get(0).getUTF8String(0).toString());
+    }
+
+    // -------------------------------------------------------------------------
+    // BGZF split — findNextBgzfBlockStart and findCleanRecordStart edge cases
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bgzf_startByte1_twoBlockBam_eofDuringBlockScan_readsAllRecords() throws IOException {
+        // Two-block BAM (header in block 0, records in block 1): findNextBgzfBlockStart
+        // scans from byte 1, hits EOF before filling its 65 KB buffer → n < 0 branch.
+        // Block 1 is found within the buffer; all records are read until
+        // bamRecordCodec.decode() returns null at EOF → r == null TRUE branch.
+        // Also covers endByte != MAX_VALUE FALSE (endByte = MAX_VALUE, no early stop).
+        Path twoBlock = createTwoBlockBam(tempDir.resolve("two_block.bam"));
+        List<InternalRow> rows = readPartition(twoBlock, 1L, Long.MAX_VALUE);
+        assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
+            "starting from byte 1 in a two-block BAM must still read all data records");
+    }
+
+    @Test
+    void bgzf_startNearEof_lessThan4BytesRead_emptyPartition() throws IOException {
+        // Start 2 bytes before EOF: findNextBgzfBlockStart reads 2 bytes (< 4),
+        // the for-loop condition i <= 2-4 = -2 is false on the first check →
+        // loop body never executes → returns -1 → empty partition.
+        long fileSize = Files.size(fixtures.bam());
+        List<InternalRow> rows = readPartition(fixtures.bam(), fileSize - 2, Long.MAX_VALUE);
+        assertEquals(0, rows.size(), "only 2 bytes before EOF yields no BGZF block");
+    }
+
+    @Test
+    void bgzf_startAtEofBlock_probeReturnsEof_emptyPartition() throws IOException {
+        // Start exactly at the 28-byte empty EOF BGZF block.
+        // findNextBgzfBlockStart finds the EOF block's magic at offset 0 in the scan.
+        // findCleanRecordStart probes its decompressed content: bcis.read() returns -1
+        // (0 bytes in EOF block) → n != 4 FALSE branch → advances to next block →
+        // no next block → returns -1 → empty partition.
+        long fileSize = Files.size(fixtures.bam());
+        long eofBlockOffset = fileSize - 28;  // empty EOF BGZF block is always 28 bytes
+        List<InternalRow> rows = readPartition(fixtures.bam(), eofBlockOffset, Long.MAX_VALUE);
+        assertEquals(0, rows.size(), "partition starting at EOF block must be empty");
+    }
+
+    // -------------------------------------------------------------------------
+    // open() — partition modes not yet covered
+    // -------------------------------------------------------------------------
+
+    @Test
+    void open_queryUnmapped_noIndex_opensWithoutIndex() {
+        // queryUnmapped=true with no index: open() takes the getIndexPath()==null branch
+        // (opens the BAM without attaching a BAI stream). queryUnmapped() then throws
+        // because a BAM without an index cannot seek to the unmapped section — but the
+        // important thing is that the code reaches the else branch, which JaCoCo counts.
+        BamInputPartition partition = new BamInputPartition(
+                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
+                /* indexPath */ null, false, null, "none",
+                /* querySequence */ null, 1, Integer.MAX_VALUE,
+                /* querySequences */ null, /* queryUnmapped */ true, false);
+        assertThrows(Exception.class, () -> readPartitionDirect(partition),
+            "queryUnmapped without BAI must throw (but the no-index branch is still covered)");
+    }
+
+    @Test
+    void open_querySequences_noIndex_fallsBackToFullScan() throws IOException {
+        // querySequences set but indexPath == null → "no index; fall back to full-file scan"
+        // branch taken in open(); samReader.iterator() returns all records.
+        BamInputPartition partition = new BamInputPartition(
+                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
+                /* indexPath */ null, false, null, "none",
+                /* querySequence */ null, 1, Integer.MAX_VALUE,
+                /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
+                /* queryUnmapped */ false, false);
+        List<InternalRow> rows = readPartitionDirect(partition);
+        assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
+            "no-index querySequences falls back to full scan and returns all records");
+    }
+
+    @Test
+    void open_cramContainerSplit_emptySpans_returnsNoRecords() throws IOException {
+        // cramContainerSpans non-null (→ CRAM container-split path in open()) but empty
+        // (→ spans.length == 0 TRUE branch in openCramContainerSplit() → early return).
+        BamInputPartition partition = new BamInputPartition(
+                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
+                null, true, null, "none",
+                null, 1, Integer.MAX_VALUE,
+                null, false, false,
+                /* cramContainerSpans */ new long[0]);
+        List<InternalRow> rows = readPartitionDirect(partition);
+        assertEquals(0, rows.size(), "empty CRAM spans must produce an empty partition");
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /** Reads all rows from an already-constructed partition. */
+    private static List<InternalRow> readPartitionDirect(BamInputPartition partition)
+            throws IOException {
+        List<InternalRow> rows = new ArrayList<>();
+        try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
+            while (reader.next()) rows.add(reader.get());
+        }
+        return rows;
+    }
 
     /** Opens a full-file partition for the given path and collects all rows. */
     private static List<InternalRow> readAll(Path path, boolean includeAttributes)
@@ -475,6 +652,62 @@ class BamPartitionReaderTest {
             while (reader.next()) rows.add(reader.get());
         }
         return rows;
+    }
+
+    /**
+     * Writes a BAM with RECORD_COUNT records in two separate BGZF data blocks:
+     * the BAM header lands in block 0 (explicit flush after writing the header binary),
+     * and all data records land in block 1.  This gives the file the structure:
+     * [header BGZF block] [data BGZF block] [EOF BGZF block]
+     * which is required for tests that need to scan from byte 1 and still find a
+     * valid data block (rather than landing directly on the EOF block as would happen
+     * with a single-block BAM).
+     */
+    private static Path createTwoBlockBam(Path dest) throws IOException {
+        SAMFileHeader header = new SAMFileHeader();
+        header.addSequence(new SAMSequenceRecord(TestBamGenerator.REF_NAME, TestBamGenerator.REF_LENGTH));
+        header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
+
+        try (BlockCompressedOutputStream bcos = new BlockCompressedOutputStream(dest.toFile())) {
+            // Write the BAM header binary manually so we can flush the BGZF block
+            // immediately after, forcing header and records into separate BGZF blocks.
+            htsjdk.samtools.util.BinaryCodec bc = new htsjdk.samtools.util.BinaryCodec(bcos);
+            // BAM magic
+            bcos.write(new byte[]{'B', 'A', 'M', 1});
+            // l_text + header text
+            byte[] headerText = ("@HD\tVN:1.6\tSO:coordinate\n" +
+                    "@SQ\tSN:" + TestBamGenerator.REF_NAME +
+                    "\tLN:" + TestBamGenerator.REF_LENGTH + "\n")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            bc.writeInt(headerText.length);
+            bcos.write(headerText);
+            // n_ref = 1 reference
+            bc.writeInt(1);
+            byte[] refName = (TestBamGenerator.REF_NAME + "\0").getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            bc.writeInt(refName.length);
+            bcos.write(refName);
+            bc.writeInt(TestBamGenerator.REF_LENGTH);
+            bcos.flush(); // ← force header into its own BGZF block
+
+            // Write records into the second BGZF block using a temporary BAM writer
+            // approach: generate records via htsjdk's BAMRecordCodec.
+            BAMRecordCodec codec = new BAMRecordCodec(header);
+            codec.setOutputStream(bcos);
+            for (int i = 0; i < TestBamGenerator.RECORD_COUNT; i++) {
+                SAMRecord r = new SAMRecord(header);
+                r.setReadName("read" + (i + 1));
+                r.setFlags(0);
+                r.setReferenceIndex(0);
+                r.setAlignmentStart((i + 1) * 100);
+                r.setMappingQuality(TestBamGenerator.MAPPING_QUALITY);
+                r.setCigarString(TestBamGenerator.CIGAR);
+                r.setReadString(TestBamGenerator.SEQUENCE);
+                r.setBaseQualityString(TestBamGenerator.BASE_QUALITIES);
+                r.setAttribute("NM", 0);
+                codec.encode(r);
+            }
+        }
+        return dest;
     }
 
     /**

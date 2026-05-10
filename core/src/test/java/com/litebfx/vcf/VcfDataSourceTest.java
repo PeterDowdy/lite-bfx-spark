@@ -331,6 +331,32 @@ class VcfDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_countMatchesExpected() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW vcf_view USING vcf"
+                + " OPTIONS (path '" + fx.bgzVcf() + "')");
+        long count = spark.sql("SELECT count(*) FROM vcf_view").first().getLong(0);
+        assertEquals(VcfTestGenerator.VCF_TOTAL, count);
+        spark.sql("DROP VIEW IF EXISTS vcf_view");
+    }
+
+    @Test
+    void sql_createTempView_regionFilter_returnsCorrectCount() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW vcf_region_view USING vcf"
+                + " OPTIONS (path '" + fx.bgzVcf() + "')");
+        long count = spark.sql(
+                "SELECT count(*) FROM vcf_region_view WHERE chrom = 'chr1'")
+                .first().getLong(0);
+        assertEquals(VcfTestGenerator.VCF_CHR1_COUNT, count);
+        spark.sql("DROP VIEW IF EXISTS vcf_region_view");
+    }
+
+    // -------------------------------------------------------------------------
     // Column pruning
     // -------------------------------------------------------------------------
 
@@ -604,5 +630,65 @@ class VcfDataSourceTest {
                 .load(fx.bgzVcf().toString())
                 .count();
         assertEquals(3L, count, "3 variants across 3 chroms should all be returned");
+    }
+
+    // -------------------------------------------------------------------------
+    // .bgzf extension treated as bgzipped — covers isPlainTextVcf() .bgzf check
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bgzfExtension_treatedAsBgzipped_correctCount() throws Exception {
+        // Rename .vcf.gz to .vcf.bgzf — isPlainTextVcf() evaluates four checks:
+        // !endsWith(.gz) [true] && !endsWith(.bgz) [true] && !endsWith(.bgzf) [false].
+        // The .bgzf check returning false is the one previously-uncovered branch.
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Path bgzfCopy = tempDir.resolve("renamed2.vcf.bgzf");
+        Path tbiCopy  = tempDir.resolve("renamed2.vcf.bgzf.tbi");
+        Files.copy(Paths.get(fx.bgzVcf()),   bgzfCopy, StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(Paths.get(fx.tbiIndex()), tbiCopy,  StandardCopyOption.REPLACE_EXISTING);
+
+        long count = spark.read().format("vcf").load(bgzfCopy.toUri().toString()).count();
+        assertEquals(VcfTestGenerator.VCF_TOTAL, count,
+                ".bgzf extension should be treated as bgzipped VCF, not plain-text");
+    }
+
+    // -------------------------------------------------------------------------
+    // planInputPartitions — pathStr == null throws IllegalArgumentException
+    // -------------------------------------------------------------------------
+
+    @Test
+    void vcfScan_noPathOption_throwsIllegalArgument() {
+        // Instantiate VcfScan with an empty options map (no "path" key) and verify
+        // planInputPartitions() throws before reaching the SparkSession call.
+        VcfScan scan = new VcfScan(
+                new CaseInsensitiveStringMap(Map.of()),
+                VcfSchema.SCHEMA, null, 1, Integer.MAX_VALUE);
+        assertThrows(IllegalArgumentException.class, scan::planInputPartitions);
+    }
+
+    // -------------------------------------------------------------------------
+    // planInputPartitions — readChromsFromTabix returns null (bad .tbi)
+    // → chroms != null && !chroms.isEmpty() evaluates false → single partition
+    // -------------------------------------------------------------------------
+
+    @Test
+    void tabixFullScan_badIndex_readChromsFails_fallsBackToSinglePartition() throws Exception {
+        // Place the bad "index" at a separate path (not co-located with the VCF) and
+        // pass it via option("indexPath").  resolveIndexPath() returns it; readChromsFromTabix()
+        // catches the parse error and returns null (chroms == null → false branch); planInputPartitions
+        // falls back to a single full-scan partition.  VcfPartitionReader.open() then uses
+        // VCFFileReader(path, requireIndex=false), which auto-discovers the valid co-located .tbi
+        // and reads all records — the bad file is never touched by the reader because queryChrom is null.
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+
+        Path badIdx = tempDir.resolve("bad_noncolocated.tbi");
+        Files.writeString(badIdx, "not a tabix index\n", StandardCharsets.UTF_8);
+
+        long count = spark.read().format("vcf")
+                .option("indexPath", badIdx.toUri().toString())
+                .load(fx.bgzVcf().toString())
+                .count();
+        assertEquals(VcfTestGenerator.VCF_TOTAL, count,
+                "bad explicit indexPath should fall back to full-scan returning all records");
     }
 }

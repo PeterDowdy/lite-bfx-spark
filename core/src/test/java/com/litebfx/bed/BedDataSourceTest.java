@@ -1,5 +1,9 @@
 package com.litebfx.bed;
 
+import htsjdk.samtools.util.BlockCompressedOutputStream;
+import htsjdk.tribble.bed.BEDCodec;
+import htsjdk.tribble.index.IndexFactory;
+import htsjdk.tribble.index.tabix.TabixIndex;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -8,8 +12,12 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.PrintWriter;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -185,6 +193,171 @@ class BedDataSourceTest {
         assertEquals("peak1",  first.getString(3));   // name
         assertEquals(500,      first.getInt(4));      // score
         assertEquals("+",      first.getString(5));   // strand
+    }
+
+    // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_countMatchesExpected() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        String bedPath = fx.bed6Bgzf().toString();
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW bed_view USING bed"
+                + " OPTIONS (path '" + bedPath + "')");
+        long count = spark.sql("SELECT count(*) FROM bed_view").first().getLong(0);
+        assertEquals(BedTestGenerator.BED6_TOTAL, count);
+        spark.sql("DROP VIEW IF EXISTS bed_view");
+    }
+
+    @Test
+    void sql_createTempView_regionFilter_returnsCorrectCount() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        String bedPath = fx.bed6Bgzf().toString();
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW bed_region_view USING bed"
+                + " OPTIONS (path '" + bedPath + "')");
+        long count = spark.sql(
+                "SELECT count(*) FROM bed_region_view WHERE chrom = 'chr1'")
+                .first().getLong(0);
+        assertEquals(BedTestGenerator.BED6_CHR1_COUNT, count);
+        spark.sql("DROP VIEW IF EXISTS bed_region_view");
+    }
+
+    // -------------------------------------------------------------------------
+    // .bgz extension — looksCompressed() covers .bgz branch in planInputPartitions
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bgzExtension_readsAllRecords() throws Exception {
+        // Write a BGZF file with .bgz extension — covers the ".bgz" branch in
+        // planInputPartitions()'s isCompressed check.
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        Path src = Paths.get(fx.bed6Bgzf());
+        Path bgzPath = tempDir.resolve("test.bed.bgz");
+        Files.copy(src, bgzPath, StandardCopyOption.REPLACE_EXISTING);
+
+        long count = spark.read().format("bed").load(bgzPath.toUri().toString()).count();
+        assertEquals(BedTestGenerator.BED6_TOTAL, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Explicit indexPath option — resolveIndexPath() explicit branch
+    // -------------------------------------------------------------------------
+
+    @Test
+    void explicitIndexPath_existingFile_usedForRegionQuery() throws Exception {
+        // Pass indexPath explicitly → resolveIndexPath() takes the explicit path branch.
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        String bedPath   = fx.bed6Bgzf().toString();
+        String indexPath = fx.bed6Tbi().toString();
+
+        long count = spark.read().format("bed")
+                .option("indexPath", indexPath)
+                .load(bedPath)
+                .filter("chrom = 'chr1'")
+                .count();
+        assertEquals(BedTestGenerator.BED6_CHR1_COUNT, count);
+    }
+
+    @Test
+    void explicitIndexPath_nonExistentFile_fallsBackToColocatedIndex() throws Exception {
+        // Explicit indexPath that does not exist → resolveIndexPath() falls through
+        // to co-located .tbi check, which succeeds.
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        String bedPath      = fx.bed6Bgzf().toString();
+        String badIndexPath = tempDir.resolve("does_not_exist.tbi").toUri().toString();
+
+        long count = spark.read().format("bed")
+                .option("indexPath", badIndexPath)
+                .load(bedPath)
+                .count();
+        // Falls back to co-located .tbi → returns all records
+        assertEquals(BedTestGenerator.BED6_TOTAL, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // planBedSplitPartitions — multiple chunks (bedSplitSize smaller than file)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void plainBed_smallSplitSize_multiplePartitions_countCorrect() throws Exception {
+        // Use a tiny bedSplitSize to force multiple chunks, covering the
+        // i != numChunks-1 branch (endByte != Long.MAX_VALUE) in planBedSplitPartitions.
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        String bed3Path = fx.bed3Plain().toString();
+
+        // 10 bytes per split ensures the 2-record BED3 file splits into >= 2 chunks
+        long count = spark.read().format("bed")
+                .option("bedSplitSize", "10")
+                .load(bed3Path)
+                .count();
+        assertEquals(BedTestGenerator.BED3_TOTAL, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // resolveIndexPath — co-located .csi branch (no .tbi, only .csi)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void csiIndex_colocated_usedForRegionQuery() throws Exception {
+        // Write a BGZF bed file in a fresh directory that has no .tbi.
+        // Write the tabix index bytes as <bed>.csi — resolveIndexPath() falls through
+        // the .tbi check and picks up the .csi file.  TabixIndex reads tabix-format
+        // bytes regardless of file extension.
+        Path csiDir = tempDir.resolve("csi_test");
+        Files.createDirectory(csiDir);
+        Path bedPath = csiDir.resolve("query.bed.gz");
+        Path csiPath = csiDir.resolve("query.bed.gz.csi");
+
+        try (BlockCompressedOutputStream out =
+                     new BlockCompressedOutputStream(bedPath.toFile())) {
+            PrintWriter pw = new PrintWriter(out);
+            pw.println("chr1\t100\t200\tpeak1\t500\t+");
+            pw.println("chr2\t100\t300\tpeak2\t700\t+");
+            pw.flush();
+        }
+        // Write tabix data to a .csi file (the resolver checks fs.exists(), not content)
+        TabixIndex tbi = IndexFactory.createTabixIndex(bedPath.toFile(), new BEDCodec(), null);
+        tbi.write(csiPath);
+
+        // Verify: no .tbi exists, so resolveIndexPath() must reach the .csi branch
+        assertFalse(Files.exists(csiDir.resolve("query.bed.gz.tbi")), ".tbi must not exist");
+        assertTrue(Files.exists(csiPath), ".csi must exist");
+
+        long chr1Count = spark.read().format("bed")
+                .load(bedPath.toUri().toString())
+                .filter("chrom = 'chr1'")
+                .count();
+        assertEquals(1L, chr1Count);
+    }
+
+    // -------------------------------------------------------------------------
+    // planBedSplitPartitions — splitSize <= 0 throws IllegalArgumentException
+    // -------------------------------------------------------------------------
+
+    @Test
+    void planBedSplitPartitions_negativeSplitSize_throwsException() throws Exception {
+        // bedSplitSize=-1 triggers the splitSize <= 0 guard in planBedSplitPartitions().
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        assertThrows(Exception.class, () ->
+                spark.read().format("bed")
+                        .option("bedSplitSize", "-1")
+                        .load(fx.bed3Plain().toString())
+                        .count());
+    }
+
+    // -------------------------------------------------------------------------
+    // planInputPartitions — pathStr == null throws IllegalArgumentException
+    // -------------------------------------------------------------------------
+
+    @Test
+    void bedScan_noPathOption_throwsIllegalArgument() {
+        // Instantiate BedScan directly with an empty options map (no "path" key).
+        // planInputPartitions() throws before reaching the SparkSession call.
+        org.apache.spark.sql.util.CaseInsensitiveStringMap empty =
+                new org.apache.spark.sql.util.CaseInsensitiveStringMap(java.util.Map.of());
+        BedScan scan = new BedScan(empty, BedSchema.SCHEMA, null, 0L, Long.MAX_VALUE);
+        assertThrows(IllegalArgumentException.class, scan::planInputPartitions);
     }
 
     // -------------------------------------------------------------------------

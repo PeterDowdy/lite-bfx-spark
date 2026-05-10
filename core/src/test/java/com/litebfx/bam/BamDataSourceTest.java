@@ -11,6 +11,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -148,6 +149,49 @@ class BamDataSourceTest {
         assertEquals(18L, count);
     }
 
+    @Test
+    void indexPath_nonexistent_fallsBackToColocated() {
+        // resolveIndexPath: explicit indexPath points to a file that doesn't exist →
+        // falls through to co-located check → finds range.bam.bai next to range.bam.
+        // The co-located BAI enables VFO splitting, so the count must still be correct.
+        long count = spark.read().format("bam")
+                .option("indexPath", "/nonexistent/path/no.bai")
+                .load(bamPath)
+                .count();
+        assertEquals(112L, count);
+    }
+
+    @Test
+    void indexDir_findsIndex_enablesIndexedRead() throws Exception {
+        // resolveIndexPath: indexDir contains <bamName>.bai → candidate exists → returned.
+        // Copy the BAI into a temp directory and pass it as indexDir.
+        Path baiFile = java.nio.file.Paths.get(new java.net.URI(baiPath));
+        Path indexDir = tempDir.resolve("indices");
+        java.nio.file.Files.createDirectories(indexDir);
+        // BAM filename is "range.bam"; BAI candidate is "range.bam.bai"
+        java.nio.file.Files.copy(baiFile, indexDir.resolve("range.bam.bai"));
+
+        long count = spark.read().format("bam")
+                .option("indexDir", indexDir.toUri().toString())
+                .load(bamPath)
+                .count();
+        assertEquals(112L, count);
+    }
+
+    @Test
+    void indexDir_notFound_fallsBackToColocated() {
+        // resolveIndexPath: indexDir is an empty directory → candidate missing →
+        // falls through to co-located check → finds range.bam.bai → still works.
+        Path emptyDir = tempDir.resolve("empty_index_dir");
+        emptyDir.toFile().mkdirs();
+
+        long count = spark.read().format("bam")
+                .option("indexDir", emptyDir.toUri().toString())
+                .load(bamPath)
+                .count();
+        assertEquals(112L, count);
+    }
+
     // -------------------------------------------------------------------------
     // SAM support
     // -------------------------------------------------------------------------
@@ -254,6 +298,112 @@ class BamDataSourceTest {
                 .rdd().getNumPartitions();
         assertEquals(1, numParts,
             "region push-down should produce a single partition regardless of BAI");
+    }
+
+    // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_countMatchesSamtools() {
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW bam_view USING bam"
+                + " OPTIONS (path '" + bamPath + "')");
+        long count = spark.sql("SELECT count(*) FROM bam_view").first().getLong(0);
+        assertEquals(112L, count);
+        spark.sql("DROP VIEW IF EXISTS bam_view");
+    }
+
+    @Test
+    void sql_createTempView_regionFilter_returnsCorrectCount() {
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW bam_region_view USING bam"
+                + " OPTIONS (path '" + bamPath + "')");
+        long count = spark.sql(
+                "SELECT count(*) FROM bam_region_view WHERE referenceName = 'CHROMOSOME_I'")
+                .first().getLong(0);
+        assertEquals(18L, count);
+        spark.sql("DROP VIEW IF EXISTS bam_region_view");
+    }
+
+    // -------------------------------------------------------------------------
+    // Directory and glob resolution (exercises BamScan.collectBamChildren)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void directory_ofBamFiles_readsAllRecords() throws Exception {
+        // Single directory path → globStatus returns [dirStatus] → collectBamChildren called.
+        // Generate in a staging dir; copy only the two BAMs (not the SAM) so the count
+        // is RECORD_COUNT * 2, not * 3 (isAcceptedExtension also accepts .sam).
+        Path stage = tempDir.resolve("stage_dir");
+        Files.createDirectories(stage);
+        TestBamGenerator.Fixtures fx = TestBamGenerator.generate(stage);
+        Path dir = tempDir.resolve("bamdir");
+        Files.createDirectories(dir);
+        Files.copy(fx.bam(), dir.resolve("a.bam"));
+        Files.copy(fx.bam(), dir.resolve("b.bam"));
+
+        long count = spark.read().format("bam")
+                .option("useIndex", "false")
+                .load(dir.toUri().toString())
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT * 2L, count);
+    }
+
+    @Test
+    void directory_withNonBamFiles_ignoresNonBam() throws Exception {
+        // isAcceptedExtension returns false for .txt — only the BAM file is collected.
+        Path stage = tempDir.resolve("stage_mixed");
+        Files.createDirectories(stage);
+        TestBamGenerator.Fixtures fx = TestBamGenerator.generate(stage);
+        Path dir = tempDir.resolve("mixeddir");
+        Files.createDirectories(dir);
+        Files.copy(fx.bam(), dir.resolve("reads.bam"));
+        Files.writeString(dir.resolve("notes.txt"), "ignored");
+
+        long count = spark.read().format("bam")
+                .option("useIndex", "false")
+                .load(dir.toUri().toString())
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+    }
+
+    @Test
+    void glob_multipleFiles_readsAll() throws Exception {
+        // Glob pattern → globStatus returns multiple FileStatus → else-if branch in
+        // resolveBamFiles; each file added via isAcceptedExtension (not collectBamChildren).
+        Path stage = tempDir.resolve("stage_glob");
+        Files.createDirectories(stage);
+        TestBamGenerator.Fixtures fx = TestBamGenerator.generate(stage);
+        Path dir = tempDir.resolve("globdir");
+        Files.createDirectories(dir);
+        Files.copy(fx.bam(), dir.resolve("a.bam"));
+        Files.copy(fx.bam(), dir.resolve("b.bam"));
+
+        String glob = dir.toUri().toString() + "/*.bam";
+        long count = spark.read().format("bam")
+                .option("useIndex", "false")
+                .load(glob)
+                .count();
+        assertEquals(TestBamGenerator.RECORD_COUNT * 2L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // SAM edge cases
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sam_headerOnly_returnsEmptyDataset() throws Exception {
+        // SAM file with only @HD and @SQ lines — no data records.
+        // Exercises openSamSplit() "line == null → dataStartByte = lineEndPos (EOF)" branch.
+        Path samPath = tempDir.resolve("headeronly.sam");
+        java.nio.file.Files.writeString(samPath,
+                "@HD\tVN:1.6\tSO:coordinate\n" +
+                "@SQ\tSN:chr1\tLN:1000000\n",
+                java.nio.charset.StandardCharsets.UTF_8);
+
+        long count = spark.read().format("bam")
+                .load(samPath.toUri().toString())
+                .count();
+        assertEquals(0L, count);
     }
 
     // -------------------------------------------------------------------------

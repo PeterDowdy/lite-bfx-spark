@@ -64,6 +64,39 @@ This is useful when the reference and its index live in different storage locati
 
 ---
 
+## Spark SQL
+
+FASTA files can be queried directly from Spark SQL without building a `DataFrameReader`.
+
+### Direct path reference
+
+For reads that need no options, use the `format.\`path\`` backtick syntax:
+
+```sql
+SELECT name, length
+FROM fasta.`s3a://ref/hg38.fa`
+ORDER BY length DESC;
+```
+
+### CREATE TEMPORARY VIEW (with options)
+
+To pass options such as `indexPath`, create a temporary view first:
+
+```sql
+CREATE TEMPORARY VIEW reference
+USING fasta
+OPTIONS (
+  path      's3a://ref/hg38.fa',
+  indexPath 's3a://idx/hg38.fa.fai'
+);
+
+SELECT name, length(sequence) AS bases
+FROM reference
+WHERE name = 'chr1';
+```
+
+---
+
 ## Options reference
 
 | Option | Default | Description |

@@ -136,6 +136,55 @@ Index resolution runs per-file. If some files have a BAI and others do not, file
 
 ---
 
+## Spark SQL
+
+BAM, SAM, and CRAM files can be queried directly from Spark SQL without building a `DataFrameReader`.
+
+### Direct path reference
+
+For reads that need no options, use the `format.\`path\`` backtick syntax:
+
+```sql
+SELECT referenceName, count(*) AS reads
+FROM bam.`s3a://bucket/sample.bam`
+GROUP BY referenceName
+ORDER BY reads DESC;
+```
+
+### CREATE TEMPORARY VIEW (with options)
+
+To pass options — such as `indexPath`, `referenceFile`, or `numPartitions` — create a temporary view first, then query it with standard SQL including `WHERE` clauses for region filtering:
+
+```sql
+-- BAM with explicit index
+CREATE TEMPORARY VIEW reads
+USING bam
+OPTIONS (
+  path      's3a://bucket/sample.bam',
+  indexPath 's3a://idx/sample.bam.bai'
+);
+
+SELECT referenceName, start, cigar
+FROM reads
+WHERE referenceName = 'chr17'
+  AND start >= 43044295
+  AND start <= 43125370;
+
+-- CRAM with reference (referenceFile is required for full sequence decoding)
+CREATE TEMPORARY VIEW cram_reads
+USING cram
+OPTIONS (
+  path          's3a://bucket/sample.cram',
+  referenceFile 's3a://ref/hg38.fa'
+);
+
+SELECT readName, referenceName, start FROM cram_reads LIMIT 10;
+```
+
+Region filters in the `WHERE` clause trigger the same BAI/CRAI-guided partition optimization as the DataFrame API.
+
+---
+
 ## Options reference
 
 | Option | Default | Description |

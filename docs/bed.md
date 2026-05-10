@@ -114,6 +114,44 @@ df = spark.read.format("bed") \
 
 ---
 
+## Spark SQL
+
+BED files can be queried directly from Spark SQL without building a `DataFrameReader`.
+
+### Direct path reference
+
+For reads that need no options, use the `format.\`path\`` backtick syntax:
+
+```sql
+SELECT chrom, count(*) AS intervals
+FROM bed.`s3a://bucket/peaks.bed.gz`
+GROUP BY chrom
+ORDER BY intervals DESC;
+```
+
+### CREATE TEMPORARY VIEW (with options)
+
+To pass options such as `indexPath` or `useIndex`, or to apply region filters via `WHERE`, create a temporary view first:
+
+```sql
+CREATE TEMPORARY VIEW peaks
+USING bed
+OPTIONS (
+  path 's3a://bucket/peaks.bed.gz'
+);
+
+-- Region filter — pushed to tabix index when a .tbi is co-located
+SELECT chrom, chromStart, chromEnd, name
+FROM peaks
+WHERE chrom = 'chr1'
+  AND chromStart >= 1000000
+  AND chromEnd   <= 2000000;
+```
+
+Region filters in the `WHERE` clause trigger the same tabix-guided partition optimization as the DataFrame API.
+
+---
+
 ## Options reference
 
 | Option | Default | Description |

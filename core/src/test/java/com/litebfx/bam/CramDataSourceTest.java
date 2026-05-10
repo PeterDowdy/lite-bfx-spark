@@ -183,6 +183,30 @@ public class CramDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Spark SQL
+    // -------------------------------------------------------------------------
+
+    @Test
+    void sql_createTempView_withReferenceFile_countMatchesExpected() {
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW cram_view USING cram"
+                + " OPTIONS (path '" + cramPath + "', referenceFile '" + fastaPath + "')");
+        long count = spark.sql("SELECT count(*) FROM cram_view").first().getLong(0);
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+        spark.sql("DROP VIEW IF EXISTS cram_view");
+    }
+
+    @Test
+    void sql_createTempView_regionFilter_returnsCorrectCount() {
+        spark.sql("CREATE OR REPLACE TEMPORARY VIEW cram_region_view USING cram"
+                + " OPTIONS (path '" + cramPath + "', referenceFile '" + fastaPath + "')");
+        long count = spark.sql(
+                "SELECT count(*) FROM cram_region_view WHERE referenceName = 'chr1'")
+                .first().getLong(0);
+        assertEquals(TestBamGenerator.RECORD_COUNT, count);
+        spark.sql("DROP VIEW IF EXISTS cram_region_view");
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

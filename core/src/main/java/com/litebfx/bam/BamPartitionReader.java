@@ -136,7 +136,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             return true;
         }
 
-        if (!iterator.hasNext()) return false;
+        if (iterator == null || !iterator.hasNext()) return false;
         current = iterator.next();
         log.trace("next() -> read record readName={}", current.getReadName());
         return true;
@@ -188,8 +188,8 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
         // CRAM container-split mode: checked first since isCram partitions never use BGZF/SAM paths.
         if (partition.getCramContainerSpans() != null) {
-            log.trace("open() CRAM container-split mode spans=[{}, {}]",
-                    partition.getCramContainerSpans()[0], partition.getCramContainerSpans()[1]);
+            log.trace("open() CRAM container-split mode spans.length={}",
+                    partition.getCramContainerSpans().length);
             openCramContainerSplit();
             return;
         }
