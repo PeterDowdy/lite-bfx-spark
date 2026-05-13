@@ -116,12 +116,15 @@ review. Items are grouped by difficulty to cover.
 
 ## High Priority
 
-### VCF cloud URI limitation
-`VcfPartitionReader` uses `VCFFileReader(java.nio.file.Path)` which requires a local
-filesystem path. Cloud URIs (`s3a://`, `gs://`, `wasb://`) are not supported for VCF
-reads. All other adapters (BAM, BED, FASTA, FASTQ) go through Hadoop FS correctly;
-VCF is the outlier. Either fix the reader to use a Hadoop-FS-backed stream, or document
-the limitation prominently in `docs/vcf.md` and the README.
+### ~~VCF cloud URI limitation~~ ✓ Resolved
+Added a **BGZF Hadoop path** to `VcfPartitionReader` that activates for any non-local
+URI (`s3a://`, `gs://`, `wasb://`, `hdfs://`, etc.). Opens the `.vcf.gz` file via
+Hadoop `FileSystem`, wraps it in `BlockCompressedInputStream` via `HadoopSeekableStream`,
+parses the VCF header for sample names, loads the tabix index via Hadoop FS when
+available, and seeks to the relevant BGZF blocks for per-chromosome or single-region
+queries. Falls back to sequential full-scan when no tabix index is present.
+Local paths continue to use `VCFFileReader` (which also handles BCF). BCF on remote
+paths throws `UnsupportedOperationException` with a helpful message. 115 VCF tests pass.
 
 **File:** `core/src/main/java/com/litebfx/vcf/VcfPartitionReader.java`
 

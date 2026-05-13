@@ -1,10 +1,14 @@
 package com.litebfx.vcf;
 
-import htsjdk.samtools.util.CloseableIterator;
+import com.litebfx.HadoopSeekableStream;
+import htsjdk.samtools.util.BlockCompressedInputStream;
+import htsjdk.tribble.index.Block;
+import htsjdk.tribble.index.tabix.TabixIndex;
 import htsjdk.variant.variantcontext.Allele;
 import htsjdk.variant.variantcontext.Genotype;
 import htsjdk.variant.variantcontext.VariantContext;
 import htsjdk.variant.vcf.VCFFileReader;
+import htsjdk.samtools.util.CloseableIterator;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -34,20 +38,27 @@ import java.util.Map;
  *
  * <h3>Reading modes</h3>
  * <ul>
- *   <li><b>Multi-chrom tabix path</b> ({@code queryChroms} is non-null): opens a
- *       {@link VCFFileReader} once and chains one tabix region query per chromosome.
- *       Used for per-chromosome parallel partitions planned by
- *       {@code VcfScan.planTabixChromPartitions}.</li>
- *   <li><b>Single-chrom or full-file VCFFileReader path</b> (tabix region query,
- *       bgzipped full-file, or BCF): uses {@link VCFFileReader} auto-detected by
- *       file magic bytes.  When {@code queryChrom} is non-null and a tabix index is
- *       present, a region query is issued; otherwise the full file is iterated.</li>
  *   <li><b>Line-split path</b> (plain-text VCF with byte-range partitions):
- *       uses {@link FSDataInputStream} directly.  The {@code #CHROM} header line is
- *       read from offset 0 to extract sample names; then the reader seeks to
- *       {@code startByte}, discards bytes up to the next newline, and parses
- *       tab-delimited VCF data lines until {@code endByte} is reached.</li>
+ *       uses {@link FSDataInputStream} directly — works for local and cloud URIs.
+ *       The {@code #CHROM} header line is read from offset 0 to extract sample names;
+ *       then the reader seeks to {@code startByte}, discards bytes up to the next
+ *       newline, and parses tab-delimited VCF data lines until {@code endByte}.</li>
+ *   <li><b>BGZF Hadoop path</b> (bgzipped {@code .vcf.gz} on any URI, including
+ *       {@code s3a://}, {@code gs://}, {@code wasb://}): opens the file via Hadoop
+ *       {@link FileSystem}, wraps it in {@link BlockCompressedInputStream} via
+ *       {@link HadoopSeekableStream}, and reads decompressed VCF lines.  When a tabix
+ *       index is available it is loaded via Hadoop FS and the reader seeks to the
+ *       relevant BGZF blocks; otherwise the file is read sequentially.  Per-chromosome
+ *       and single-region query modes are supported.</li>
+ *   <li><b>VCFFileReader path</b> (local files only — plain VCF, bgzipped VCF, BCF):
+ *       uses {@link VCFFileReader} backed by Java NIO.  Only active for {@code file://}
+ *       or scheme-less paths; cloud URIs use the BGZF Hadoop path instead.</li>
  * </ul>
+ *
+ * <p>BCF ({@code .bcf}) is not supported for remote URIs — BCF is a binary format
+ * that requires htsjdk's binary codec, which cannot read from a Hadoop
+ * {@link FSDataInputStream} without VCFFileReader.  Convert BCF to {@code .vcf.gz}
+ * for cloud storage.
  */
 public class VcfPartitionReader implements PartitionReader<InternalRow> {
 
@@ -56,19 +67,32 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private final VcfInputPartition partition;
     private boolean opened = false;
 
-    // --- VCFFileReader path (tabix region query, bgzipped full-file, or BCF) ---
+    // --- VCFFileReader path (local only: BCF, bgzipped VCF, plain VCF) ---
     private VCFFileReader reader;
     private CloseableIterator<VariantContext> iter;
     private VariantContext current;
 
-    // --- Multi-chrom tabix path ---
-    /** Remaining chromosomes to query; non-null in multi-chrom mode. Iterators are created lazily. */
+    // --- VCFFileReader multi-chrom tabix path (local) ---
     private Deque<String> pendingChroms;
 
-    // --- Line-split path (plain-text VCF with byte-range partitions) ---
+    // --- Line-split path (plain-text VCF, any URI) ---
     private FSDataInputStream fsIn;
     private boolean isVcfSplitMode = false;
     private long vcfEndByte = Long.MAX_VALUE;
+
+    // --- BGZF Hadoop path (bgzipped VCF, any URI including cloud) ---
+    private boolean isVcfBgzfMode = false;
+    private BlockCompressedInputStream bcis;
+    private FSDataInputStream bgzfFsIn;
+    private TabixIndex tabixIdx;
+    // Remaining blocks for the current chromosome; null in full-scan mode.
+    private Deque<Block> bgzfBlocks;
+    // VFO past which we stop reading from the current block.
+    private long bgzfBlockEnd = Long.MAX_VALUE;
+    // Remaining chromosomes in multi-chrom tabix mode.
+    private Deque<String> bgzfPendingChroms;
+
+    // --- Shared split / BGZF state ---
     private String[] sampleNames = new String[0];
     private String[] currentColumns = null;
 
@@ -88,12 +112,9 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
-        if (isVcfSplitMode) {
-            return nextSplitMode();
-        }
-        if (pendingChroms != null) {
-            return nextMultiChromMode();
-        }
+        if (isVcfSplitMode) return nextSplitMode();
+        if (isVcfBgzfMode)  return nextBgzfMode();
+        if (pendingChroms != null) return nextMultiChromMode();
         if (!iter.hasNext()) return false;
         current = iter.next();
         return true;
@@ -101,9 +122,7 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
 
     @Override
     public InternalRow get() {
-        if (isVcfSplitMode) {
-            return getSplitMode();
-        }
+        if (isVcfSplitMode || isVcfBgzfMode) return getSplitMode();
         return getFromVariantContext(current);
     }
 
@@ -116,7 +135,18 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             try {
                 if (reader != null) reader.close();
             } finally {
-                if (fsIn != null) fsIn.close();
+                try {
+                    if (bcis != null) {
+                        bcis.close(); // closes bgzfFsIn via HadoopSeekableStream
+                        bgzfFsIn = null;
+                    }
+                } finally {
+                    try {
+                        if (bgzfFsIn != null) bgzfFsIn.close();
+                    } finally {
+                        if (fsIn != null) fsIn.close();
+                    }
+                }
             }
         }
     }
@@ -125,29 +155,39 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     // Open helpers
     // -------------------------------------------------------------------------
 
-    private void open() {
+    private void open() throws IOException {
         long startByte = partition.getStartByte();
         long endByte   = partition.getEndByte();
 
-        // Enter split mode when the partition has a byte-range boundary.
+        // Line-split mode: byte-range partition of a plain-text VCF.
         if (startByte > 0 || endByte != Long.MAX_VALUE) {
             openSplitMode();
             return;
         }
 
-        // Multi-chrom tabix mode: one query per chromosome in the group.
+        String pathStr = partition.getPath();
+
+        // Remote path: use Hadoop FS so cloud URIs (s3a://, gs://, wasb://) work.
+        if (!isLocalPath(pathStr)) {
+            if (isBcf(pathStr)) {
+                throw new UnsupportedOperationException(
+                    "BCF is not supported for remote paths (" + pathStr + "). " +
+                    "Convert to .vcf.gz for cloud storage.");
+            }
+            openBgzfHadoopMode();
+            return;
+        }
+
+        // Local path: use VCFFileReader (handles BCF, bgzipped VCF, plain VCF).
         if (partition.getQueryChroms() != null) {
             openMultiChromMode();
             return;
         }
 
-        // VCFFileReader path: tabix region query, bgzipped full-file, or BCF.
-        String pathStr  = partition.getPath();
         String indexStr = partition.getIndexPath();
         String chrom    = partition.getQueryChrom();
-        log.trace("open() path={} indexPath={} queryChrom={}", pathStr, indexStr, chrom);
-
         java.nio.file.Path nioPath = toNioPath(pathStr);
+        log.trace("open() local path={} indexPath={} queryChrom={}", pathStr, indexStr, chrom);
 
         if (indexStr != null && chrom != null) {
             try {
@@ -157,11 +197,12 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
                 log.trace("open() region query chrom={} start={} end={}",
                         chrom, partition.getQueryStart(), partition.getQueryEnd());
             } catch (Exception e) {
-                // TabixIndex(File) does not support remote paths (S3A, HDFS, etc.).
-                // Fall back to a full-file scan and let the reader filter in-process.
-                log.warn("Could not open index from {}, falling back to full scan: {}", indexStr, e.getMessage());
+                log.warn("Could not open index from {}, falling back to full scan: {}",
+                        indexStr, e.getMessage());
                 if (reader != null) {
-                    try { reader.close(); } catch (Exception ex) { log.debug("suppressed exception closing reader", ex); }
+                    try { reader.close(); } catch (Exception ex) {
+                        log.debug("suppressed exception closing reader", ex);
+                    }
                     reader = null;
                 }
                 reader = new VCFFileReader(nioPath, false);
@@ -175,13 +216,108 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     }
 
     /**
-     * Opens one {@link VCFFileReader} and queues all chromosomes from
-     * {@code partition.getQueryChroms()} into {@link #pendingChroms} for lazy iteration.
-     * {@link #nextMultiChromMode()} creates one tabix query iterator per chromosome on demand.
+     * Opens a bgzipped VCF via Hadoop {@link FileSystem} so cloud URIs work.
      *
-     * <p>Falls back to a full-file scan if the tabix index cannot be opened (e.g. remote
-     * path that htsjdk's nio provider does not support) — same fallback as the single-chrom
-     * path.
+     * <p>The VCF header is parsed from the decompressed stream to extract sample names.
+     * If a tabix index is available it is loaded via Hadoop FS; the reader then seeks
+     * to the relevant BGZF blocks rather than scanning the whole file.
+     *
+     * <p>Mode selection (checked after loading the index):
+     * <ol>
+     *   <li>{@code queryChroms} non-null → multi-chrom tabix: one block set per chrom.</li>
+     *   <li>{@code queryChrom} non-null and tabix available → single-region tabix query.</li>
+     *   <li>No tabix → sequential full-scan of the decompressed stream.</li>
+     * </ol>
+     */
+    private void openBgzfHadoopMode() throws IOException {
+        String pathStr = partition.getPath();
+        String indexStr = partition.getIndexPath();
+        Configuration conf = partition.getHadoopConf();
+        log.trace("openBgzfHadoopMode() path={} indexPath={}", pathStr, indexStr);
+
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        long fileLen = fs.getFileStatus(hadoopPath).getLen();
+
+        bgzfFsIn = fs.open(hadoopPath);
+        bcis = new BlockCompressedInputStream(
+                new HadoopSeekableStream(bgzfFsIn, fileLen, pathStr));
+
+        // Parse VCF header from the decompressed stream to get sample names.
+        String line;
+        while ((line = bcis.readLine()) != null) {
+            if (line.startsWith("#CHROM") || line.startsWith("#chrom")) {
+                sampleNames = parseSampleNames(line);
+                break;
+            }
+            if (!line.startsWith("#")) break; // non-standard: data before #CHROM
+        }
+        // bcis is now positioned at (or just past) the first data line.
+
+        // Load tabix index via Hadoop FS if available.
+        if (indexStr != null) {
+            try {
+                Path idxPath = new Path(indexStr);
+                FileSystem idxFs = idxPath.getFileSystem(conf);
+                try (FSDataInputStream idxIn = idxFs.open(idxPath);
+                     BlockCompressedInputStream idxBcis = new BlockCompressedInputStream(idxIn)) {
+                    tabixIdx = new TabixIndex(idxBcis);
+                    log.trace("openBgzfHadoopMode() loaded tabix index from {}", indexStr);
+                }
+            } catch (Exception e) {
+                log.warn("Could not load tabix index from {}, falling back to full scan: {}",
+                        indexStr, e.getMessage());
+                tabixIdx = null;
+            }
+        }
+
+        String[] queryChroms = partition.getQueryChroms();
+        String queryChrom = partition.getQueryChrom();
+
+        if (tabixIdx != null && queryChroms != null) {
+            // Multi-chrom tabix: queue all chromosomes, seek to first chrom's blocks.
+            bgzfPendingChroms = new ArrayDeque<>(Arrays.asList(queryChroms));
+            advanceToBgzfChrom();
+        } else if (tabixIdx != null && queryChrom != null) {
+            // Single-region tabix query.
+            List<Block> blocks = tabixIdx.getBlocks(
+                    queryChrom, partition.getQueryStart(), partition.getQueryEnd());
+            bgzfBlocks = new ArrayDeque<>(blocks);
+            log.trace("openBgzfHadoopMode() single-chrom tabix: {} blocks for {}",
+                    blocks.size(), queryChrom);
+            advanceToBgzfBlock();
+        }
+        // else: full sequential scan — bcis stays at current position after header.
+
+        isVcfBgzfMode = true;
+    }
+
+    /** Advances to the first block of the next chromosome in {@link #bgzfPendingChroms}. */
+    private void advanceToBgzfChrom() throws IOException {
+        if (bgzfPendingChroms == null || bgzfPendingChroms.isEmpty()) {
+            bgzfBlocks = null;
+            return;
+        }
+        String chrom = bgzfPendingChroms.poll();
+        List<Block> blocks = tabixIdx.getBlocks(chrom, 1, Integer.MAX_VALUE);
+        bgzfBlocks = new ArrayDeque<>(blocks);
+        log.trace("advanceToBgzfChrom() chrom={} blocks={}", chrom, blocks.size());
+        advanceToBgzfBlock();
+    }
+
+    /** Seeks {@link #bcis} to the start of the next pending BGZF block. */
+    private void advanceToBgzfBlock() throws IOException {
+        bgzfBlockEnd = Long.MAX_VALUE;
+        if (bgzfBlocks == null || bgzfBlocks.isEmpty()) return;
+        Block block = bgzfBlocks.poll();
+        bcis.seek(block.getStartPosition());
+        bgzfBlockEnd = block.getEndPosition();
+        log.trace("advanceToBgzfBlock() start={} end={}", block.getStartPosition(), bgzfBlockEnd);
+    }
+
+    /**
+     * Opens one {@link VCFFileReader} for multi-chrom tabix queries against a local file.
+     * Falls back to full-file scan if the tabix index cannot be opened.
      */
     private void openMultiChromMode() {
         String   pathStr  = partition.getPath();
@@ -195,15 +331,12 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             try {
                 java.nio.file.Path nioIndex = toNioPath(indexStr);
                 reader = new VCFFileReader(nioPath, nioIndex, true);
-                // Store chroms for lazy iteration — don't create all query iterators upfront,
-                // because each reader.query() seeks the shared underlying stream and invalidates
-                // any previously-open iterator.
                 pendingChroms = new ArrayDeque<>(Arrays.asList(chroms));
                 log.trace("openMultiChromMode() queued {} chroms for lazy iteration", chroms.length);
                 return;
             } catch (Exception e) {
-                // Index not accessible as a nio path — fall back to full-file scan.
-                log.warn("Could not open index from {}, falling back to full scan: {}", indexStr, e.getMessage());
+                log.warn("Could not open index from {}, falling back to full scan: {}",
+                        indexStr, e.getMessage());
                 if (reader != null) {
                     try { reader.close(); } catch (Exception ex) {
                         log.debug("suppressed exception closing reader", ex);
@@ -213,44 +346,12 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             }
         }
 
-        // Fallback: full-file scan (pendingChroms stays null; iter is used instead).
         reader = new VCFFileReader(nioPath, false);
         iter   = reader.iterator();
         log.trace("openMultiChromMode() fallback to full-file scan");
     }
 
-    /**
-     * Lazily creates and drains one tabix query iterator per chromosome from
-     * {@link #pendingChroms}.  Sets {@link #current} to the next record and returns
-     * {@code true}, or returns {@code false} when all chromosomes are exhausted.
-     *
-     * <p>Only one query iterator is open at a time; it is created when the previous
-     * one is exhausted and closed before the next chrom is queried.  This avoids
-     * seeking conflicts: each {@code reader.query()} call repositions the underlying
-     * stream and would invalidate a simultaneously-open iterator.
-     */
-    private boolean nextMultiChromMode() {
-        while (true) {
-            // Drain the current chromosome's iterator.
-            if (iter != null && iter.hasNext()) {
-                current = iter.next();
-                return true;
-            }
-            // Current iterator exhausted — close it before opening the next chrom.
-            if (iter != null) {
-                try { iter.close(); } catch (Exception e) {
-                    log.debug("suppressed exception closing exhausted chrom iterator", e);
-                }
-                iter = null;
-            }
-            // Advance to the next queued chromosome.
-            if (pendingChroms.isEmpty()) return false;
-            String chrom = pendingChroms.poll();
-            iter = reader.query(chrom, 1, Integer.MAX_VALUE);
-        }
-    }
-
-    private void openSplitMode() {
+    private void openSplitMode() throws IOException {
         String pathStr  = partition.getPath();
         long startByte  = partition.getStartByte();
         long endByte    = partition.getEndByte();
@@ -259,105 +360,141 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         isVcfSplitMode = true;
         vcfEndByte = endByte;
 
-        try {
-            Configuration conf = partition.getHadoopConf();
-            Path hadoopPath = new Path(pathStr);
-            FileSystem fs = hadoopPath.getFileSystem(conf);
-            long fileLength = fs.getFileStatus(hadoopPath).getLen();
+        Configuration conf = partition.getHadoopConf();
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        long fileLength = fs.getFileStatus(hadoopPath).getLen();
 
-            if (startByte > 0 && startByte >= fileLength) {
-                // Chunk starts past EOF — empty partition.
-                return;
+        if (startByte > 0 && startByte >= fileLength) {
+            return; // empty partition
+        }
+
+        fsIn = fs.open(hadoopPath);
+
+        // Scan the header from offset 0 to find the #CHROM line and extract sample names.
+        String line;
+        while ((line = readLineFromStream(fsIn)) != null) {
+            if (line.startsWith("#CHROM") || line.startsWith("#chrom")) {
+                sampleNames = parseSampleNames(line);
+                break;
             }
+            if (!line.startsWith("#")) break;
+        }
 
-            fsIn = fs.open(hadoopPath);
-
-            // Scan the header from offset 0 to find the #CHROM line and extract sample names.
-            String line;
-            while ((line = readLineFromStream(fsIn)) != null) {
-                if (line.startsWith("#CHROM") || line.startsWith("#chrom")) {
-                    sampleNames = parseSampleNames(line);
-                    break;
-                }
-                if (!line.startsWith("#")) {
-                    // Hit a data line before finding #CHROM (non-standard VCF) — stop scanning.
-                    break;
-                }
+        if (startByte > 0) {
+            fsIn.seek(startByte - 1);
+            int prev = fsIn.read();
+            if (prev != '\n') {
+                int b;
+                while ((b = fsIn.read()) != -1 && b != '\n') { /* skip partial line */ }
             }
-            // After the loop, fsIn is positioned right after the #CHROM line (= start of data).
-
-            // For startByte > 0, seek to the chunk boundary and skip the partial line.
-            if (startByte > 0) {
-                fsIn.seek(startByte - 1);
-                int prev = fsIn.read(); // advances position to startByte
-                if (prev != '\n') {
-                    int b;
-                    while ((b = fsIn.read()) != -1 && b != '\n') { /* skip partial line */ }
-                }
-            }
-            // For startByte == 0: already positioned right after #CHROM, which is correct.
-
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to open VCF split partition for path: " + pathStr, e);
         }
     }
 
     // -------------------------------------------------------------------------
-    // Split-mode next / get
+    // next() implementations
     // -------------------------------------------------------------------------
 
+    private boolean nextBgzfMode() throws IOException {
+        while (true) {
+            // In tabix-guided mode, enforce block boundaries.
+            if (bgzfBlocks != null || bgzfPendingChroms != null) {
+                if (bgzfBlockEnd != Long.MAX_VALUE && bcis.getPosition() >= bgzfBlockEnd) {
+                    // Current block exhausted — advance to next block for this chrom.
+                    if (bgzfBlocks != null && !bgzfBlocks.isEmpty()) {
+                        advanceToBgzfBlock();
+                        continue;
+                    }
+                    // No more blocks for this chrom — advance to next chrom.
+                    if (bgzfPendingChroms != null && !bgzfPendingChroms.isEmpty()) {
+                        advanceToBgzfChrom();
+                        continue;
+                    }
+                    return false;
+                }
+            }
+
+            String line = bcis.readLine();
+            if (line == null) {
+                // EOF reached — try next chrom if we're in multi-chrom mode.
+                if (bgzfPendingChroms != null && !bgzfPendingChroms.isEmpty()) {
+                    advanceToBgzfChrom();
+                    continue;
+                }
+                return false;
+            }
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            String[] cols = line.split("\t", -1);
+            if (cols.length < 8) continue; // malformed
+            currentColumns = cols;
+            return true;
+        }
+    }
+
     private boolean nextSplitMode() throws IOException {
-        if (fsIn == null) return false; // empty partition (startByte past EOF)
+        if (fsIn == null) return false;
         while (true) {
             if (vcfEndByte != Long.MAX_VALUE && fsIn.getPos() >= vcfEndByte) return false;
             String line = readLineFromStream(fsIn);
             if (line == null) return false;
             if (line.isEmpty() || line.startsWith("#")) continue;
             String[] cols = line.split("\t", -1);
-            if (cols.length < 8) continue; // malformed line
+            if (cols.length < 8) continue;
             currentColumns = cols;
             return true;
         }
     }
 
+    private boolean nextMultiChromMode() {
+        while (true) {
+            if (iter != null && iter.hasNext()) {
+                current = iter.next();
+                return true;
+            }
+            if (iter != null) {
+                try { iter.close(); } catch (Exception e) {
+                    log.debug("suppressed exception closing exhausted chrom iterator", e);
+                }
+                iter = null;
+            }
+            if (pendingChroms.isEmpty()) return false;
+            String chrom = pendingChroms.poll();
+            iter = reader.query(chrom, 1, Integer.MAX_VALUE);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // get() implementations
+    // -------------------------------------------------------------------------
+
     private InternalRow getSplitMode() {
         String[] c = currentColumns;
 
-        // chrom (col 0)
         UTF8String chrom = UTF8String.fromString(c[0]);
-
-        // pos (col 1, 1-based)
         int pos = Integer.parseInt(c[1].trim());
 
-        // id (col 2) — null when "."
         String idStr = c[2].trim();
         UTF8String id = (".".equals(idStr) || idStr.isEmpty()) ? null : UTF8String.fromString(idStr);
 
-        // ref (col 3)
         UTF8String ref = UTF8String.fromString(c[3]);
 
-        // alt (col 4) — null when "."
         String altStr = c[4].trim();
         UTF8String alt = (".".equals(altStr) || altStr.isEmpty()) ? null : UTF8String.fromString(altStr);
 
-        // qual (col 5) — null when "."
         Double qual = null;
         String qualStr = c[5].trim();
         if (!".".equals(qualStr) && !qualStr.isEmpty()) {
-            try { qual = Double.parseDouble(qualStr); } catch (NumberFormatException ignored) { /* null */ }
+            try { qual = Double.parseDouble(qualStr); } catch (NumberFormatException ignored) { }
         }
 
-        // filter (col 6) — null when "." (not applied)
         UTF8String filter = null;
         String filterStr = c[6].trim();
         if (!".".equals(filterStr) && !filterStr.isEmpty()) {
             filter = UTF8String.fromString(filterStr);
         }
 
-        // info (col 7)
         ArrayBasedMapData infoMap = parseInfoString(c[7]);
 
-        // format + genotypes (cols 8+) — absent in sites-only VCFs
         UTF8String format = null;
         ArrayBasedMapData genotypesMap = null;
         if (c.length > 8 && !c[8].trim().isEmpty()) {
@@ -368,39 +505,22 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         }
 
         Object[] values = new Object[10];
-        values[0] = chrom;
-        values[1] = pos;
-        values[2] = id;
-        values[3] = ref;
-        values[4] = alt;
-        values[5] = qual;
-        values[6] = filter;
-        values[7] = infoMap;
-        values[8] = format;
-        values[9] = genotypesMap;
+        values[0] = chrom; values[1] = pos;   values[2] = id;     values[3] = ref;
+        values[4] = alt;   values[5] = qual;  values[6] = filter; values[7] = infoMap;
+        values[8] = format; values[9] = genotypesMap;
         return new GenericInternalRow(values);
     }
 
-    // -------------------------------------------------------------------------
-    // VCFFileReader-path get
-    // -------------------------------------------------------------------------
-
     private static InternalRow getFromVariantContext(VariantContext vc) {
-        // chrom
         UTF8String chrom = UTF8String.fromString(vc.getContig());
-
-        // pos (htsjdk is 1-based, same as VCF)
         int pos = vc.getStart();
 
-        // id — null when "." or absent
         String idStr = vc.getID();
         UTF8String id = (idStr == null || ".".equals(idStr) || idStr.isEmpty())
                 ? null : UTF8String.fromString(idStr);
 
-        // ref
         UTF8String ref = UTF8String.fromString(vc.getReference().getDisplayString());
 
-        // alt — comma-joined; null when no alternate alleles
         List<Allele> altAlleles = vc.getAlternateAlleles();
         UTF8String alt = null;
         if (!altAlleles.isEmpty()) {
@@ -412,23 +532,17 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             alt = UTF8String.fromString(sb.toString());
         }
 
-        // qual — null when missing
         Double qual = vc.hasLog10PError() ? vc.getPhredScaledQual() : null;
 
-        // filter — null when "." (not applied); "PASS" or semicolon-joined filters otherwise
         UTF8String filter = null;
         if (vc.filtersWereApplied()) {
-            if (vc.getFilters().isEmpty()) {
-                filter = UTF8String.fromString("PASS");
-            } else {
-                filter = UTF8String.fromString(String.join(";", vc.getFilters()));
-            }
+            filter = vc.getFilters().isEmpty()
+                    ? UTF8String.fromString("PASS")
+                    : UTF8String.fromString(String.join(";", vc.getFilters()));
         }
 
-        // info map
         ArrayBasedMapData infoMap = buildInfoMap(vc.getAttributes());
 
-        // format + genotypes — null when no samples
         UTF8String format = null;
         ArrayBasedMapData genotypesMap = null;
         if (!vc.getGenotypes().isEmpty()) {
@@ -438,28 +552,16 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         }
 
         Object[] values = new Object[10];
-        values[0] = chrom;
-        values[1] = pos;
-        values[2] = id;
-        values[3] = ref;
-        values[4] = alt;
-        values[5] = qual;
-        values[6] = filter;
-        values[7] = infoMap;
-        values[8] = format;
-        values[9] = genotypesMap;
+        values[0] = chrom; values[1] = pos;   values[2] = id;     values[3] = ref;
+        values[4] = alt;   values[5] = qual;  values[6] = filter; values[7] = infoMap;
+        values[8] = format; values[9] = genotypesMap;
         return new GenericInternalRow(values);
     }
 
     // -------------------------------------------------------------------------
-    // Split-mode helpers
+    // Parsing helpers (shared by split and BGZF modes)
     // -------------------------------------------------------------------------
 
-    /**
-     * Parses a raw VCF INFO column string (e.g. {@code "DP=30;AF=0.5"}) into a
-     * Spark map of string keys to string values.  Flag fields (no {@code =}) are
-     * mapped to {@code "true"}.
-     */
     private static ArrayBasedMapData parseInfoString(String info) {
         String trimmed = info.trim();
         if (".".equals(trimmed) || trimmed.isEmpty()) {
@@ -478,7 +580,7 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
                 vals.add(UTF8String.fromString(pair.substring(eq + 1)));
             } else {
                 keys.add(UTF8String.fromString(pair));
-                vals.add(UTF8String.fromString("true")); // flag field
+                vals.add(UTF8String.fromString("true"));
             }
         }
         return new ArrayBasedMapData(
@@ -486,11 +588,6 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
                 new GenericArrayData(vals.toArray()));
     }
 
-    /**
-     * Builds the genotypes map (sample name → FORMAT values) from the raw VCF columns.
-     * Sample names are taken from {@link #sampleNames} (parsed from the {@code #CHROM} line).
-     * Returns null if there are no samples or no genotype columns.
-     */
     private ArrayBasedMapData buildGenotypesFromColumns(String[] cols) {
         int n = Math.min(sampleNames.length, cols.length - 9);
         if (n <= 0) return null;
@@ -503,26 +600,14 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         return new ArrayBasedMapData(new GenericArrayData(keys), new GenericArrayData(vals));
     }
 
-    /**
-     * Extracts sample names from the {@code #CHROM} header line.
-     * Sample names occupy columns 9+ (0-indexed).
-     */
     private static String[] parseSampleNames(String chromLine) {
         String[] cols = chromLine.split("\t", -1);
         if (cols.length <= 9) return new String[0];
         String[] names = new String[cols.length - 9];
-        for (int i = 0; i < names.length; i++) {
-            names[i] = cols[9 + i].trim();
-        }
+        for (int i = 0; i < names.length; i++) names[i] = cols[9 + i].trim();
         return names;
     }
 
-    /**
-     * Reads one text line from {@code stream} byte-by-byte, consuming the terminating
-     * {@code \n}.  Returns the line content without the line terminator, or {@code null}
-     * at EOF with no bytes read.  Using direct stream reads (rather than BufferedReader)
-     * keeps {@code stream.getPos()} accurate so the caller can enforce byte-range boundaries.
-     */
     private static String readLineFromStream(FSDataInputStream stream) throws IOException {
         StringBuilder sb = new StringBuilder(256);
         int b;
@@ -574,9 +659,7 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private static ArrayBasedMapData buildGenotypesMap(VariantContext vc, Genotype first) {
         List<String> extKeys = new ArrayList<>(first.getExtendedAttributes().keySet());
         List<Genotype> genotypes = new ArrayList<>();
-        for (Genotype g : vc.getGenotypes()) {
-            genotypes.add(g);
-        }
+        for (Genotype g : vc.getGenotypes()) genotypes.add(g);
 
         Object[] gtKeys   = new Object[genotypes.size()];
         Object[] gtValues = new Object[genotypes.size()];
@@ -594,12 +677,33 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         return new ArrayBasedMapData(new GenericArrayData(gtKeys), new GenericArrayData(gtValues));
     }
 
+    // -------------------------------------------------------------------------
+    // Path helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns true when the path refers to the local filesystem (null scheme or "file" scheme).
+     * Cloud URIs ({@code s3a://}, {@code gs://}, {@code wasb://}, {@code hdfs://}, etc.)
+     * return false and are handled via Hadoop FS.
+     */
+    static boolean isLocalPath(String pathStr) {
+        try {
+            URI uri = URI.create(pathStr);
+            String scheme = uri.getScheme();
+            return scheme == null || scheme.equals("file");
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private static boolean isBcf(String pathStr) {
+        return pathStr.toLowerCase().endsWith(".bcf");
+    }
+
     private static java.nio.file.Path toNioPath(String pathStr) {
         try {
             URI uri = URI.create(pathStr);
-            if (uri.getScheme() == null) {
-                return Paths.get(pathStr);
-            }
+            if (uri.getScheme() == null) return Paths.get(pathStr);
             return Paths.get(uri);
         } catch (Exception e) {
             return Paths.get(pathStr);
