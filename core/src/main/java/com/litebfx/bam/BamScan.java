@@ -244,6 +244,28 @@ public class BamScan implements Scan, Batch {
      * records from there until it reaches the next chunk boundary. Chunks that contain
      * no clean record start produce zero rows (safe — Spark unions all partitions).
      *
+     * <h3>Why splits are not BGZF-block-aligned</h3>
+     * <p>Split boundaries are computed arithmetically ({@code i × splitSize}) rather than
+     * by enumerating actual BGZF block offsets. This is intentional: enumerating block
+     * boundaries would require the driver to scan the entire file sequentially — thousands
+     * of seeks on cloud storage (S3, GCS, ADLS) — just to build a partition plan.
+     *
+     * <p>Instead, each executor orients itself locally: {@link BamPartitionReader} calls
+     * {@code findNextBgzfBlockStart}, which reads at most one buffer of
+     * {@code MAX_COMPRESSED_BLOCK_SIZE + 4 ≈ 65 KB} (one HTTP Range request on object
+     * storage) to locate the next BGZF magic bytes, then probes the decompressed content
+     * for a valid BAM record-body length. This work is bounded, parallelised across
+     * executors, and negligible relative to the data each partition actually reads at the
+     * default 128 MB split size.
+     *
+     * <h3>Degenerate split sizes</h3>
+     * <p>Setting {@code bgzfSplitSize} smaller than {@code MAX_COMPRESSED_BLOCK_SIZE}
+     * (~65 KB) will produce many partitions that do a ~65 KB scan only to find no clean
+     * record start and yield zero rows. At very small values (e.g. 1 byte, as used in
+     * correctness tests) the scan overhead dominates. There is no correctness risk, but
+     * throughput degrades. The option exists for testing and for files with unusually
+     * large records; the default (128 MB) is appropriate for typical WGS BAM files.
+     *
      * <p>The split size is controlled by the {@code bgzfSplitSize} option (default 128 MB).
      */
     private void planBgzfSplitPartitions(String fileUri,
