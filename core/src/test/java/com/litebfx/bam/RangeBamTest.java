@@ -8,7 +8,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
-import java.net.URI;
 import java.net.URL;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -182,8 +181,8 @@ class RangeBamTest {
     // -------------------------------------------------------------------------
 
     private static List<InternalRow> readAll() throws IOException {
-        BamInputPartition partition = new BamInputPartition(
-            bamUri, 0L, Long.MAX_VALUE, new Configuration());
+        BamInputPartition partition = BamInputPartition.forFullScan(
+            bamUri, new Configuration());
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, true)) {
             while (reader.next()) rows.add(reader.get());

@@ -2,8 +2,6 @@ package com.litebfx.bam;
 
 import htsjdk.samtools.BAMRecordCodec;
 import htsjdk.samtools.SAMFileHeader;
-import htsjdk.samtools.SAMFileWriter;
-import htsjdk.samtools.SAMFileWriterFactory;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.SAMSequenceRecord;
 import htsjdk.samtools.util.BlockCompressedOutputStream;
@@ -170,16 +168,10 @@ class BamPartitionReaderTest {
      */
     @Test
     void perRefPartition_singleRef_readsAllRecords() throws IOException {
-        BamInputPartition partition = new BamInputPartition(
-            fixtures.bam().toUri().toString(),
-            0L, Long.MAX_VALUE,
-            new Configuration(),
-            /* indexPath */ null,
-            false, null, "none",
-            /* querySequence */ null, 1, Integer.MAX_VALUE,
-            /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
-            /* queryUnmapped  */ false,
-            /* samSplit       */ false);
+        BamInputPartition partition = BamInputPartition.forVfoPartitions(
+            fixtures.bam().toUri().toString(), new Configuration(),
+            /* indexPath */ null, null, "none",
+            new String[]{TestBamGenerator.REF_NAME});
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -192,16 +184,10 @@ class BamPartitionReaderTest {
     @Test
     void perRefPartition_withBaiIndex_readsAllRecords() throws IOException {
         String baiUri = fixtures.bai().toUri().toString();
-        BamInputPartition partition = new BamInputPartition(
-            fixtures.bam().toUri().toString(),
-            0L, Long.MAX_VALUE,
-            new Configuration(),
-            /* indexPath */ baiUri,
-            false, null, "none",
-            /* querySequence */ null, 1, Integer.MAX_VALUE,
-            /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
-            /* queryUnmapped  */ false,
-            /* samSplit       */ false);
+        BamInputPartition partition = BamInputPartition.forVfoPartitions(
+            fixtures.bam().toUri().toString(), new Configuration(),
+            /* indexPath */ baiUri, null, "none",
+            new String[]{TestBamGenerator.REF_NAME});
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -215,16 +201,9 @@ class BamPartitionReaderTest {
     void unmappedPartition_withBaiIndex_returnsNoRecordsForAllMappedFile() throws IOException {
         // The synthetic BAM has no unmapped reads; queryUnmapped() should return 0 rows.
         String baiUri = fixtures.bai().toUri().toString();
-        BamInputPartition partition = new BamInputPartition(
-            fixtures.bam().toUri().toString(),
-            0L, Long.MAX_VALUE,
-            new Configuration(),
-            /* indexPath */ baiUri,
-            false, null, "none",
-            /* querySequence */ null, 1, Integer.MAX_VALUE,
-            /* querySequences */ null,
-            /* queryUnmapped  */ true,
-            /* samSplit       */ false);
+        BamInputPartition partition = BamInputPartition.forUnmapped(
+            fixtures.bam().toUri().toString(), new Configuration(),
+            /* indexPath */ baiUri, null, "none");
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
@@ -539,11 +518,9 @@ class BamPartitionReaderTest {
         // (opens the BAM without attaching a BAI stream). queryUnmapped() then throws
         // because a BAM without an index cannot seek to the unmapped section — but the
         // important thing is that the code reaches the else branch, which JaCoCo counts.
-        BamInputPartition partition = new BamInputPartition(
-                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
-                /* indexPath */ null, false, null, "none",
-                /* querySequence */ null, 1, Integer.MAX_VALUE,
-                /* querySequences */ null, /* queryUnmapped */ true, false);
+        BamInputPartition partition = BamInputPartition.forUnmapped(
+                fixtures.bam().toUri().toString(), new Configuration(),
+                /* indexPath */ null, null, "none");
         assertThrows(Exception.class, () -> readPartitionDirect(partition),
             "queryUnmapped without BAI must throw (but the no-index branch is still covered)");
     }
@@ -552,12 +529,10 @@ class BamPartitionReaderTest {
     void open_querySequences_noIndex_fallsBackToFullScan() throws IOException {
         // querySequences set but indexPath == null → "no index; fall back to full-file scan"
         // branch taken in open(); samReader.iterator() returns all records.
-        BamInputPartition partition = new BamInputPartition(
-                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
-                /* indexPath */ null, false, null, "none",
-                /* querySequence */ null, 1, Integer.MAX_VALUE,
-                /* querySequences */ new String[]{TestBamGenerator.REF_NAME},
-                /* queryUnmapped */ false, false);
+        BamInputPartition partition = BamInputPartition.forVfoPartitions(
+                fixtures.bam().toUri().toString(), new Configuration(),
+                /* indexPath */ null, null, "none",
+                new String[]{TestBamGenerator.REF_NAME});
         List<InternalRow> rows = readPartitionDirect(partition);
         assertEquals(TestBamGenerator.RECORD_COUNT, rows.size(),
             "no-index querySequences falls back to full scan and returns all records");
@@ -567,12 +542,9 @@ class BamPartitionReaderTest {
     void open_cramContainerSplit_emptySpans_returnsNoRecords() throws IOException {
         // cramContainerSpans non-null (→ CRAM container-split path in open()) but empty
         // (→ spans.length == 0 TRUE branch in openCramContainerSplit() → early return).
-        BamInputPartition partition = new BamInputPartition(
-                fixtures.bam().toUri().toString(), 0L, Long.MAX_VALUE, new Configuration(),
-                null, true, null, "none",
-                null, 1, Integer.MAX_VALUE,
-                null, false, false,
-                /* cramContainerSpans */ new long[0]);
+        BamInputPartition partition = BamInputPartition.forCramContainerSplit(
+                fixtures.bam().toUri().toString(), new Configuration(),
+                null, null, "none", /* cramContainerSpans */ new long[0]);
         List<InternalRow> rows = readPartitionDirect(partition);
         assertEquals(0, rows.size(), "empty CRAM spans must produce an empty partition");
     }
@@ -594,11 +566,8 @@ class BamPartitionReaderTest {
     /** Opens a full-file partition for the given path and collects all rows. */
     private static List<InternalRow> readAll(Path path, boolean includeAttributes)
         throws IOException {
-        BamInputPartition partition = new BamInputPartition(
-            path.toUri().toString(),
-            /* startVFO */ 0L,
-            /* endVFO   */ Long.MAX_VALUE,
-            new Configuration());
+        BamInputPartition partition = BamInputPartition.forFullScan(
+            path.toUri().toString(), new Configuration());
 
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, includeAttributes)) {
@@ -627,8 +596,8 @@ class BamPartitionReaderTest {
      */
     private static List<InternalRow> readPartition(Path bamPath, long startByte, long endByte)
             throws IOException {
-        BamInputPartition partition = new BamInputPartition(
-            bamPath.toUri().toString(), startByte, endByte, new Configuration());
+        BamInputPartition partition = BamInputPartition.forBgzfSplit(
+            bamPath.toUri().toString(), new Configuration(), startByte, endByte, null, "none");
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
             while (reader.next()) rows.add(reader.get());
@@ -642,11 +611,8 @@ class BamPartitionReaderTest {
      */
     private static List<InternalRow> readSamPartition(Path samPath, long startByte, long endByte)
             throws IOException {
-        BamInputPartition partition = new BamInputPartition(
-            samPath.toUri().toString(), startByte, endByte, new Configuration(),
-            null, false, null, "none",
-            null, 1, Integer.MAX_VALUE,
-            null, false, /* samSplit */ true);
+        BamInputPartition partition = BamInputPartition.forSamSplit(
+            samPath.toUri().toString(), new Configuration(), startByte, endByte);
         List<InternalRow> rows = new ArrayList<>();
         try (BamPartitionReader reader = new BamPartitionReader(partition, false)) {
             while (reader.next()) rows.add(reader.get());

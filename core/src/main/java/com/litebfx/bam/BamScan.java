@@ -178,10 +178,16 @@ public class BamScan implements Scan, Batch {
                     int queryEnd   = querySequence != null ? pushedEnd   : Integer.MAX_VALUE;
                     log.trace("planInputPartitions() single partition querySequence={} queryStart={} queryEnd={}",
                             querySequence, queryStart, queryEnd);
-                    partitions.add(new BamInputPartition(
-                            fileUri, 0L, Long.MAX_VALUE, hadoopConf,
-                            indexPath, isCram, referenceFile, referenceMode,
-                            querySequence, queryStart, queryEnd));
+                    if (querySequence != null) {
+                        partitions.add(BamInputPartition.forRegionQuery(
+                                fileUri, hadoopConf, indexPath, isCram,
+                                referenceFile, referenceMode,
+                                querySequence, queryStart, queryEnd));
+                    } else {
+                        partitions.add(BamInputPartition.forFullScan(
+                                fileUri, hadoopConf, indexPath, isCram,
+                                referenceFile, referenceMode));
+                    }
                 }
             }
         } catch (IOException e) {
@@ -220,20 +226,14 @@ public class BamScan implements Scan, Batch {
         for (List<String> group : groups) {
             String[] seqs = group.toArray(new String[0]);
             log.trace("planVfoPartitions() adding per-ref partition seqs={}", (Object) seqs);
-            out.add(new BamInputPartition(
-                    fileUri, 0L, Long.MAX_VALUE, conf,
-                    indexPath, false, referenceFile, referenceMode,
-                    null, 1, Integer.MAX_VALUE,
-                    seqs, false, false));
+            out.add(BamInputPartition.forVfoPartitions(
+                    fileUri, conf, indexPath, referenceFile, referenceMode, seqs));
         }
 
         // Unmapped partition: reads unplaced unmapped reads via samReader.queryUnmapped().
         log.trace("planVfoPartitions() adding unmapped partition");
-        out.add(new BamInputPartition(
-                fileUri, 0L, Long.MAX_VALUE, conf,
-                indexPath, false, referenceFile, referenceMode,
-                null, 1, Integer.MAX_VALUE,
-                null, true, false));
+        out.add(BamInputPartition.forUnmapped(
+                fileUri, conf, indexPath, referenceFile, referenceMode));
     }
 
     /**
@@ -266,11 +266,8 @@ public class BamScan implements Scan, Batch {
             long startByte = (long) i * splitSize;
             long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long)(i + 1) * splitSize;
             log.trace("planBgzfSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
-            out.add(new BamInputPartition(
-                    fileUri, startByte, endByte, conf,
-                    null, false, referenceFile, referenceMode,
-                    null, 1, Integer.MAX_VALUE,
-                    null, false, false));
+            out.add(BamInputPartition.forBgzfSplit(
+                    fileUri, conf, startByte, endByte, referenceFile, referenceMode));
         }
     }
 
@@ -303,11 +300,7 @@ public class BamScan implements Scan, Batch {
             long startByte = (long) i * splitSize;
             long endByte   = (i == numChunks - 1) ? Long.MAX_VALUE : (long) (i + 1) * splitSize;
             log.trace("planSamSplitPartitions() chunk={} startByte={} endByte={}", i, startByte, endByte);
-            out.add(new BamInputPartition(
-                    fileUri, startByte, endByte, conf,
-                    null, false, null, "none",
-                    null, 1, Integer.MAX_VALUE,
-                    null, false, true));
+            out.add(BamInputPartition.forSamSplit(fileUri, conf, startByte, endByte));
         }
     }
 
@@ -351,8 +344,8 @@ public class BamScan implements Scan, Batch {
 
         if (seen.isEmpty()) {
             log.trace("planCraiPartitions() no containers in CRAI — single full-scan partition");
-            out.add(new BamInputPartition(fileUri, 0L, Long.MAX_VALUE, conf,
-                    indexPath, true, referenceFile, referenceMode));
+            out.add(BamInputPartition.forFullScan(
+                    fileUri, conf, indexPath, true, referenceFile, referenceMode));
             return;
         }
 
@@ -396,8 +389,8 @@ public class BamScan implements Scan, Batch {
 
         if (offsets.isEmpty()) {
             log.trace("planCramContainerSplitPartitions() no containers — single full-scan partition");
-            out.add(new BamInputPartition(fileUri, 0L, Long.MAX_VALUE, conf,
-                    null, true, referenceFile, referenceMode));
+            out.add(BamInputPartition.forFullScan(
+                    fileUri, conf, null, true, referenceFile, referenceMode));
             return;
         }
 
@@ -440,11 +433,8 @@ public class BamScan implements Scan, Batch {
                     : fileSize << 16;
             long[] spans = new long[]{groupStart, groupEnd};
             log.trace("addCramContainerPartitions() group={} spans=[{}, {}]", g, groupStart, groupEnd);
-            out.add(new BamInputPartition(
-                    fileUri, 0L, Long.MAX_VALUE, conf,
-                    indexPath, true, referenceFile, referenceMode,
-                    null, 1, Integer.MAX_VALUE,
-                    null, false, false, spans));
+            out.add(BamInputPartition.forCramContainerSplit(
+                    fileUri, conf, indexPath, referenceFile, referenceMode, spans));
             idx += size;
         }
     }
