@@ -184,18 +184,29 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             return;
         }
 
+        openLocalVcfFileReader();
+    }
+
+    /**
+     * Opens a local VCF/BCF/bgzipped-VCF file via {@link VCFFileReader}.
+     * Used for single-region tabix queries and full-file scans on local paths.
+     * Falls back to a full-file scan if the tabix index cannot be opened.
+     */
+    private void openLocalVcfFileReader() {
+        String pathStr  = partition.getPath();
         String indexStr = partition.getIndexPath();
         String chrom    = partition.getQueryChrom();
         java.nio.file.Path nioPath = toNioPath(pathStr);
-        log.trace("open() local path={} indexPath={} queryChrom={}", pathStr, indexStr, chrom);
+        log.trace("openLocalVcfFileReader() path={} indexPath={} queryChrom={}", pathStr, indexStr, chrom);
 
         if (indexStr != null && chrom != null) {
             try {
                 java.nio.file.Path nioIndex = toNioPath(indexStr);
                 reader = new VCFFileReader(nioPath, nioIndex, true);
                 iter = reader.query(chrom, partition.getQueryStart(), partition.getQueryEnd());
-                log.trace("open() region query chrom={} start={} end={}",
+                log.trace("openLocalVcfFileReader() region query chrom={} start={} end={}",
                         chrom, partition.getQueryStart(), partition.getQueryEnd());
+                return;
             } catch (Exception e) {
                 log.warn("Could not open index from {}, falling back to full scan: {}",
                         indexStr, e.getMessage());
@@ -205,14 +216,12 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
                     }
                     reader = null;
                 }
-                reader = new VCFFileReader(nioPath, false);
-                iter = reader.iterator();
             }
-        } else {
-            reader = new VCFFileReader(nioPath, false);
-            iter = reader.iterator();
-            log.trace("open() full-file scan");
         }
+
+        reader = new VCFFileReader(nioPath, false);
+        iter = reader.iterator();
+        log.trace("openLocalVcfFileReader() full-file scan");
     }
 
     /**
