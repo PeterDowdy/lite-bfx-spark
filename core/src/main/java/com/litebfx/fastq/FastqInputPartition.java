@@ -21,7 +21,7 @@ import java.io.Serializable;
  * Each reader seeks to {@code startByte} then advances forward to the next
  * {@code @} record boundary before beginning iteration.
  */
-public class FastqInputPartition implements InputPartition, Serializable {
+public class FastqInputPartition implements InputPartition {
 
     private final String path;
     private final long startByte;

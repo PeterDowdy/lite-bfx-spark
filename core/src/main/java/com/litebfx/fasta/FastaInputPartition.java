@@ -17,7 +17,7 @@ import java.io.Serializable;
  * {@code contigName=null}; the reader iterates all sequences via
  * {@code nextSequence()}.
  */
-public class FastaInputPartition implements InputPartition, Serializable {
+public class FastaInputPartition implements InputPartition {
 
     private final String path;
     /** Contig to read; null means "iterate all contigs in order". */

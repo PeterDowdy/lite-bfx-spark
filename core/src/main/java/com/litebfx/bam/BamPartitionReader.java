@@ -145,7 +145,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     @Override
     public InternalRow get() {
         log.trace("get() readName={}", current.getReadName());
-        Object[] values = new Object[12];
+        Object[] values = new Object[13];
         values[0]  = toUTF8(current.getReadName());
         values[1]  = current.getFlags();
         values[2]  = toUTF8(current.getContig());
@@ -158,6 +158,8 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         values[9]  = toUTF8(current.getReadString());
         values[10] = toUTF8(current.getBaseQualityString());
         values[11] = includeAttributes ? buildAttributesMap(current) : null;
+        long startPos = current.getAlignmentStart();
+        values[12] = startPos > 0 ? startPos - 1L : null; // 0-based, null for unmapped
         return new GenericInternalRow(values);
     }
 

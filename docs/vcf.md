@@ -16,7 +16,7 @@ For bgzipped (`.vcf.gz`) and BCF files, format detection is automatic: `VCFFileR
 | `pos` | Integer | 1-based position (`POS`) |
 | `id` | String | Variant identifier; null when `.` |
 | `ref` | String | Reference allele |
-| `alt` | String | Comma-joined alternate alleles; null when `.` |
+| `alt` | Array(String) | Alternate alleles; null when `.` |
 | `qual` | Double | Phred-scaled quality score; null when `.` |
 | `filter` | String | `"PASS"`, or semicolon-joined filter names; null when `.` (not applied) |
 | `info` | Map(String, String) | INFO field key-value pairs. Flag attributes (no value) are stored as `"true"`. Multi-value attributes are comma-joined. |

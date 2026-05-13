@@ -54,7 +54,7 @@ class BamPartitionReaderTest {
     @Test
     void schema_hasExpectedFields() {
         var schema = BamSchema.SCHEMA;
-        assertEquals(12, schema.length());
+        assertEquals(13, schema.length());
         assertEquals("readName",          schema.apply(0).name());
         assertEquals("flags",             schema.apply(1).name());
         assertEquals("referenceName",     schema.apply(2).name());
@@ -67,6 +67,7 @@ class BamPartitionReaderTest {
         assertEquals("sequence",          schema.apply(9).name());
         assertEquals("baseQualities",     schema.apply(10).name());
         assertEquals("attributes",        schema.apply(11).name());
+        assertEquals("start0",            schema.apply(12).name());
     }
 
     // -------------------------------------------------------------------------

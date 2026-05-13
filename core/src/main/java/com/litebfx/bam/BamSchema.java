@@ -14,16 +14,17 @@ public class BamSchema {
         .add("readName",          DataTypes.StringType,                              true)
         .add("flags",             DataTypes.IntegerType,                             false)
         .add("referenceName",     DataTypes.StringType,                              true)
-        .add("start",             DataTypes.IntegerType,                             true) // 1-based (SAM spec)
+        .add("start",             DataTypes.LongType,                             true) // 1-based (SAM spec)
         .add("mappingQuality",    DataTypes.IntegerType,                             true)
         .add("cigar",             DataTypes.StringType,                              true)
         .add("mateReferenceName", DataTypes.StringType,                              true)
-        .add("mateStart",         DataTypes.IntegerType,                             true) // 1-based (SAM spec)
+        .add("mateStart",         DataTypes.LongType,                             true) // 1-based (SAM spec)
         .add("insertSize",        DataTypes.IntegerType,                             true)
         .add("sequence",          DataTypes.StringType,                              true)
         .add("baseQualities",     DataTypes.StringType,                              true)
         .add("attributes",        DataTypes.createMapType(DataTypes.StringType,
-                                                          DataTypes.StringType, true), true);
+                                                          DataTypes.StringType, true), true)
+        .add("start0",            DataTypes.LongType,                             true); // 0-based (BED-compatible)
 
     private BamSchema() {}
 }

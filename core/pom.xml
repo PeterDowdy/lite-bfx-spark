@@ -191,7 +191,7 @@
       <properties>
         <azure.account>devstoreaccount1</azure.account>
         <azure.container>test-container</azure.container>
-        <!-- Well-known Azurite shared key -->
+        <!-- Well-known Azurite development key — not a real secret  gitleaks:allow -->
         <azure.key>Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==</azure.key>
       </properties>
       <build>

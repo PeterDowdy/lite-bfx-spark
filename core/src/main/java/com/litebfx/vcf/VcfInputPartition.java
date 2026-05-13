@@ -22,7 +22,7 @@ import java.io.Serializable;
  * discards bytes up to the next newline to land on a clean line start, and reads
  * records until the next line would begin at or past {@code endByte}.
  */
-public class VcfInputPartition implements InputPartition, Serializable {
+public class VcfInputPartition implements InputPartition {
 
     private final String path;
     private final String indexPath;

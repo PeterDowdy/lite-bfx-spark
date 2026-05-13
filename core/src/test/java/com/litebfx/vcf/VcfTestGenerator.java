@@ -57,6 +57,11 @@ public class VcfTestGenerator {
 
     public static final String SAMPLE_NAME = "sample1";
 
+    /** Sample names used in the multi-sample fixture. */
+    public static final String[] MULTI_SAMPLE_NAMES = {"NA12878", "NA12877", "NA12879"};
+    /** Total variants in the multi-sample fixture. */
+    public static final int MULTI_SAMPLE_VARIANT_COUNT = 2;
+
     public record Fixtures(
         java.net.URI plainVcf,
         java.net.URI bgzVcf,
@@ -145,6 +150,92 @@ public class VcfTestGenerator {
                         .attribute("DP", dp)
                         .make())
                 .make();
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-sample fixture (GT:AD:DP:GQ:PL, 3 samples, biallelic + multi-allelic)
+    // -------------------------------------------------------------------------
+
+    public record MultiSampleFixtures(java.net.URI plainVcf, java.net.URI bgzVcf) {}
+
+    /**
+     * Generates a three-sample VCF with two variants:
+     * <ul>
+     *   <li>chr1:100 — biallelic SNP (A→T): NA12878=0/1 het, NA12877=0/0 hom-ref, NA12879=1/1 hom-alt.</li>
+     *   <li>chr1:500 — multi-allelic (A→T,G): NA12878=0/1, NA12877=0/2, NA12879=1/2.</li>
+     * </ul>
+     * FORMAT fields: GT, AD, DP, GQ, PL.
+     */
+    public static MultiSampleFixtures generateMultiSample(Path tempDir) throws IOException {
+        Path plainPath = tempDir.resolve("multi_sample.vcf");
+        Path bgzPath   = tempDir.resolve("multi_sample.vcf.gz");
+
+        SAMSequenceDictionary dict = new SAMSequenceDictionary(
+                List.of(new SAMSequenceRecord("chr1", 248956422)));
+
+        Set<htsjdk.variant.vcf.VCFHeaderLine> lines = new java.util.LinkedHashSet<>();
+        lines.add(new VCFFormatHeaderLine("GT", 1,                         VCFHeaderLineType.String,  "Genotype"));
+        lines.add(new VCFFormatHeaderLine("AD", VCFHeaderLineCount.R,      VCFHeaderLineType.Integer, "Allele depth per sample"));
+        lines.add(new VCFFormatHeaderLine("DP", 1,                         VCFHeaderLineType.Integer, "Read depth"));
+        lines.add(new VCFFormatHeaderLine("GQ", 1,                         VCFHeaderLineType.Integer, "Genotype quality"));
+        lines.add(new VCFFormatHeaderLine("PL", VCFHeaderLineCount.G,      VCFHeaderLineType.Integer, "Phred-scaled likelihoods"));
+        VCFHeader header = new VCFHeader(lines, Arrays.asList(MULTI_SAMPLE_NAMES));
+        header.setSequenceDictionary(dict);
+
+        List<VariantContext> variants = buildMultiSampleVariants();
+        writeVcf(plainPath.toFile(), header, dict, variants, VariantContextWriterBuilder.OutputType.VCF);
+        writeVcf(bgzPath.toFile(),   header, dict, variants, VariantContextWriterBuilder.OutputType.BLOCK_COMPRESSED_VCF);
+
+        return new MultiSampleFixtures(plainPath.toUri(), bgzPath.toUri());
+    }
+
+    private static List<VariantContext> buildMultiSampleVariants() {
+        Allele refA = Allele.create("A", true);
+        Allele altT = Allele.create("T", false);
+        Allele altG = Allele.create("G", false);
+
+        // chr1:100 biallelic SNP
+        VariantContext biallelic = new VariantContextBuilder()
+                .chr("chr1").start(100).stop(100)
+                .alleles(Arrays.asList(refA, altT))
+                .id("rs1")
+                .log10PError(-3.0)
+                .genotypes(Arrays.asList(
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[0])   // NA12878: 0/1 het
+                                .alleles(Arrays.asList(refA, altT))
+                                .AD(new int[]{15, 15}).DP(30).GQ(99)
+                                .PL(new int[]{100, 0, 200}).make(),
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[1])   // NA12877: 0/0 hom-ref
+                                .alleles(Arrays.asList(refA, refA))
+                                .AD(new int[]{30, 0}).DP(30).GQ(99)
+                                .PL(new int[]{0, 90, 255}).make(),
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[2])   // NA12879: 1/1 hom-alt
+                                .alleles(Arrays.asList(altT, altT))
+                                .AD(new int[]{0, 25}).DP(25).GQ(75)
+                                .PL(new int[]{255, 75, 0}).make()
+                )).make();
+
+        // chr1:500 multi-allelic (A→T,G)
+        VariantContext multiAllelic = new VariantContextBuilder()
+                .chr("chr1").start(500).stop(500)
+                .alleles(Arrays.asList(refA, altT, altG))
+                .id(".")
+                .genotypes(Arrays.asList(
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[0])   // NA12878: 0/1
+                                .alleles(Arrays.asList(refA, altT))
+                                .AD(new int[]{10, 10, 0}).DP(20).GQ(99)
+                                .PL(new int[]{100, 0, 200, 200, 200, 255}).make(),
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[1])   // NA12877: 0/2
+                                .alleles(Arrays.asList(refA, altG))
+                                .AD(new int[]{10, 0, 10}).DP(20).GQ(85)
+                                .PL(new int[]{150, 200, 255, 0, 100, 200}).make(),
+                        new GenotypeBuilder(MULTI_SAMPLE_NAMES[2])   // NA12879: 1/2
+                                .alleles(Arrays.asList(altT, altG))
+                                .AD(new int[]{0, 8, 12}).DP(20).GQ(75)
+                                .PL(new int[]{200, 150, 255, 100, 0, 150}).make()
+                )).make();
+
+        return Arrays.asList(biallelic, multiAllelic);
     }
 
     // -------------------------------------------------------------------------

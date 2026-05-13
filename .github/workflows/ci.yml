@@ -12,9 +12,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
 
   # ---------------------------------------------------------------------------
@@ -150,6 +147,7 @@ jobs:
     name: Cloud integration (${{ matrix.cloud }})
     runs-on: ubuntu-latest
     needs: test
+    timeout-minutes: 20
 
     strategy:
       fail-fast: false
@@ -266,6 +264,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push'
+    # Requires secrets: OSSRH_USERNAME, OSSRH_TOKEN, GPG_PRIVATE_KEY, GPG_PASSPHRASE.
+    # The "Check Central Portal connectivity" step below provides fast-fail when
+    # secrets are absent or wrong — it exits with a non-zero status before the
+    # signing step runs.  Configure these secrets before merging to main.
 
     steps:
       - uses: actions/checkout@v6.0.2

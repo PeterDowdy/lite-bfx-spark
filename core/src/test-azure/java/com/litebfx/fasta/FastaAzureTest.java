@@ -51,7 +51,7 @@ class FastaAzureTest {
         account    = System.getProperty("azure.account",   "devstoreaccount1");
         container  = System.getProperty("azure.container", "test-container");
         accountKey = System.getProperty("azure.key",
-            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==");
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="); // gitleaks:allow
 
         String blobHost = account + ".blob.core.windows.net";
         try {

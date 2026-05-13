@@ -504,7 +504,7 @@ Implements `htsjdk.samtools.seekablestream.SeekableStream` wrapping `FSDataInput
 
 ### `BamInputPartition.java`
 ```java
-class BamInputPartition implements InputPartition, Serializable {
+class BamInputPartition implements InputPartition {
     String path;
     long startVirtualOffset;   // 0 for start-of-file
     long endVirtualOffset;     // Long.MAX_VALUE for end-of-file

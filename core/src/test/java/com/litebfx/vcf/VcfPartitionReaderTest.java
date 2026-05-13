@@ -2,6 +2,7 @@ package com.litebfx.vcf;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.util.ArrayData;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -94,7 +95,7 @@ class VcfPartitionReaderTest {
         assertEquals(100,    r.getInt(1));                   // pos
         assertEquals("rs1",  r.getUTF8String(2).toString()); // id
         assertEquals("A",    r.getUTF8String(3).toString()); // ref
-        assertEquals("T",    r.getUTF8String(4).toString()); // alt
+        assertEquals("T",    r.getArray(4).getUTF8String(0).toString()); // alt[0]
         assertEquals(30.5,   r.getDouble(5), 0.001);         // qual
         assertEquals("PASS", r.getUTF8String(6).toString()); // filter
         assertFalse(r.isNullAt(7));                          // info map present
@@ -343,7 +344,7 @@ class VcfPartitionReaderTest {
         assertEquals(100,    r0.getInt(1));
         assertEquals("rs1",  r0.getUTF8String(2).toString());
         assertEquals("A",    r0.getUTF8String(3).toString());
-        assertEquals("T",    r0.getUTF8String(4).toString());
+        assertEquals("T",    r0.getArray(4).getUTF8String(0).toString());
         assertFalse(r0.isNullAt(5));                          // qual present
         assertEquals("PASS", r0.getUTF8String(6).toString()); // PASS filter
 
@@ -357,7 +358,7 @@ class VcfPartitionReaderTest {
     }
 
     @Test
-    void vcfFileReader_multiAltAlleles_commaJoined() throws Exception {
+    void vcfFileReader_multiAltAlleles_returnedAsArray() throws Exception {
         String vcf =
                 "##fileformat=VCFv4.2\n" +
                 "##contig=<ID=chr1,length=1000000>\n" +
@@ -368,9 +369,10 @@ class VcfPartitionReaderTest {
         List<InternalRow> rows = readAll(new VcfInputPartition(file.toString(), null, conf()));
 
         assertEquals(1, rows.size());
-        String alt = rows.get(0).getUTF8String(4).toString();
-        assertTrue(alt.contains("T") && alt.contains("G"),
-                "multi-alt should be comma-joined, got: " + alt);
+        ArrayData alt = rows.get(0).getArray(4);
+        assertEquals(2, alt.numElements());
+        assertEquals("T", alt.getUTF8String(0).toString());
+        assertEquals("G", alt.getUTF8String(1).toString());
     }
 
     // -------------------------------------------------------------------------

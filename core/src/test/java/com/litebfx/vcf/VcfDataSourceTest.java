@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -147,11 +148,11 @@ class VcfDataSourceTest {
                 .orderBy("chrom", "pos")
                 .first();
 
-        assertEquals("chr1",  first.getString(0));   // chrom
-        assertEquals(100,     first.getInt(1));       // pos
-        assertEquals("rs1",   first.getString(2));    // id
-        assertEquals("A",     first.getString(3));    // ref
-        assertEquals("T",     first.getString(4));    // alt
+        assertEquals("chr1",  first.getString(0));               // chrom
+        assertEquals(100,     first.getInt(1));                  // pos
+        assertEquals("rs1",   first.getString(2));               // id
+        assertEquals("A",     first.getString(3));               // ref
+        assertEquals("T",     first.<String>getList(4).get(0)); // alt[0]
         assertFalse(first.isNullAt(5), "qual should not be null");
         // filter: our test variants have no filter applied
         // info map should not be null
@@ -212,11 +213,11 @@ class VcfDataSourceTest {
                 .orderBy("chrom", "pos")
                 .first();
 
-        assertEquals("chr1", first.getString(0));  // chrom
-        assertEquals(100,    first.getInt(1));      // pos
-        assertEquals("rs1",  first.getString(2));   // id
-        assertEquals("A",    first.getString(3));   // ref
-        assertEquals("T",    first.getString(4));   // alt
+        assertEquals("chr1", first.getString(0));               // chrom
+        assertEquals(100,    first.getInt(1));                  // pos
+        assertEquals("rs1",  first.getString(2));               // id
+        assertEquals("A",    first.getString(3));               // ref
+        assertEquals("T",    first.<String>getList(4).get(0)); // alt[0]
     }
 
     // -------------------------------------------------------------------------
@@ -305,11 +306,11 @@ class VcfDataSourceTest {
                 .orderBy("chrom", "pos")
                 .first();
 
-        assertEquals("chr1", first.getString(0));   // chrom
-        assertEquals(100,    first.getInt(1));       // pos
-        assertEquals("rs1",  first.getString(2));    // id
-        assertEquals("A",    first.getString(3));    // ref
-        assertEquals("T",    first.getString(4));    // alt
+        assertEquals("chr1", first.getString(0));               // chrom
+        assertEquals(100,    first.getInt(1));                  // pos
+        assertEquals("rs1",  first.getString(2));               // id
+        assertEquals("A",    first.getString(3));               // ref
+        assertEquals("T",    first.<String>getList(4).get(0)); // alt[0]
         assertFalse(first.isNullAt(5), "qual should not be null");
         assertFalse(first.isNullAt(7), "info map should not be null");
 
@@ -650,6 +651,126 @@ class VcfDataSourceTest {
         long count = spark.read().format("vcf").load(bgzfCopy.toUri().toString()).count();
         assertEquals(VcfTestGenerator.VCF_TOTAL, count,
                 ".bgzf extension should be treated as bgzipped VCF, not plain-text");
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-sample VCF: genotype coverage (GT:AD:DP:GQ:PL, 3 samples)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void multiSample_allSamplesAppearAsGenotypeKeys() throws Exception {
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        Row first = spark.read().format("vcf").load(fx.bgzVcf().toString())
+                .orderBy("pos").first();  // chr1:100 biallelic
+
+        assertFalse(first.isNullAt(9), "genotypes map should not be null");
+        Map<String, String> genotypes = first.getJavaMap(9);
+        assertEquals(3, genotypes.size(), "should have one entry per sample");
+        for (String sample : VcfTestGenerator.MULTI_SAMPLE_NAMES) {
+            assertTrue(genotypes.containsKey(sample), "missing sample: " + sample);
+        }
+    }
+
+    @Test
+    void multiSample_genotypeStringsReflectActualGt() throws Exception {
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        Row first = spark.read().format("vcf").load(fx.bgzVcf().toString())
+                .orderBy("pos").first();  // chr1:100
+
+        // VCFFileReader encodes GT via Genotype.getGenotypeString(); htsjdk appends
+        // '*' to reference allele display strings (e.g. Allele "A" ref → "A*").
+        Map<String, String> genotypes = first.getJavaMap(9);
+        assertEquals("A*/T",   genotypes.get("NA12878"), "NA12878 should be het (A*/T)");
+        assertEquals("A*/A*",  genotypes.get("NA12877"), "NA12877 should be hom-ref (A*/A*)");
+        assertEquals("T/T",    genotypes.get("NA12879"), "NA12879 should be hom-alt (T/T)");
+    }
+
+    @Test
+    void multiSample_multiAllelicSite_altIsArray() throws Exception {
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        List<Row> rows = spark.read().format("vcf").load(fx.bgzVcf().toString())
+                .orderBy("pos").collectAsList();
+        assertEquals(VcfTestGenerator.MULTI_SAMPLE_VARIANT_COUNT, rows.size());
+
+        Row multiAllelic = rows.get(1);  // chr1:500 → alt = [T, G]
+        assertFalse(multiAllelic.isNullAt(4), "multi-allelic site should have non-null alt");
+        List<String> alt = multiAllelic.getList(4);
+        assertEquals(2, alt.size(), "bi-allelic alt column should have 2 elements");
+        assertTrue(alt.contains("T") && alt.contains("G"),
+                "alt should contain both T and G, got: " + alt);
+    }
+
+    @Test
+    void multiSample_multiAllelicSite_allSamplesHaveDifferentGt() throws Exception {
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        List<Row> rows = spark.read().format("vcf").load(fx.bgzVcf().toString())
+                .orderBy("pos").collectAsList();
+
+        // VCFFileReader encodes GT as allele display bases; ref alleles get '*' suffix.
+        Map<String, String> genotypes = rows.get(1).getJavaMap(9);  // chr1:500
+        assertEquals("A*/T",  genotypes.get("NA12878"), "NA12878 should be 0/1 (A*/T)");
+        assertEquals("A*/G",  genotypes.get("NA12877"), "NA12877 should be 0/2 (A*/G)");
+        assertEquals("G/T",   genotypes.get("NA12879"), "NA12879 should be 1/2 (G/T)");
+    }
+
+    @Test
+    void multiSample_splitMode_allSamplesPresent() throws Exception {
+        // vcfSplitSize forces the byte-range split code path (getSplitMode / buildGenotypesFromColumns)
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        Row first = spark.read().format("vcf")
+                .option("vcfSplitSize", "50")
+                .load(fx.plainVcf().toString())
+                .orderBy("pos").first();
+
+        assertFalse(first.isNullAt(9), "genotypes should not be null in split mode");
+        Map<String, String> genotypes = first.getJavaMap(9);
+        assertEquals(3, genotypes.size(), "split mode should expose all 3 samples");
+        for (String sample : VcfTestGenerator.MULTI_SAMPLE_NAMES) {
+            assertTrue(genotypes.containsKey(sample), "split mode missing sample: " + sample);
+        }
+    }
+
+    @Test
+    void multiSample_splitMode_genotypeValuesPreserveAllFormatFields() throws Exception {
+        // Split mode stores the raw VCF column verbatim: numeric GT:AD:DP:GQ:PL.
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        Row first = spark.read().format("vcf")
+                .option("vcfSplitSize", "50")
+                .load(fx.plainVcf().toString())
+                .orderBy("pos").first();  // chr1:100
+
+        Map<String, String> genotypes = first.getJavaMap(9);
+        String na12878 = genotypes.get("NA12878");
+        assertTrue(na12878.startsWith("0/1"),
+                "split-mode GT should use numeric allele indices, got: " + na12878);
+        String[] parts = na12878.split(":");
+        assertTrue(parts.length >= 5,
+                "genotype should encode GT:AD:DP:GQ:PL (5+ fields), got: " + na12878);
+        assertTrue(na12878.contains("15,15"), "AD=15,15 should be present in raw column");
+        assertTrue(na12878.contains("30"),    "DP=30 should be present in raw column");
+    }
+
+    @Test
+    void multiSample_splitMode_formatColumnContainsAllKeys() throws Exception {
+        // In split mode the FORMAT column is the raw colon-joined string from the file.
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        Row first = spark.read().format("vcf")
+                .option("vcfSplitSize", "50")
+                .load(fx.plainVcf().toString())
+                .orderBy("pos").first();
+
+        assertFalse(first.isNullAt(8), "format column should not be null");
+        String format = first.getString(8);
+        for (String key : new String[]{"GT", "AD", "DP", "GQ", "PL"}) {
+            assertTrue(format.contains(key), "format should contain " + key + ", got: " + format);
+        }
+    }
+
+    @Test
+    void multiSample_totalVariantCount_correct() throws Exception {
+        VcfTestGenerator.MultiSampleFixtures fx = VcfTestGenerator.generateMultiSample(tempDir);
+        long count = spark.read().format("vcf").load(fx.bgzVcf().toString()).count();
+        assertEquals(VcfTestGenerator.MULTI_SAMPLE_VARIANT_COUNT, count);
     }
 
     // -------------------------------------------------------------------------

@@ -24,8 +24,11 @@ BAM, SAM, and CRAM are the standard formats for storing aligned sequencing reads
 | `sequence` | String | Read bases (`SEQ`) |
 | `baseQualities` | String | ASCII Phred+33 base qualities (`QUAL`) |
 | `attributes` | Map(String, String) | Optional SAM tags (`NM`, `MD`, `RG`, `AS`, …); see note below |
+| `start0` | Long | 0-based position (`start - 1`); null for unmapped reads. Use this when joining with BED data. |
 
 All fields can be null for unmapped or partially-specified records.
+
+> **Coordinate system:** `start` and `mateStart` are **1-based** as defined by the SAM spec. BED `chromStart` is **0-based**. Joining BAM and BED DataFrames directly on `start = chromStart` produces off-by-one errors. Use `start0` (which equals `chromStart` for the same position) or apply `start - 1` explicitly.
 
 **`attributes` column:** Each SAM optional tag (`TAG:TYPE:VALUE`) is stored as a string key and string value, e.g. `NM → "3"`, `RG → "1"`. If you select columns without including `attributes`, the tag map construction is skipped entirely on the executor — useful when attributes are large and not needed.
 

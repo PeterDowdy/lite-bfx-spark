@@ -54,15 +54,18 @@ For testing infrastructure, see [TESTING.md](TESTING.md).
 | `readName` | String | |
 | `flags` | Integer | SAM bitfield |
 | `referenceName` | String | |
-| `start` | Integer | 1-based inclusive |
+| `start` | Long | 1-based inclusive (SAM spec) |
 | `mappingQuality` | Integer | |
 | `cigar` | String | |
 | `mateReferenceName` | String | |
-| `mateStart` | Integer | 1-based |
+| `mateStart` | Long | 1-based (SAM spec) |
 | `insertSize` | Integer | |
 | `sequence` | String | |
 | `baseQualities` | String | ASCII Phred+33 |
 | `attributes` | Map(String, String) | SAM optional tags (NM, MD, RG, …) |
+| `start0` | Long | 0-based position (`start - 1`); null for unmapped. Use for BED joins. |
+
+> **Coordinate system:** `start` is 1-based (SAM spec). BED `chromStart` is 0-based. Use `start0` when joining BAM and BED DataFrames on genomic position.
 
 ### FASTQ
 
@@ -81,7 +84,7 @@ For testing infrastructure, see [TESTING.md](TESTING.md).
 | `pos` | Integer | 1-based |
 | `id` | String | Null when `.` |
 | `ref` | String | |
-| `alt` | String | Comma-joined multi-allelic; null when `.` |
+| `alt` | Array(String) | Alternate alleles; null when `.` |
 | `qual` | Double | Null when `.` |
 | `filter` | String | `"PASS"` or semicolon-joined; null when `.` |
 | `info` | Map(String, String) | INFO key=value pairs; flags stored as `"true"` |

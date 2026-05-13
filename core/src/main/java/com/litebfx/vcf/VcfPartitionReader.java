@@ -488,7 +488,15 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         UTF8String ref = UTF8String.fromString(c[3]);
 
         String altStr = c[4].trim();
-        UTF8String alt = (".".equals(altStr) || altStr.isEmpty()) ? null : UTF8String.fromString(altStr);
+        GenericArrayData alt = null;
+        if (!".".equals(altStr) && !altStr.isEmpty()) {
+            String[] alleles = altStr.split(",", -1);
+            Object[] altArr = new Object[alleles.length];
+            for (int i = 0; i < alleles.length; i++) {
+                altArr[i] = UTF8String.fromString(alleles[i]);
+            }
+            alt = new GenericArrayData(altArr);
+        }
 
         Double qual = null;
         String qualStr = c[5].trim();
@@ -531,14 +539,13 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         UTF8String ref = UTF8String.fromString(vc.getReference().getDisplayString());
 
         List<Allele> altAlleles = vc.getAlternateAlleles();
-        UTF8String alt = null;
+        GenericArrayData alt = null;
         if (!altAlleles.isEmpty()) {
-            StringBuilder sb = new StringBuilder();
+            Object[] altArr = new Object[altAlleles.size()];
             for (int i = 0; i < altAlleles.size(); i++) {
-                if (i > 0) sb.append(',');
-                sb.append(altAlleles.get(i).getDisplayString());
+                altArr[i] = UTF8String.fromString(altAlleles.get(i).getDisplayString());
             }
-            alt = UTF8String.fromString(sb.toString());
+            alt = new GenericArrayData(altArr);
         }
 
         Double qual = vc.hasLog10PError() ? vc.getPhredScaledQual() : null;

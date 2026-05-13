@@ -7,11 +7,11 @@ import org.apache.spark.sql.types.StructType;
 public class VcfSchema {
 
     public static final StructType SCHEMA = new StructType()
-        .add("chrom",     DataTypes.StringType,  false)
-        .add("pos",       DataTypes.IntegerType, false)
-        .add("id",        DataTypes.StringType,  true)
-        .add("ref",       DataTypes.StringType,  false)
-        .add("alt",       DataTypes.StringType,  true)
+        .add("chrom",     DataTypes.StringType,                              false)
+        .add("pos",       DataTypes.IntegerType,                             false)
+        .add("id",        DataTypes.StringType,                              true)
+        .add("ref",       DataTypes.StringType,                              false)
+        .add("alt",       DataTypes.createArrayType(DataTypes.StringType, true), true)
         .add("qual",      DataTypes.DoubleType,  true)
         .add("filter",    DataTypes.StringType,  true)
         .add("info",      new MapType(DataTypes.StringType, DataTypes.StringType, true), false)

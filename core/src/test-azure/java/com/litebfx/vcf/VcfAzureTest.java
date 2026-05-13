@@ -43,7 +43,7 @@ class VcfAzureTest {
         account    = System.getProperty("azure.account",   "devstoreaccount1");
         container  = System.getProperty("azure.container", "test-container");
         accountKey = System.getProperty("azure.key",
-            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==");
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="); // gitleaks:allow
 
         // VCFFileReader (htsjdk) resolves the path via Java NIO, which has no wasb:// provider.
         // The URI is treated as a local path and the read fails. Skip rather than error.
