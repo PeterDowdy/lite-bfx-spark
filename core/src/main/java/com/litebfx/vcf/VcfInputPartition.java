@@ -4,8 +4,6 @@ import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.sql.connector.read.InputPartition;
 
-import java.io.Serializable;
-
 /**
  * Describes a single Spark partition over a VCF/BCF file.
  *
