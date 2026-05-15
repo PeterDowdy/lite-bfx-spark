@@ -88,11 +88,11 @@ class BamPartitionReaderTest {
         assertEquals("read1",                 row.getUTF8String(0).toString()); // readName
         assertEquals(0,                        row.getInt(1));                   // flags
         assertEquals(TestBamGenerator.REF_NAME, row.getUTF8String(2).toString()); // referenceName
-        assertEquals(100,                      row.getInt(3));                   // start (1-based)
+        assertEquals(100L,                     row.getLong(3));                  // start (1-based, LongType)
         assertEquals(TestBamGenerator.MAPPING_QUALITY, row.getInt(4));           // mappingQuality
         assertEquals(TestBamGenerator.CIGAR,   row.getUTF8String(5).toString()); // cigar
         assertNull(                            row.getUTF8String(6));            // mateReferenceName (unmapped)
-        assertEquals(0,                        row.getInt(7));                   // mateStart
+        assertEquals(0L,                       row.getLong(7));                  // mateStart (LongType)
         assertEquals(0,                        row.getInt(8));                   // insertSize
         assertEquals(TestBamGenerator.SEQUENCE,      row.getUTF8String(9).toString());  // sequence
         assertEquals(TestBamGenerator.BASE_QUALITIES, row.getUTF8String(10).toString()); // baseQualities
@@ -102,7 +102,7 @@ class BamPartitionReaderTest {
     void bam_recordPositionsAreMonotonicallyIncreasing() throws IOException {
         List<InternalRow> rows = readAll(fixtures.bam(), false);
         for (int i = 0; i < rows.size(); i++) {
-            assertEquals((i + 1) * 100, rows.get(i).getInt(3),
+            assertEquals((long) (i + 1) * 100, rows.get(i).getLong(3),
                 "start position for read" + (i + 1));
         }
     }
@@ -152,7 +152,7 @@ class BamPartitionReaderTest {
         assertEquals("read1", row.getUTF8String(0).toString());
         assertEquals(0,       row.getInt(1));
         assertEquals(TestBamGenerator.REF_NAME, row.getUTF8String(2).toString());
-        assertEquals(100,     row.getInt(3));
+        assertEquals(100L,    row.getLong(3));
         assertEquals(TestBamGenerator.CIGAR, row.getUTF8String(5).toString());
         assertEquals(TestBamGenerator.SEQUENCE, row.getUTF8String(9).toString());
         assertEquals(TestBamGenerator.BASE_QUALITIES, row.getUTF8String(10).toString());

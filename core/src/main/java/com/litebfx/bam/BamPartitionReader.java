@@ -149,17 +149,17 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         values[0]  = toUTF8(current.getReadName());
         values[1]  = current.getFlags();
         values[2]  = toUTF8(current.getContig());
-        values[3]  = current.getAlignmentStart();
+        long startPos = current.getAlignmentStart();
+        values[3]  = startPos;                                 // LongType
         values[4]  = current.getMappingQuality();
         values[5]  = toUTF8(current.getCigarString());
         values[6]  = toUTF8(mateContig(current));
-        values[7]  = current.getMateAlignmentStart();
+        values[7]  = (long) current.getMateAlignmentStart();  // LongType
         values[8]  = current.getInferredInsertSize();
         values[9]  = toUTF8(current.getReadString());
         values[10] = toUTF8(current.getBaseQualityString());
         values[11] = includeAttributes ? buildAttributesMap(current) : null;
-        long startPos = current.getAlignmentStart();
-        values[12] = startPos > 0 ? startPos - 1L : null; // 0-based, null for unmapped
+        values[12] = startPos > 0 ? startPos - 1L : null;     // 0-based, null for unmapped
         return new GenericInternalRow(values);
     }
 

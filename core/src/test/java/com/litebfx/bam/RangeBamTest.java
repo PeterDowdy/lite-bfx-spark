@@ -110,7 +110,7 @@ class RangeBamTest {
     void firstRecord_referenceNameAndStart() throws IOException {
         InternalRow row = firstRow();
         assertEquals("CHROMOSOME_I", row.getUTF8String(2).toString());
-        assertEquals(914, row.getInt(3)); // 1-based, matches SAM
+        assertEquals(914L, row.getLong(3)); // 1-based, LongType
     }
 
     @Test
@@ -125,7 +125,7 @@ class RangeBamTest {
         // Mate is mapped to CHROMOSOME_V (different chromosome), insertSize = 0
         InternalRow row = firstRow();
         assertEquals("CHROMOSOME_V", row.getUTF8String(6).toString()); // mateReferenceName
-        assertEquals(1104758,        row.getInt(7));                    // mateStart
+        assertEquals(1104758L,       row.getLong(7));                   // mateStart (LongType)
         assertEquals(0,              row.getInt(8));                    // insertSize
     }
 
