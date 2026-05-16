@@ -157,7 +157,6 @@ Region filters in the `WHERE` clause trigger the same tabix-guided partition opt
 | Option | Default | Description |
 |---|---|---|
 | `indexPath` | — | Explicit tabix index path (`.tbi` or `.csi`). Single-file reads only. |
-| `indexDir` | — | Directory of tabix index files. Resolved as `<indexDir>/<filename>.tbi`. |
 | `bedSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for uncompressed BED files. Has no effect for `.bed.gz`. |
 | `numPartitions` | `200` | Reserved for future multi-block tabix splitting. Currently one partition is planned per query. |
 | `useIndex` | `true` | Set `false` to force a full-file single-partition scan for bgzipped BED. |

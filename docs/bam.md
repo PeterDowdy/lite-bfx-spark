@@ -13,20 +13,20 @@ BAM, SAM, and CRAM are the standard formats for storing aligned sequencing reads
 | Field | Type | Notes |
 |---|---|---|
 | `readName` | String | Query template name |
-| `flags` | Integer | SAM bitfield (see SAM spec §1.4.2) |
+| `flags` | Integer | SAM bitfield (see SAM spec §1.4.2); always non-null |
 | `referenceName` | String | Reference sequence name (`RNAME`); null for unmapped reads |
-| `start` | Integer | 1-based leftmost mapping position (`POS`) |
+| `start` | Long | 1-based leftmost mapping position (`POS`) |
 | `mappingQuality` | Integer | Mapping quality (`MAPQ`); 255 = unavailable |
 | `cigar` | String | CIGAR string; `*` when unavailable |
 | `mateReferenceName` | String | Reference name of the mate (`RNEXT`); null for unpaired reads |
-| `mateStart` | Integer | 1-based mate position (`PNEXT`) |
+| `mateStart` | Long | 1-based mate position (`PNEXT`) |
 | `insertSize` | Integer | Signed observed template length (`TLEN`) |
 | `sequence` | String | Read bases (`SEQ`) |
 | `baseQualities` | String | ASCII Phred+33 base qualities (`QUAL`) |
 | `attributes` | Map(String, String) | Optional SAM tags (`NM`, `MD`, `RG`, `AS`, …); see note below |
 | `start0` | Long | 0-based position (`start - 1`); null for unmapped reads. Use this when joining with BED data. |
 
-All fields can be null for unmapped or partially-specified records.
+All fields except `flags` can be null for unmapped or partially-specified records.
 
 > **Coordinate system:** `start` and `mateStart` are **1-based** as defined by the SAM spec. BED `chromStart` is **0-based**. Joining BAM and BED DataFrames directly on `start = chromStart` produces off-by-one errors. Use `start0` (which equals `chromStart` for the same position) or apply `start - 1` explicitly.
 
