@@ -114,8 +114,14 @@ class BaiRangeS3Test {
             .config("spark.hadoop.fs.s3a.path.style.access",        "true")
             .config("spark.hadoop.fs.s3a.impl",                     "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .config("spark.hadoop.fs.s3a.connection.ssl.enabled",   "false")
-            // Disable readahead so each htsjdk seek maps to its own Range request
+            // Disable readahead so each htsjdk seek maps to its own Range request.
             .config("spark.hadoop.fs.s3a.readahead.range",          "0")
+            // Use random-access I/O mode: S3A aborts HTTP connections on seek/close
+            // rather than draining remaining bytes. Without this, closing a stream
+            // mid-response (e.g., after reading chr1 data) causes S3A to download the
+            // remaining chr2 bytes to reuse the keepalive connection, inflating the byte
+            // count and defeating the BAI range-request savings assertion.
+            .config("spark.hadoop.fs.s3a.input.fadvise",            "random")
             .getOrCreate();
     }
 
