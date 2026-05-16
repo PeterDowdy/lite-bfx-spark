@@ -123,6 +123,7 @@ human_size() {
     -path "$REPO_ROOT/.git" -prune -o \
     -path "$REPO_ROOT/target" -prune -o \
     -path "$REPO_ROOT/.idea" -prune -o \
+    -path "$REPO_ROOT/site" -prune -o \
     -path "*/target" -prune -o \
     -type f -print \
   | sort \
