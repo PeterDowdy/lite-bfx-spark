@@ -1,3 +1,4 @@
+# ReadTheDocs v2 build configuration for MkDocs documentation site
 version: 2
 
 build:

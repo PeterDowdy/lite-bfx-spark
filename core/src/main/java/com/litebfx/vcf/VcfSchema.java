@@ -4,6 +4,7 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.MapType;
 import org.apache.spark.sql.types.StructType;
 
+/** Spark schema for VCF/BCF: column names, types, and nullability for all standard fields. */
 public class VcfSchema {
 
     public static final StructType SCHEMA = new StructType()

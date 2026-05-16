@@ -1,1 +1,2 @@
+# Python packages for MkDocs Material documentation build
 mkdocs-material>=9.5

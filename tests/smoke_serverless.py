@@ -1,5 +1,5 @@
+# Databricks Connect serverless smoke test: SELECT 1 against a real Databricks workspace.
 """
-Databricks Connect serverless smoke test: SELECT 1.
 
 Prerequisites:
   - DATABRICKS_HOST env var  (e.g. https://my-workspace.azuredatabricks.net)

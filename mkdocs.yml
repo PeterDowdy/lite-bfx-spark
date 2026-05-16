@@ -1,3 +1,4 @@
+# MkDocs Material configuration for the lite-bfx-spark documentation site
 site_name: lite-bfx-spark
 site_description: Native Apache Spark 4.x DataSource V2 readers for genomics file formats
 site_url: https://lite-bfx-spark.readthedocs.io/

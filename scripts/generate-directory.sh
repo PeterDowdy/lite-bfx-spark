@@ -6,29 +6,25 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$REPO_ROOT/DIRECTORY.md"
 
-# Files/dirs to exclude from the listing
-PRUNE_DIRS=(".git" "target" ".idea" ".DS_Store")
-
-build_prune_args() {
-  local args=()
-  for d in "${PRUNE_DIRS[@]}"; do
-    args+=(-path "*/$d" -prune -o)
-  done
-  echo "${args[@]}"
-}
-
 # Extract a short description from the first meaningful comment in a file.
 # Returns "—" for binary files or when nothing is found.
 describe() {
   local file="$1"
   local ext="${file##*.}"
 
-  # Binary files
+  # Binary files (no text content to extract)
   case "$ext" in
-    bam|bai|class|jar|png|jpg|jpeg|gif|zip|gz)
+    bam|bai|cram|crai|class|jar|png|jpg|jpeg|gif|zip|gz)
       echo "Binary file"
       return
       ;;
+  esac
+
+  # Genomic text formats with no comment convention
+  case "$ext" in
+    fa|fasta) echo "FASTA nucleotide sequence file"; return ;;
+    fai)      echo "FASTA index (samtools faidx format)"; return ;;
+    sam)      echo "SAM alignment file (Sequence Alignment/Map text format)"; return ;;
   esac
 
   # Read first 40 lines for comment extraction
@@ -36,14 +32,20 @@ describe() {
   head="$(head -n 40 "$file" 2>/dev/null)" || { echo "—"; return; }
 
   case "$ext" in
-    java)
-      # First /** javadoc block (single line extract) or first // comment
+    java|scala)
+      # Multi-line javadoc: first ` * text` body line
       local javadoc
       javadoc="$(echo "$head" | grep -m1 '^ *\*' | sed 's/^ *\* *//' | tr -d '\r')"
       if [[ -n "$javadoc" && "$javadoc" != "/" ]]; then
-        echo "$javadoc"
-        return
+        echo "$javadoc"; return
       fi
+      # Single-line javadoc: /** Description */
+      local sljd
+      sljd="$(echo "$head" | grep -m1 '/\*\*[^*]' | sed 's|.*/\*\*[[:space:]]*||; s|[[:space:]]*\*/.*||' | tr -d '\r')"
+      if [[ -n "$sljd" ]]; then
+        echo "$sljd"; return
+      fi
+      # Fall back to // comment
       local slashslash
       slashslash="$(echo "$head" | grep -m1 '^ *//' | sed 's|^ *// *||' | tr -d '\r')"
       [[ -n "$slashslash" ]] && echo "$slashslash" || echo "—"
@@ -54,15 +56,13 @@ describe() {
       [[ -n "$comment" ]] && echo "$comment" || echo "—"
       ;;
     py)
-      # Skip shebang; take first # comment or first docstring line
+      # Skip shebang; take first # comment
       local pycomment
       pycomment="$(echo "$head" | grep -v '^#!' | grep -m1 '^#' | sed 's/^#[[:space:]]*//' | tr -d '\r')"
-      if [[ -n "$pycomment" ]]; then
-        echo "$pycomment"
-        return
-      fi
+      if [[ -n "$pycomment" ]]; then echo "$pycomment"; return; fi
+      # Fall back to inline docstring: """Description"""
       local docstring
-      docstring="$(echo "$head" | grep -m1 '"""' | sed 's/.*"""\(.*\)/\1/' | tr -d '\r')"
+      docstring="$(echo "$head" | grep -m1 '"""[^"]' | sed 's/.*"""\([^"]*\).*/\1/' | tr -d '\r')"
       [[ -n "$docstring" ]] && echo "$docstring" || echo "—"
       ;;
     sh)
@@ -71,8 +71,23 @@ describe() {
       shcomment="$(echo "$head" | grep -v '^#!' | grep -m1 '^#' | sed 's/^#[[:space:]]*//' | tr -d '\r')"
       [[ -n "$shcomment" ]] && echo "$shcomment" || echo "—"
       ;;
+    yml|yaml)
+      # Prefer a leading # comment; fall back to site_description key
+      local ycomment
+      ycomment="$(echo "$head" | grep -m1 '^#' | sed 's/^#[[:space:]]*//' | tr -d '\r')"
+      if [[ -n "$ycomment" ]]; then echo "$ycomment"; return; fi
+      local ydesc
+      ydesc="$(echo "$head" | grep -m1 'site_description:' | sed 's/.*site_description:[[:space:]]*//' | tr -d '\r')"
+      [[ -n "$ydesc" ]] && echo "$ydesc" || echo "—"
+      ;;
+    txt)
+      # First # comment line
+      local txtcomment
+      txtcomment="$(echo "$head" | grep -m1 '^#' | sed 's/^#[[:space:]]*//' | tr -d '\r')"
+      [[ -n "$txtcomment" ]] && echo "$txtcomment" || echo "—"
+      ;;
     md)
-      # First heading or first non-empty line
+      # First heading
       local heading
       heading="$(echo "$head" | grep -m1 '^#' | sed 's/^#* *//' | tr -d '\r')"
       [[ -n "$heading" ]] && echo "$heading" || echo "—"
@@ -87,12 +102,11 @@ describe() {
 }
 
 # Rough token estimate: bytes / 4 (standard approximation for LLM tokenizers).
-# Binary files show byte size only.
 token_count() {
   local file="$1"
   local ext="${file##*.}"
   case "$ext" in
-    bam|bai|class|jar|png|jpg|jpeg|gif|zip|gz)
+    bam|bai|cram|crai|class|jar|png|jpg|jpeg|gif|zip|gz)
       echo "—"
       return
       ;;
@@ -118,7 +132,6 @@ human_size() {
   echo "| File | Description | Size | ~Tokens |"
   echo "|---|---|---|---|"
 
-  # Build find command dynamically
   find "$REPO_ROOT" \
     -path "$REPO_ROOT/.git" -prune -o \
     -path "$REPO_ROOT/target" -prune -o \
@@ -133,11 +146,31 @@ human_size() {
       # Skip DIRECTORY.md itself to avoid circular descriptions
       [[ "$rel" == "DIRECTORY.md" ]] && continue
 
+      # Skip macOS metadata files
+      [[ "$rel" == *".DS_Store" ]] && continue
+
       bytes="$(wc -c < "$abs" 2>/dev/null || echo 0)"
       size="$(human_size "$bytes")"
-      desc="$(describe "$abs")"
-      tokens="$(token_count "$abs")"
 
+      # Hardcoded descriptions for files that cannot carry inline comments
+      case "$rel" in
+        CLAUDE.md)
+          desc="Claude Code project instructions (loads DIRECTORY.md and TESTING.md)" ;;
+        LICENSE)
+          desc="MIT License" ;;
+        .claude/settings.json)
+          desc="Claude Code project permission and tool settings" ;;
+        .vscode/settings.json)
+          desc="VS Code workspace settings (Java build configuration)" ;;
+        .vscode/tasks.json)
+          desc="VS Code task definitions for running tests via Docker" ;;
+        core/src/main/resources/META-INF/services/org.apache.spark.sql.sources.DataSourceRegister)
+          desc="Service provider registrations for all DataSource V2 format readers" ;;
+        *)
+          desc="$(describe "$abs")" ;;
+      esac
+
+      tokens="$(token_count "$abs")"
       printf "| \`%s\` | %s | %s | %s |\n" "$rel" "$desc" "$size" "$tokens"
     done
 } > "$OUT"
