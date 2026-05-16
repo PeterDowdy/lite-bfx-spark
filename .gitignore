@@ -46,3 +46,4 @@ Thumbs.db
 derby.log
 metastore_db/
 spark-warehouse/
+site/

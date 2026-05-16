@@ -156,7 +156,7 @@ df = spark.read.format("bam").load(
 )
 ```
 
-For serverless Databricks jobs, JARs must live in a Unity Catalog Volume or workspace files — not `dbfs:/`. See [README](../README.md#deploying-to-a-cluster) for deployment details.
+For serverless Databricks jobs, JARs must live in a Unity Catalog Volume or workspace files — not `dbfs:/`. See the [project README](https://github.com/PeterDowdy/lite-bfx-spark#readme) for deployment details.
 
 ---
 
@@ -192,4 +192,4 @@ Expected output for a BAI-guided region query:
 
 The absence of a `Range: bytes=0-<fileSize>` line confirms that BAI-guided reads are not downloading the whole file.
 
-The S3 integration test suite (`-Ps3-integration`) formally asserts this by comparing bytes-transferred deltas for region queries versus full scans. See [TESTING.md](../TESTING.md) for how to run these tests.
+The S3 integration test suite (`-Ps3-integration`) formally asserts this by comparing bytes-transferred deltas for region queries versus full scans. See [TESTING.md](https://github.com/PeterDowdy/lite-bfx-spark/blob/main/TESTING.md) for how to run these tests.

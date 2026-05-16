@@ -1,0 +1,56 @@
+site_name: lite-bfx-spark
+site_description: Native Apache Spark 4.x DataSource V2 readers for genomics file formats
+site_url: https://lite-bfx-spark.readthedocs.io/
+repo_url: https://github.com/PeterDowdy/lite-bfx-spark
+repo_name: PeterDowdy/lite-bfx-spark
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - toc.integrate
+    - content.code.copy
+    - content.code.annotate
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Formats:
+    - BAM / SAM / CRAM: bam.md
+    - VCF / BCF: vcf.md
+    - FASTA: fasta.md
+    - FASTQ: fastq.md
+    - BED: bed.md
+  - Advanced:
+    - Cloud Storage: cloud-storage.md
+    - Partitioning & Indexes: partitioning.md
+    - Scala API: scala-api.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
