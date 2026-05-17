@@ -26,6 +26,7 @@ The library does **not** use Disq or hadoop-bam. Those add transitive dependenci
 | [Partitioning and indexes](docs/partitioning.md) | How VFO-based splitting works, predicate pushdown mechanics, column pruning, numPartitions |
 | [Cloud storage](docs/cloud-storage.md) | S3, ADLS Gen2, GCS, DBFS, Unity Catalog Volumes, credential propagation, range-request verification |
 | [Scala API](docs/scala-api.md) | DataFrameReaderOps, DataFrameOps, GenomicRegion, LiteBfxSpark object |
+| [Architecture](ARCHITECTURE.md) | DataSource V2 layer diagram, module layout, index strategy, design decisions |
 
 For testing infrastructure, see [TESTING.md](TESTING.md).
 
@@ -245,9 +246,11 @@ lite-bfx-spark/
 │       │   ├── vcf/    VCF / BCF DataSource V2
 │       │   ├── fasta/  FASTA DataSource V2
 │       │   └── bed/    BED DataSource V2
-│       ├── test/java/com/litebfx/   JUnit 5 integration tests
-│       ├── test-s3/java/com/litebfx/  S3 range-access tests (MinIO, -Ps3-integration)
-│       └── test/resources/          Binary fixtures (range.bam, realn01.fa, FASTQ files, …)
+│       ├── test/java/com/litebfx/          JUnit 5 integration tests
+│       ├── test-s3/java/com/litebfx/       S3 range-access tests (MinIO, -Ps3-integration)
+│       ├── test-gcs/java/com/litebfx/      GCS range-access tests (fake-gcs-server, -Pgcs-integration)
+│       ├── test-azure/java/com/litebfx/    Azure range-access tests (Azurite, -Pazure-integration)
+│       └── test/resources/                 Binary fixtures (range.bam, realn01.fa, FASTQ files, …)
 ├── scala/                      Scala wrapper module — lite-bfx-spark-scala_2.13.jar
 │   ├── pom.xml
 │   └── src/
@@ -265,8 +268,8 @@ lite-bfx-spark/
 ├── scripts/
 │   ├── generate-directory.sh   Regenerates DIRECTORY.md
 │   └── run-tests.sh            Runs all Docker test environments sequentially
-├── PLAN.md                     Original design document
-├── IMPLEMENTATION.md           Checklist tracking implementation status
+├── ARCHITECTURE.md             Architecture overview and design decisions
+├── DIRECTORY.md                Auto-generated file index with descriptions
 └── TESTING.md                  Full testing guide
 ```
 
@@ -343,18 +346,32 @@ docker compose run --rm databricks  mvn test -Pspark402
 docker compose run --rm spark-test mvn test -pl core -Pspark402 -Dtest=BamDataSourceTest
 ```
 
-### S3 range-access tests (MinIO)
+### Cloud storage range-access tests
 
-These tests verify that BAI/FAI/CRAI-guided reads issue HTTP `Range` requests against object storage rather than downloading the whole file.
+These tests verify that BAI/FAI/CRAI/tabix-guided reads issue HTTP `Range` requests against object storage rather than downloading the whole file. Each suite uploads its own fixtures — no manual setup required.
+
+**S3 (MinIO)**
 
 ```bash
 docker compose run --rm spark-test-s3
 ```
 
-The test containers upload their own fixtures to MinIO — no manual setup required. To inspect the `Range` headers MinIO received:
+To inspect the `Range` headers MinIO received:
 
 ```bash
 docker compose logs minio | grep '"Range"'
+```
+
+**GCS (fake-gcs-server)**
+
+```bash
+docker compose run --rm spark-test-gcs
+```
+
+**Azure Blob Storage (Azurite)**
+
+```bash
+docker compose run --rm spark-test-azure
 ```
 
 ### Databricks Serverless smoke test
