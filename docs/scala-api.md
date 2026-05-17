@@ -16,7 +16,7 @@ import com.litebfx.scala.GenomicRegion   // if using typed regions
 This follows the same opt-in pattern as `spark.implicits._`. The import wires two implicit conversions:
 
 - `DataFrameReader → DataFrameReaderOps` — adds `.bam()`, `.cram()`, `.fastq()`, etc.
-- `DataFrame → DataFrameOps` — adds `.filterChromosome()`, `.withoutAttributes`, etc.
+- `DataFrame` — use standard Spark `.filter()` and `.drop()` directly; see [Common filter patterns](#common-filter-patterns)
 
 If you prefer to avoid wildcard imports, use the explicit `LiteBfxSpark` object instead — see [below](#litebfxspark-object).
 
@@ -178,62 +178,38 @@ val peaks = spark.read.bed("s3a://bucket/peaks.bed.gz")
 
 ---
 
-## DataFrameOps
+## Common filter patterns
 
-Extension methods on `DataFrame`. All methods return a new `DataFrame` — they do not modify the receiver.
-
-### BAM / CRAM helpers
-
-Use plain `.filter()` for region, flag, and quality filtering — predicate pushdown to BAI/CRAI is triggered automatically (see [BAM predicate pushdown](bam.md#region-filtering-and-predicate-pushdown)).
+Predicate pushdown to BAI/CRAI (BAM/CRAM) and tabix (VCF/BED) is triggered automatically by the scan builder when the filter is on the indexed columns. Use standard Spark `.filter()` — no custom wrapper needed.
 
 ```scala
-// Region filter — BAI pushdown fires automatically
-df.filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
+// BAM — region filter (BAI pushdown fires automatically)
+spark.read.bam("s3a://bucket/sample.bam")
+  .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
 
-// Mapped reads only (SAM FLAG 0x4 unset)
+// BAM — chromosome only
+spark.read.bam("s3a://bucket/sample.bam")
+  .filter("referenceName = 'chrX'")
+
+// BAM — mapped reads (FLAG 0x4 unset)
 df.filter("(flags & 4) = 0")
 
-// Mapping quality threshold
+// BAM — mapping quality threshold
 df.filter("mappingQuality >= 30")
-```
 
-#### `.filterChromosome()`
+// BAM — drop attributes column (skips per-row tag parsing on executors)
+df.drop("attributes")
 
-Filter to reads aligned to a specific chromosome. Equivalent to `df.filter("referenceName = '<value>'")` but accepts the chromosome as a typed parameter rather than an interpolated string.
-
-```scala
-def filterChromosome(chromosome: String): DataFrame
-```
-
-```scala
-df.filterChromosome("chr1")
-```
-
-#### `.withoutAttributes`
-
-Drop the `attributes` column. Applicable to BAM and CRAM DataFrames (and VCF, which has an `info` map — note this drops `attributes`, not `info`). Useful when attributes are not needed and you want to reduce memory overhead.
-
-```scala
-def withoutAttributes: DataFrame
-```
-
-```scala
-df.withoutAttributes.show()
-```
-
-### VCF and BED region filters
-
-Use plain `.filter()` — predicate pushdown to tabix is triggered automatically for `chrom`/`pos` (VCF) and `chrom`/`chromStart`/`chromEnd` (BED) predicates.
-
-```scala
 // VCF — tabix pushdown fires automatically
-val variants = spark.read.vcf("s3a://bucket/calls.vcf.gz")
+spark.read.vcf("s3a://bucket/calls.vcf.gz")
   .filter("chrom = 'chr1' AND pos >= 1000000 AND pos <= 2000000")
 
 // BED — tabix pushdown fires automatically
-val peaks = spark.read.bed("s3a://bucket/peaks.bed.gz")
+spark.read.bed("s3a://bucket/peaks.bed.gz")
   .filter("chrom = 'chr1' AND chromStart >= 0 AND chromEnd <= 1000000")
 ```
+
+See the [BAM](bam.md#region-filtering-and-predicate-pushdown), [VCF](vcf.md#predicate-pushdown), and [BED](bed.md#predicate-pushdown) docs for the exact filter expressions that trigger index-guided I/O.
 
 ---
 
@@ -325,9 +301,9 @@ val df = LiteBfxSpark.readRegion(
 
 ---
 
-## Chaining filters
+## Chaining
 
-The extension methods return `DataFrame` so they can be chained freely with each other and with standard Spark operations:
+The reader extension methods return a `DataFrame`, so standard Spark operations chain naturally:
 
 ```scala
 import com.litebfx.scala.implicits._
@@ -337,7 +313,7 @@ val highQualReads = spark.read
   .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
   .filter("(flags & 4) = 0")      // mapped reads only
   .filter("mappingQuality >= 30") // high-confidence alignments
-  .withoutAttributes              // drop the tag map column
+  .drop("attributes")             // skip per-row tag parsing on executors
   .select("readName", "start", "cigar", "sequence")
   .cache()
 

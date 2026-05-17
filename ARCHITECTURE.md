@@ -50,7 +50,6 @@ scala/                     ← Scala API fat JAR (embeds core via shade merge)
         package.scala          ← implicits wiring
         GenomicRegion.scala    ← typed interval value object
         DataFrameReaderOps.scala
-        DataFrameOps.scala
         LiteBfxSpark.scala     ← non-implicit entry point
 ```
 
@@ -335,13 +334,9 @@ spark.read.bam("s3a://bucket/cohort/", indexDir = Some("s3a://idx/"))
 spark.read.format("bam").option("indexDir", "s3a://idx/").load("s3a://bucket/cohort/")
 ```
 
-### `DataFrameOps`
-
-An implicit class on `DataFrame` with two thin helpers: `.filterChromosome(name)` (typed chromosome equality on `referenceName`) and `.withoutAttributes` (drops the `attributes` column to avoid per-record tag parsing). All other filtering uses standard `.filter()` directly — predicate pushdown to BAI/tabix is triggered automatically by the scan builder.
-
 ### `implicits` object and `LiteBfxSpark`
 
-`package.scala` exports a single `implicits` object with two implicit conversions (reader ops and DataFrame ops). `LiteBfxSpark` provides the same API as explicit method calls for users who prefer to avoid implicit imports.
+`package.scala` exports a single `implicits` object with one implicit conversion (`DataFrameReader → DataFrameReaderOps`). All DataFrame-level filtering uses standard Spark `.filter()` and `.drop()` directly — predicate pushdown to BAI/tabix is triggered automatically by the scan builder. `LiteBfxSpark` provides the same reader API as explicit method calls for users who prefer to avoid implicit imports.
 
 ---
 

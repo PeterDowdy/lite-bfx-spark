@@ -91,4 +91,4 @@ Every existing Spark genomics library is either abandoned or architecturally loc
 - [BED](bed.md) — schema, BED3–BED12, tabix pushdown, coordinate system
 - [Cloud Storage](cloud-storage.md) — S3, ADLS Gen2, GCS, DBFS, Unity Catalog Volumes, credential propagation
 - [Partitioning & Indexes](partitioning.md) — how VFO-based splitting works, predicate pushdown, column pruning
-- [Scala API](scala-api.md) — DataFrameReaderOps, DataFrameOps, GenomicRegion
+- [Scala API](scala-api.md) — DataFrameReaderOps, GenomicRegion, common filter patterns

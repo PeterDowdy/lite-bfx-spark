@@ -1,11 +1,11 @@
 package com.litebfx
 
-import org.apache.spark.sql.{DataFrame, DataFrameReader}
+import org.apache.spark.sql.DataFrameReader
 
 /**
  * Scala API for lite-bfx-spark.
  *
- * A single import brings all extension methods into scope:
+ * A single import brings reader extension methods into scope:
  * {{{
  *   import com.litebfx.scala.implicits._
  *   import com.litebfx.scala.GenomicRegion
@@ -19,7 +19,7 @@ import org.apache.spark.sql.{DataFrame, DataFrameReader}
 package object scala {
 
   /**
-   * Single opt-in import that wires all implicit conversions.
+   * Single opt-in import that wires the DataFrameReader implicit conversion.
    * Mirrors the `spark.implicits._` pattern from Spark itself.
    */
   object implicits {
@@ -27,8 +27,5 @@ package object scala {
 
     implicit def toDataFrameReaderOps(reader: DataFrameReader): DataFrameReaderOps =
       new DataFrameReaderOps(reader)
-
-    implicit def toDataFrameOps(df: DataFrame): DataFrameOps =
-      new DataFrameOps(df)
   }
 }

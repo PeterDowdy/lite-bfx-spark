@@ -25,7 +25,7 @@ The library does **not** use Disq or hadoop-bam. Those add transitive dependenci
 | [BED](docs/bed.md) | Schema, BED3–BED12, tabix pushdown, coordinate system |
 | [Partitioning and indexes](docs/partitioning.md) | How VFO-based splitting works, predicate pushdown mechanics, column pruning, numPartitions |
 | [Cloud storage](docs/cloud-storage.md) | S3, ADLS Gen2, GCS, DBFS, Unity Catalog Volumes, credential propagation, range-request verification |
-| [Scala API](docs/scala-api.md) | DataFrameReaderOps, DataFrameOps, GenomicRegion, LiteBfxSpark object |
+| [Scala API](docs/scala-api.md) | DataFrameReaderOps, GenomicRegion, LiteBfxSpark object, common filter patterns |
 | [Architecture](ARCHITECTURE.md) | DataSource V2 layer diagram, module layout, index strategy, design decisions |
 
 For testing infrastructure, see [TESTING.md](TESTING.md).
@@ -258,7 +258,6 @@ lite-bfx-spark/
 │       │   ├── package.scala           implicits object (single import)
 │       │   ├── GenomicRegion.scala     Typed genomic interval value class
 │       │   ├── DataFrameReaderOps.scala  spark.read.bam/cram/fastq/vcf/fasta/bed(...)
-│       │   ├── DataFrameOps.scala      df.filterChromosome/withoutAttributes
 │       │   └── LiteBfxSpark.scala      Explicit (non-implicit) entry point
 │       └── test/scala/com/litebfx/scala/  ScalaTest suites
 ├── tests/smoke/                Minimal Maven project — SparkSession + SELECT 1
