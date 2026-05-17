@@ -11,7 +11,7 @@ import org.apache.spark.sql.{DataFrame, DataFrameReader}
  *   import com.litebfx.scala.GenomicRegion
  *
  *   val df = spark.read.bam("s3a://bucket/sample.bam")
- *   df.filterRegion("chr1", 1000, 2000).show()
+ *   df.filter("referenceName = 'chr1' AND start >= 1000 AND start <= 2000").show()
  * }}}
  *
  * For non-implicit usage see [[LiteBfxSpark]].

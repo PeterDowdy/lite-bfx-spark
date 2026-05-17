@@ -16,7 +16,7 @@ import com.litebfx.scala.GenomicRegion   // if using typed regions
 This follows the same opt-in pattern as `spark.implicits._`. The import wires two implicit conversions:
 
 - `DataFrameReader → DataFrameReaderOps` — adds `.bam()`, `.cram()`, `.fastq()`, etc.
-- `DataFrame → DataFrameOps` — adds `.filterRegion()`, `.filterMapped`, etc.
+- `DataFrame → DataFrameOps` — adds `.filterChromosome()`, `.withoutAttributes`, etc.
 
 If you prefer to avoid wildcard imports, use the explicit `LiteBfxSpark` object instead — see [below](#litebfxspark-object).
 
@@ -63,7 +63,7 @@ val df = spark.read.bam("s3a://bucket/sample.bam", useIndex = false)
 
 ### `.bamRegion()`
 
-Read a BAM file filtered to a specific genomic region. Equivalent to `.bam(...).filterRegion(region)`.
+Read a BAM file filtered to a specific genomic region. Equivalent to `.bam(...).filter("referenceName = '...' AND start >= ... AND start <= ...")`.
 
 ```scala
 def bamRegion(
@@ -182,26 +182,24 @@ val peaks = spark.read.bed("s3a://bucket/peaks.bed.gz")
 
 Extension methods on `DataFrame`. All methods return a new `DataFrame` — they do not modify the receiver.
 
-### BAM / CRAM filters
+### BAM / CRAM helpers
 
-#### `.filterRegion()`
-
-Filter to reads whose `start` falls within the given region (1-based, inclusive). The `referenceName` equality and `start` range are recognized by the BAM scan builder and trigger BAI/CRAI predicate pushdown.
+Use plain `.filter()` for region, flag, and quality filtering — predicate pushdown to BAI/CRAI is triggered automatically (see [BAM predicate pushdown](bam.md#region-filtering-and-predicate-pushdown)).
 
 ```scala
-def filterRegion(region: GenomicRegion): DataFrame
-def filterRegion(chromosome: String, start: Int, end: Int): DataFrame
-```
+// Region filter — BAI pushdown fires automatically
+df.filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
 
-```scala
-df.filterRegion("chr1", 1000000, 2000000)
-df.filterRegion(GenomicRegion("chr17", 43044295, 43125370))
-df.filterRegion(GenomicRegion.wholeChromosome("chrX"))
+// Mapped reads only (SAM FLAG 0x4 unset)
+df.filter("(flags & 4) = 0")
+
+// Mapping quality threshold
+df.filter("mappingQuality >= 30")
 ```
 
 #### `.filterChromosome()`
 
-Filter to reads aligned to a specific chromosome. Equivalent to `df.filter(col("referenceName") === chromosome)`.
+Filter to reads aligned to a specific chromosome. Equivalent to `df.filter("referenceName = '<value>'")` but accepts the chromosome as a typed parameter rather than an interpolated string.
 
 ```scala
 def filterChromosome(chromosome: String): DataFrame
@@ -209,30 +207,6 @@ def filterChromosome(chromosome: String): DataFrame
 
 ```scala
 df.filterChromosome("chr1")
-```
-
-#### `.filterMapped`
-
-Filter to reads that are mapped (SAM FLAG 0x4 unset). Removes unmapped reads.
-
-```scala
-def filterMapped: DataFrame
-```
-
-```scala
-df.filterMapped.count()
-```
-
-#### `.filterMappingQuality()`
-
-Filter to reads with `mappingQuality >= minMQ`. Removes multi-mappers and low-confidence alignments.
-
-```scala
-def filterMappingQuality(minMQ: Int): DataFrame
-```
-
-```scala
-df.filterMappingQuality(30)
 ```
 
 #### `.withoutAttributes`
@@ -360,10 +334,10 @@ import com.litebfx.scala.implicits._
 
 val highQualReads = spark.read
   .bam("s3a://bucket/cohort/", indexDir = Some("s3a://idx/cohort/"))
-  .filterRegion("chr17", 43044295, 43125370)  // BAI pushdown + Spark post-filter
-  .filterMapped                                // row-level: unmapped flag
-  .filterMappingQuality(30)                   // row-level: MAPQ >= 30
-  .withoutAttributes                          // drop the tag map column
+  .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
+  .filter("(flags & 4) = 0")      // mapped reads only
+  .filter("mappingQuality >= 30") // high-confidence alignments
+  .withoutAttributes              // drop the tag map column
   .select("readName", "start", "cigar", "sequence")
   .cache()
 
@@ -383,7 +357,7 @@ import com.litebfx.scala.implicits._
 import com.litebfx.scala.GenomicRegion
 
 val df = spark.read.bam("dbfs:/mnt/genomics/sample.bam")
-df.filterRegion("chr1", 1000000, 2000000).show()
+df.filter("referenceName = 'chr1' AND start >= 1000000 AND start <= 2000000").show()
 ```
 
 ```python

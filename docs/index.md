@@ -71,9 +71,9 @@ Every existing Spark genomics library is either abandoned or architecturally loc
     // BAM — cohort + predicate pushdown + post-filter
     val reads = spark.read
       .bam("s3a://data/cohort/", indexDir = Some("s3a://idx/cohort/"))
-      .filterRegion("chr17", 43044295, 43125370)
-      .filterMappingQuality(30)
-      .filterMapped
+      .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
+      .filter("(flags & 4) = 0")
+      .filter("mappingQuality >= 30")
 
     // VCF — tabix pushdown
     val variants = spark.read.vcf("s3a://data/calls.vcf.gz")

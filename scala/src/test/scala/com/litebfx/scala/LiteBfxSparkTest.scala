@@ -94,10 +94,12 @@ class LiteBfxSparkTest extends AnyFunSuite with BeforeAndAfterAll {
   // readRegion (BAM)
   // ---------------------------------------------------------------------------
 
-  test("readRegion: count matches filterRegion chain") {
-    val region = LiteBfxSpark.region("CHROMOSOME_I", 1, 999999)
+  test("readRegion: count matches plain filter chain") {
+    val region    = LiteBfxSpark.region("CHROMOSOME_I", 1, 999999)
     val explicit  = LiteBfxSpark.readRegion(spark, bamPath, region).count()
-    val chained   = spark.read.bam(bamPath).filterRegion(region).count()
+    val chained   = spark.read.bam(bamPath)
+      .filter("referenceName = 'CHROMOSOME_I' AND start >= 1 AND start <= 999999")
+      .count()
     assert(explicit == chained)
     assert(explicit == 18L)
   }

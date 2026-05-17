@@ -58,15 +58,12 @@ class DataFrameOpsTest extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
-  // filterRegion (BAM)
+  // BAM region filter (plain .filter — triggers BAI pushdown)
   // ---------------------------------------------------------------------------
 
-  test("filterRegion(GenomicRegion): CHROMOSOME_I count = 18") {
-    assert(bamDf.filterRegion(GenomicRegion("CHROMOSOME_I", 1, 999999)).count() == 18L)
-  }
-
-  test("filterRegion(chrom, start, end): CHROMOSOME_I count = 18") {
-    assert(bamDf.filterRegion("CHROMOSOME_I", 1, 999999).count() == 18L)
+  test("bam filter(referenceName, start range): CHROMOSOME_I count = 18") {
+    val count = bamDf.filter("referenceName = 'CHROMOSOME_I' AND start >= 1 AND start <= 999999").count()
+    assert(count == 18L)
   }
 
   // ---------------------------------------------------------------------------
@@ -78,23 +75,19 @@ class DataFrameOpsTest extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
-  // filterMapped (BAM)
+  // BAM flag and quality filters (plain .filter)
   // ---------------------------------------------------------------------------
 
-  test("filterMapped: count <= total count") {
-    val total   = bamDf.count()
-    val mapped  = bamDf.filterMapped.count()
+  test("filter mapped reads: count <= total count") {
+    val total  = bamDf.count()
+    val mapped = bamDf.filter("(flags & 4) = 0").count()
     assert(mapped <= total)
     assert(mapped > 0)
   }
 
-  // ---------------------------------------------------------------------------
-  // filterMappingQuality (BAM)
-  // ---------------------------------------------------------------------------
-
-  test("filterMappingQuality(30): count <= total count") {
+  test("filter mapping quality >= 30: count <= total count") {
     val total = bamDf.count()
-    val hq    = bamDf.filterMappingQuality(30).count()
+    val hq    = bamDf.filter("mappingQuality >= 30").count()
     assert(hq <= total)
     assert(hq > 0)
   }

@@ -175,14 +175,14 @@ val df = spark.read.bam("dbfs:/mnt/genomics/sample.bam")
 // BAM — cohort + predicate pushdown + post-filter
 val reads = spark.read
   .bam("s3a://data/cohort/", indexDir = Some("s3a://idx/cohort/"))
-  .filterRegion("chr17", 43044295, 43125370)
-  .filterMappingQuality(30)
-  .filterMapped
+  .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
+  .filter("(flags & 4) = 0")
+  .filter("mappingQuality >= 30")
 
 // CRAM
 val df = spark.read.cram("s3a://data/sample.cram",
   referenceFile = Some("s3a://ref/hg38.fa"))
-df.filterRegion(GenomicRegion("chr17", 43044295, 43125370)).show()
+df.filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370").show()
 
 // FASTQ — paired-end reads side by side
 val r1 = spark.read.fastq("s3a://data/reads_R1.fastq.gz")
@@ -258,7 +258,7 @@ lite-bfx-spark/
 │       │   ├── package.scala           implicits object (single import)
 │       │   ├── GenomicRegion.scala     Typed genomic interval value class
 │       │   ├── DataFrameReaderOps.scala  spark.read.bam/cram/fastq/vcf/fasta/bed(...)
-│       │   ├── DataFrameOps.scala      df.filterRegion/filterChromosome/filterMapped/…
+│       │   ├── DataFrameOps.scala      df.filterChromosome/withoutAttributes
 │       │   └── LiteBfxSpark.scala      Explicit (non-implicit) entry point
 │       └── test/scala/com/litebfx/scala/  ScalaTest suites
 ├── tests/smoke/                Minimal Maven project — SparkSession + SELECT 1

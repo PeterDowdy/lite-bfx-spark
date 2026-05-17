@@ -337,15 +337,7 @@ spark.read.format("bam").option("indexDir", "s3a://idx/").load("s3a://bucket/coh
 
 ### `DataFrameOps`
 
-An implicit class on `DataFrame` that adds genomics-aware filter helpers. These compile down to standard Spark `Column` expressions — no custom execution plans:
-
-```scala
-df.filterRegion("chr17", 43044295, 43125370)
-// equivalent to:
-df.filter(col("referenceName") === "chr17" && col("start") >= 43044295 && col("start") <= 43125370)
-```
-
-Filters for mapped reads, mapping quality, and variant/BED region queries follow the same pattern.
+An implicit class on `DataFrame` with two thin helpers: `.filterChromosome(name)` (typed chromosome equality on `referenceName`) and `.withoutAttributes` (drops the `attributes` column to avoid per-record tag parsing). All other filtering uses standard `.filter()` directly — predicate pushdown to BAI/tabix is triggered automatically by the scan builder.
 
 ### `implicits` object and `LiteBfxSpark`
 
