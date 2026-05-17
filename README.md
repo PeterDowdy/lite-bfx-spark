@@ -188,17 +188,17 @@ df.filterRegion(GenomicRegion("chr17", 43044295, 43125370)).show()
 val r1 = spark.read.fastq("s3a://data/reads_R1.fastq.gz")
 val r2 = spark.read.fastq("s3a://data/reads_R2.fastq.gz")
 
-// VCF — tabix pushdown
+// VCF — tabix pushdown (plain .filter triggers it automatically)
 val variants = spark.read.vcf("s3a://data/calls.vcf.gz")
-  .filterVariantRegion("chr1", 1000000, 2000000)
+  .filter("chrom = 'chr1' AND pos >= 1000000 AND pos <= 2000000")
 
 // FASTA — one row per contig
 val ref = spark.read.fasta("s3a://ref/hg38.fa")
 ref.filter("name = 'chr1'").select("length").show()
 
-// BED — tabix pushdown
+// BED — tabix pushdown (plain .filter triggers it automatically)
 val peaks = spark.read.bed("s3a://data/peaks.bed.gz")
-  .filterBedRegion("chr1", 0L, 1000000L)
+  .filter("chrom = 'chr1' AND chromStart >= 0 AND chromEnd <= 1000000")
 
 // Non-implicit API (no import needed)
 val df = LiteBfxSpark.readRegion(spark, "s3a://data/sample.bam",

@@ -247,42 +247,18 @@ def withoutAttributes: DataFrame
 df.withoutAttributes.show()
 ```
 
-### VCF filters
+### VCF and BED region filters
 
-#### `.filterVariantRegion()`
-
-Filter VCF rows to variants within a genomic region (1-based, inclusive on `pos`). Triggers tabix predicate pushdown.
+Use plain `.filter()` — predicate pushdown to tabix is triggered automatically for `chrom`/`pos` (VCF) and `chrom`/`chromStart`/`chromEnd` (BED) predicates.
 
 ```scala
-def filterVariantRegion(chrom: String, start: Int, end: Int): DataFrame
-def filterVariantRegion(region: GenomicRegion): DataFrame
-```
-
-```scala
+// VCF — tabix pushdown fires automatically
 val variants = spark.read.vcf("s3a://bucket/calls.vcf.gz")
-  .filterVariantRegion("chr1", 1000000, 2000000)
+  .filter("chrom = 'chr1' AND pos >= 1000000 AND pos <= 2000000")
 
-val brca1 = GenomicRegion("chr17", 43044295, 43125370)
-spark.read.vcf("s3a://bucket/calls.vcf.gz").filterVariantRegion(brca1)
-```
-
-### BED filters
-
-#### `.filterBedRegion()`
-
-Filter BED rows to intervals within a region (0-based coordinates matching BED convention). Triggers tabix predicate pushdown.
-
-```scala
-def filterBedRegion(chrom: String, start: Long, end: Long): DataFrame
-def filterBedRegion(region: GenomicRegion): DataFrame
-```
-
-```scala
+// BED — tabix pushdown fires automatically
 val peaks = spark.read.bed("s3a://bucket/peaks.bed.gz")
-  .filterBedRegion("chr1", 0L, 1000000L)
-
-// GenomicRegion coordinates are Int; converted to Long automatically
-peaks.filterBedRegion(GenomicRegion("chr1", 1, 1000000))
+  .filter("chrom = 'chr1' AND chromStart >= 0 AND chromEnd <= 1000000")
 ```
 
 ---

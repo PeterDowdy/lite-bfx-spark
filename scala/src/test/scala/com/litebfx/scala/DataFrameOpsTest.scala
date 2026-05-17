@@ -110,32 +110,25 @@ class DataFrameOpsTest extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
-  // filterVariantRegion (VCF)
+  // VCF region filter (plain .filter — triggers tabix pushdown)
   // ---------------------------------------------------------------------------
 
-  test("filterVariantRegion(chrom, start, end): chr1 count matches expected") {
-    val count = vcfDf.filterVariantRegion("chr1", 1, 1000000).count()
+  test("vcf filter(chrom, pos range): chr1 count matches expected") {
+    val count = vcfDf.filter("chrom = 'chr1' AND pos >= 1 AND pos <= 1000000").count()
     assert(count == VcfTestGenerator.VCF_CHR1_COUNT.toLong)
   }
 
-  test("filterVariantRegion(GenomicRegion): chr1 from pos 500 count matches expected") {
-    val region = GenomicRegion("chr1", 500, 1000000)
-    val count  = vcfDf.filterVariantRegion(region).count()
+  test("vcf filter(chrom, pos range from 500): chr1 from pos 500 count matches expected") {
+    val count = vcfDf.filter("chrom = 'chr1' AND pos >= 500 AND pos <= 1000000").count()
     assert(count == VcfTestGenerator.VCF_CHR1_FROM_500.toLong)
   }
 
   // ---------------------------------------------------------------------------
-  // filterBedRegion (BED)
+  // BED region filter (plain .filter — triggers tabix pushdown)
   // ---------------------------------------------------------------------------
 
-  test("filterBedRegion(chrom, start, end): chr1 count matches expected") {
-    val count = bedDf.filterBedRegion("chr1", 0L, 1000000L).count()
-    assert(count == BedTestGenerator.BED6_CHR1_COUNT.toLong)
-  }
-
-  test("filterBedRegion(GenomicRegion): chr1 count matches expected") {
-    val region = GenomicRegion("chr1", 1, 1000000)
-    val count  = bedDf.filterBedRegion(region).count()
+  test("bed filter(chrom, chromStart, chromEnd): chr1 count matches expected") {
+    val count = bedDf.filter("chrom = 'chr1' AND chromStart >= 0 AND chromEnd <= 1000000").count()
     assert(count == BedTestGenerator.BED6_CHR1_COUNT.toLong)
   }
 

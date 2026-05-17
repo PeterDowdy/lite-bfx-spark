@@ -47,41 +47,4 @@ class DataFrameOps(val df: DataFrame) {
   def withoutAttributes: DataFrame =
     df.drop("attributes")
 
-  // ---------------------------------------------------------------------------
-  // VCF filters  (operate on chrom / pos)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Filter VCF rows to variants within [start, end] on chrom (1-based, inclusive).
-   * Fires tabix predicate pushdown when combined with `spark.read.vcf(...)`.
-   */
-  def filterVariantRegion(chrom: String, start: Int, end: Int): DataFrame =
-    df.filter(
-      col("chrom") === chrom &&
-      col("pos") >= start &&
-      col("pos") <= end
-    )
-
-  /** Overload accepting a [[GenomicRegion]]. */
-  def filterVariantRegion(region: GenomicRegion): DataFrame =
-    filterVariantRegion(region.chromosome, region.start, region.end)
-
-  // ---------------------------------------------------------------------------
-  // BED filters  (operate on chrom / chromStart / chromEnd)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Filter BED rows whose interval falls within [start, end) on chrom (0-based).
-   * Fires tabix predicate pushdown when combined with `spark.read.bed(...)`.
-   */
-  def filterBedRegion(chrom: String, start: Long, end: Long): DataFrame =
-    df.filter(
-      col("chrom") === chrom &&
-      col("chromStart") >= start &&
-      col("chromEnd") <= end
-    )
-
-  /** Overload accepting a [[GenomicRegion]] (coordinates converted to Long). */
-  def filterBedRegion(region: GenomicRegion): DataFrame =
-    filterBedRegion(region.chromosome, region.start.toLong, region.end.toLong)
 }

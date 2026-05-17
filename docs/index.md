@@ -77,7 +77,7 @@ Every existing Spark genomics library is either abandoned or architecturally loc
 
     // VCF — tabix pushdown
     val variants = spark.read.vcf("s3a://data/calls.vcf.gz")
-      .filterVariantRegion("chr1", 1000000, 2000000)
+      .filter("chrom = 'chr1' AND pos >= 1000000 AND pos <= 2000000")
     ```
 
 ---
