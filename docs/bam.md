@@ -63,16 +63,32 @@ df = spark.read.format("bam") \
     .load("s3a://bucket/sample.bam")
 ```
 
-### Region filtering
+### Region filtering and predicate pushdown
 
-Apply a region filter as a standard Spark filter expression. The `referenceName` equality and `start` range are recognized by the scan builder and pushed to the BAI index so only the relevant BGZF blocks are fetched:
+Apply a region filter as a standard Spark `.filter()` expression. The scan builder recognizes specific filter patterns and uses them to guide BAI-based partition planning; Spark always re-applies all filters as a post-filter pass for correctness.
+
+**Recognized filter patterns (BAM + BAI only):**
+
+| Filter expression | Effect |
+|---|---|
+| `referenceName = '<value>'` | Required anchor — enables any pushdown |
+| `start >= N` or `start > N` | Lower bound on alignment start (1-based) |
+| `start <= N` or `start < N` | Upper bound on alignment start (1-based) |
+| `referenceName = '<v>' AND start >= A AND start <= B` | Single BAI-guided partition covering `[A, B]` |
+
+`referenceName` equality **must** be present for any pushdown to occur. A `start` range without `referenceName` is not pushable and results in a full scan. For SAM files (plain text, no BGZF), filters are always applied as a Spark post-filter — no BAI-guided optimization is possible regardless of the filter expression.
 
 ```python
+# Pushed — single partition, BAI-guided byte-range read
 df = spark.read.format("bam").load("s3a://bucket/sample.bam") \
     .filter("referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370")
-```
 
-When a region filter is active, the scan produces a single partition with a BAI-guided region query instead of VFO-based splitting. Spark re-applies the filter as a post-filter to handle reads that span region boundaries.
+# Pushed — referenceName only (no start range)
+df.filter("referenceName = 'chrX'")
+
+# Not pushed — no referenceName; full scan with post-filter
+df.filter("start >= 43044295 AND start <= 43125370")
+```
 
 ---
 

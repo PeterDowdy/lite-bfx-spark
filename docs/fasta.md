@@ -56,6 +56,26 @@ This is useful when the reference and its index live in different storage locati
 
 ---
 
+## Predicate pushdown
+
+The scan builder recognizes one filter pattern for contig pruning:
+
+| Filter expression | Effect |
+|---|---|
+| `name = '<value>'` | Only the matching contig partition is planned; all others are skipped |
+
+`name` equality **must** be an exact match (`=`). No range predicates are supported. Pushdown requires a FAI index — without one, the file is read as a single partition anyway and the filter is applied as a Spark post-filter over all rows.
+
+```python
+# Pushed — only the chr1 partition is planned and executed
+df.filter("name = 'chr1'").select("sequence").first()
+
+# Not pushed — no name filter; all contig partitions are read
+df.filter("length > 1000000")
+```
+
+---
+
 ## FAI index resolution order
 
 1. `indexPath` option

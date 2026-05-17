@@ -67,16 +67,18 @@ df.filter("chrom = 'chr1' AND chromStart >= 0 AND chromEnd <= 1000000").show()
 
 ## Predicate pushdown
 
-The scan builder recognizes the following filter patterns and uses them to plan tabix-guided partitions:
+The scan builder recognizes specific filter patterns and uses them to plan tabix-guided partitions. Spark always re-applies all filters as a post-filter pass for correctness.
 
-| Filter expression | Pushdown effect |
+**Recognized filter patterns (bgzipped `.bed.gz` with tabix only):**
+
+| Filter expression | Effect |
 |---|---|
-| `chrom = '<value>'` | Only tabix blocks for that chromosome are read |
-| `chrom = '<value>' AND chromStart >= A` | Blocks from position A on that chromosome |
-| `chrom = '<value>' AND chromEnd <= B` | Blocks up to position B on that chromosome |
-| Combined `chromStart >= A AND chromEnd <= B` | Blocks overlapping the interval |
+| `chrom = '<value>'` | Required anchor — enables any tabix-guided optimization |
+| `chromStart >= N` or `chromStart > N` | Lower bound on interval start (0-based) |
+| `chromEnd <= N` or `chromEnd < N` | Upper bound on interval end (0-based, exclusive) |
+| `chrom = '<v>' AND chromStart >= A AND chromEnd <= B` | Only blocks overlapping `[A, B)` read |
 
-All pushed filters are re-applied by Spark as a post-filter, so results are always correct even if an interval straddles a block boundary.
+`chrom` equality **must** be present for any pushdown to occur. `chromStart` or `chromEnd` range predicates without `chrom` are not pushable and result in a full scan.
 
 ```python
 # Pushed — tabix seeks to chr22 blocks only
@@ -85,7 +87,7 @@ df.filter("chrom = 'chr22'").count()
 # Pushed — only blocks overlapping the region
 df.filter("chrom = 'chr1' AND chromStart >= 1000000 AND chromEnd <= 2000000")
 
-# Not pushed — no chrom filter
+# Not pushed — no chrom filter; full scan + post-filter
 df.filter("chromStart >= 1000000")
 ```
 

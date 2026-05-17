@@ -82,30 +82,31 @@ df.count()
 
 ## Predicate pushdown
 
-Pushdown behavior differs by file type:
+Pushdown behavior differs by file type. Spark always re-applies all filters as a post-filter pass in every case, so results are correct regardless.
 
-| File type | Filter expression | Effect |
-|---|---|---|
-| `.vcf.gz` (tabix) | `chrom = '<value>'` | Only tabix blocks for that chromosome are read — reduces I/O |
-| `.vcf.gz` (tabix) | `chrom = '<value>' AND pos >= A AND pos <= B` | Only tabix blocks overlapping `[A, B]` are read — reduces I/O |
-| `.vcf` (plain) | any `chrom` / `pos` filter | Spark post-filter only — all byte-range partitions are read |
+**Recognized filter patterns (bgzipped `.vcf.gz` / `.bcf` with tabix only):**
 
-All pushed filters are re-applied by Spark as a post-filter in all cases, so results are always correct. For selective queries on large files, bgzipped + tabix is more I/O efficient than plain-text.
+| Filter expression | Effect |
+|---|---|
+| `chrom = '<value>'` | Required anchor — enables any tabix-guided optimization |
+| `pos >= N` or `pos > N` | Lower bound on variant position (1-based) |
+| `pos <= N` or `pos < N` | Upper bound on variant position (1-based) |
+| `chrom = '<v>' AND pos >= A AND pos <= B` | Single partition, only blocks overlapping `[A, B]` read |
 
-A `pos` range without a `chrom` filter is not pushable for tabix — tabix requires a chromosome to look up blocks.
+`chrom` equality **must** be present for any pushdown to occur. A `pos` range without `chrom` is not pushable — tabix requires a chromosome to locate index blocks. Plain-text `.vcf` files receive no tabix-guided optimization regardless of filter; all byte-range partitions are read and Spark post-filters the rows.
 
 ```python
-# .vcf.gz: only chr17 BGZF blocks are read from the file
+# Pushed — only chr17 BGZF blocks are read
 df.filter("chrom = 'chr17'").count()
 
-# .vcf.gz: only blocks overlapping BRCA1 are read
+# Pushed — only blocks overlapping BRCA1 are read
 df.filter("chrom = 'chr17' AND pos >= 43044295 AND pos <= 43125370")
 
-# .vcf (plain): all partitions read, Spark post-filters to chr17 rows
-df.filter("chrom = 'chr17'").count()
-
-# Not pushed for tabix: pos range without chrom — full scan
+# Not pushed — pos range without chrom; full scan + post-filter
 df.filter("pos >= 1000000 AND pos <= 2000000")
+
+# .vcf (plain): no tabix; all partitions read, Spark post-filters
+df.filter("chrom = 'chr17'").count()
 ```
 
 ---
