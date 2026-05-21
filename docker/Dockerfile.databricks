@@ -1,0 +1,40 @@
+# Databricks Runtime 17.3-LTS test image.
+# Base: databricksruntime/standard:17.3-LTS (Java 17.0.16, Python 3.12.3, Ubuntu)
+# Adds: Maven 3.9, samtools built from source.
+# Used by: `docker compose run databricks mvn test`
+FROM databricksruntime/standard:17.3-LTS
+
+ARG SAMTOOLS_VERSION=1.21
+
+# Install Maven and samtools build deps.
+# DBR image is Ubuntu-based but doesn't include Maven.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        maven \
+        curl bzip2 make gcc \
+        zlib1g-dev libbz2-dev liblzma-dev \
+        libcurl4-openssl-dev libssl-dev libncurses5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY samtools-build.sh /tmp/samtools-build.sh
+RUN chmod +x /tmp/samtools-build.sh \
+    && SAMTOOLS_VERSION="${SAMTOOLS_VERSION}" /tmp/samtools-build.sh \
+    && rm /tmp/samtools-build.sh
+
+# Spark 4.x / Java 17 module opens
+ENV MAVEN_OPTS="\
+  --add-opens=java.base/java.lang=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+  --add-opens=java.base/java.io=ALL-UNNAMED \
+  --add-opens=java.base/java.net=ALL-UNNAMED \
+  --add-opens=java.base/java.nio=ALL-UNNAMED \
+  --add-opens=java.base/java.util=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+  --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+  --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+  -Xmx2g"
+
+WORKDIR /workspace

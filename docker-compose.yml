@@ -1,0 +1,340 @@
+# spark-bam-reader test environments
+#
+# Test environments (run mvn test):
+#   spark-test       Pure Spark 4.x, no Databricks, no Unity Catalog    (maven:3.9-eclipse-temurin-17)
+#   spark402         Apache Spark 4.0.2 runtime                          (apache/spark:4.0.2)
+#   spark411         Apache Spark 4.1.1 runtime                          (apache/spark:4.1.1)
+#   databricks       Databricks Runtime 17.3-LTS, no Unity Catalog       (databricksruntime/standard:17.3-LTS)
+#   databricks-uc    Databricks Runtime 17.3-LTS + Unity Catalog sidecar
+#   spark-uc         Pure Spark 4.x + Unity Catalog sidecar
+#   serverless-build Databricks Serverless-compatible build (mvn package -Pserverless)
+#   spark-shell      Interactive shell inside spark-test image
+#
+# Infrastructure sidecars (start automatically when needed via depends_on):
+#   unity-catalog    Unity Catalog OSS REST server  (port 8080)
+#   minio            S3-compatible object store      (port 9000 / console 9001)
+#   azurite          Azure Blob/ADLS Gen2 emulator   (port 10000-10002)
+#   fake-gcs         Google Cloud Storage emulator   (port 4443)
+#
+# Usage examples:
+#   docker compose run --rm spark-test mvn test
+#   docker compose run --rm databricks mvn test
+#   docker compose run --rm spark-uc mvn test -Puc-integration
+#   docker compose run --rm serverless-build mvn package -Pserverless
+#   docker compose up minio azurite fake-gcs   # start cloud sidecars
+#   docker compose run --rm spark-shell         # interactive shell
+
+x-maven-opts: &maven-opts
+  MAVEN_OPTS: >-
+    --add-opens=java.base/java.lang=ALL-UNNAMED
+    --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+    --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+    --add-opens=java.base/java.io=ALL-UNNAMED
+    --add-opens=java.base/java.net=ALL-UNNAMED
+    --add-opens=java.base/java.nio=ALL-UNNAMED
+    --add-opens=java.base/java.util=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+    --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+    --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+    --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+    --add-opens=java.base/sun.security.action=ALL-UNNAMED
+    --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+    -Xmx2g
+
+x-test-volumes: &test-volumes
+  - .:/workspace
+  - maven-cache:/root/.m2
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # spark-test: pure Spark 4.x, no Databricks, no Unity Catalog
+  # ---------------------------------------------------------------------------
+  spark-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: mvn test -Pspark402
+
+  # ---------------------------------------------------------------------------
+  # spark402: Apache Spark 4.0.2 runtime
+  # ---------------------------------------------------------------------------
+  spark402:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark402
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: mvn test -Pspark402
+
+  # ---------------------------------------------------------------------------
+  # spark411: Apache Spark 4.1.1 runtime
+  # ---------------------------------------------------------------------------
+  spark411:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.spark411
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: mvn test -Pspark411
+
+  # ---------------------------------------------------------------------------
+  # databricks: Databricks Runtime 17.3-LTS, no Unity Catalog
+  # ---------------------------------------------------------------------------
+  databricks:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: mvn test -Pspark402
+
+  # ---------------------------------------------------------------------------
+  # databricks-uc: Databricks Runtime 17.3-LTS + Unity Catalog sidecar
+  # ---------------------------------------------------------------------------
+  databricks-uc:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment:
+      <<: *maven-opts
+      UNITY_CATALOG_URI: http://unity-catalog:8080
+    command: mvn test -Pspark402,uc-integration
+    depends_on:
+      unity-catalog:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # spark-uc: Pure Spark 4.x + Unity Catalog sidecar
+  # ---------------------------------------------------------------------------
+  spark-uc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment:
+      <<: *maven-opts
+      UNITY_CATALOG_URI: http://unity-catalog:8080
+    command: mvn test -Pspark402,uc-integration
+    depends_on:
+      unity-catalog:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # serverless-build: produce a Databricks Serverless-compatible JAR.
+  # Databricks Serverless runs on a fixed DBR with Spark 3.5.x / Java 17.
+  # Activates the `serverless` Maven profile (to be defined in pom.xml) which
+  # sets spark.version=3.5.x and configures bytecode target accordingly.
+  # Upload the resulting JAR to a Unity Catalog Volume or workspace files:
+  # https://docs.databricks.com/aws/en/jobs/how-to/use-jars-in-workflows
+  # ---------------------------------------------------------------------------
+  serverless-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: mvn package -Pserverless -DskipTests
+
+  # ---------------------------------------------------------------------------
+  # databricks-connect: Databricks Connect client for serverless smoke testing.
+  # Requires real Databricks credentials passed as environment variables:
+  #   DATABRICKS_HOST=https://<workspace>.azuredatabricks.net
+  #   DATABRICKS_TOKEN=<personal-access-token>
+  #   (or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET for OAuth M2M)
+  # ---------------------------------------------------------------------------
+  databricks-connect:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.databricks-connect
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    environment:
+      DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+      DATABRICKS_CLIENT_ID: ${DATABRICKS_CLIENT_ID:-}
+      DATABRICKS_CLIENT_SECRET: ${DATABRICKS_CLIENT_SECRET:-}
+    command: python3 tests/smoke_serverless.py
+
+  # ---------------------------------------------------------------------------
+  # spark-test-s3: run S3 range-access integration tests against MinIO.
+  #
+  # Uploads range.bam/.bai, a synthetic multi-contig FASTA, and a synthetic
+  # CRAM to MinIO, then verifies that BAI/FAI/CRAI-guided reads issue HTTP
+  # Range requests (fewer bytes transferred than a full-file scan).
+  #
+  # MinIO access logs (with Range headers) are visible via:
+  #   docker compose logs minio | grep '"Range"'
+  # ---------------------------------------------------------------------------
+  spark-test-s3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: >-
+      mvn clean test -Pspark402,s3-integration
+      -Ds3.endpoint=http://minio:9000
+      -Ds3.bucket=test-bucket
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # spark-test-gcs: run GCS range-access integration tests against fake-gcs-server
+  #
+  # Uploads fixtures directly via fake-gcs REST API (no GCS client library needed).
+  # Tests assert that FAI/BAI/tabix-guided reads transfer fewer bytes than full scans.
+  # ---------------------------------------------------------------------------
+  spark-test-gcs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: >-
+      mvn clean test -Pspark402,gcs-integration
+      -Dgcs.endpoint=http://fake-gcs:4443
+      -Dgcs.bucket=test-bucket
+    depends_on:
+      fake-gcs:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # spark-test-azure: run Azure range-access integration tests against Azurite
+  #
+  # Azurite exposes network aliases (devstoreaccount1.dfs.core.windows.net and
+  # devstoreaccount1.blob.core.windows.net) so the ABFS connector can resolve
+  # the storage account DNS name without /etc/hosts changes.
+  # ---------------------------------------------------------------------------
+  spark-test-azure:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    command: >-
+      mvn clean test -Pspark402,azure-integration
+    depends_on:
+      azurite:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # spark-shell: interactive shell for ad-hoc debugging
+  # ---------------------------------------------------------------------------
+  spark-shell:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes: *test-volumes
+    working_dir: /workspace
+    environment: *maven-opts
+    entrypoint: /bin/bash
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------------
+  # unity-catalog: Unity Catalog OSS REST server
+  # ---------------------------------------------------------------------------
+  unity-catalog:
+    image: unitycatalog/unitycatalog:latest
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/2.1/unity-catalog/catalogs"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # minio: S3-compatible storage (s3a:// connector testing)
+  # Access key: minioadmin  Secret key: minioadmin
+  # S3 API: http://localhost:9000   Console: http://localhost:9001
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001" --json
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # azurite: Azure Blob / ADLS Gen2 emulator (abfss:// connector testing)
+  # Connection string: DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;
+  #   AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;
+  #   BlobEndpoint=http://localhost:10000/devstoreaccount1;
+  # ---------------------------------------------------------------------------
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    ports:
+      - "10000:80"    # Blob — container listens on port 80 so ABFS connector (HTTP default) can reach it
+      - "10001:10001" # Queue
+      - "10002:10002" # Table
+    # Blob port 80: the ABFS connector uses port 80 for HTTP by default (no configurable override).
+    # Within the Docker network, containers reach azurite at devstoreaccount1.dfs.core.windows.net:80.
+    # The host port mapping (10000:80) preserves backward compatibility for external tools.
+    command: azurite --blobHost 0.0.0.0 --blobPort 80 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "80"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      default:
+        aliases:
+          - devstoreaccount1.dfs.core.windows.net
+          - devstoreaccount1.blob.core.windows.net
+
+  # ---------------------------------------------------------------------------
+  # fake-gcs: Google Cloud Storage emulator (gs:// connector testing)
+  # Endpoint: http://localhost:4443
+  # ---------------------------------------------------------------------------
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    ports:
+      - "4443:4443"
+    command: -scheme http -port 4443
+
+volumes:
+  maven-cache:

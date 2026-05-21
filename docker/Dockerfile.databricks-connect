@@ -1,0 +1,19 @@
+# Databricks Connect image for serverless smoke testing.
+# Installs databricks-connect>=15.0 (supports serverless compute).
+# Does NOT contain Spark binaries — all execution happens remotely on Databricks.
+#
+# Usage:
+#   docker compose run --rm \
+#     -e DATABRICKS_HOST=https://<workspace>.azuredatabricks.net \
+#     -e DATABRICKS_TOKEN=<token> \
+#     databricks-connect python3 /workspace/tests/smoke_serverless.py
+FROM python:3.12-slim
+
+# databricks-connect 15.x targets DBR 15.x (Spark 3.5).
+# For DBR 16.x / Spark 4.x serverless, use databricks-connect>=16.0 when available.
+ARG DATABRICKS_CONNECT_VERSION=15.4.2
+
+RUN pip install --no-cache-dir \
+    "databricks-connect==${DATABRICKS_CONNECT_VERSION}"
+
+WORKDIR /workspace

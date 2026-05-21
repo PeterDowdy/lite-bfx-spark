@@ -1,0 +1,405 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Root Maven POM: parent build for core (Java) and scala modules. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.litebfx</groupId>
+  <artifactId>lite-bfx-spark-parent</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>lite-bfx-spark</name>
+  <description>Native Apache Spark 4.x DataSource V2 readers for BAM, SAM, CRAM, FASTQ, VCF, BCF, FASTA, and BED.</description>
+  <url>https://github.com/PeterDowdy/lite-bfx-spark</url>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>PeterDowdy</id>
+      <name>Peter Dowdy</name>
+      <url>https://github.com/PeterDowdy</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:git://github.com/PeterDowdy/lite-bfx-spark.git</connection>
+    <developerConnection>scm:git:ssh://github.com/PeterDowdy/lite-bfx-spark.git</developerConnection>
+    <url>https://github.com/PeterDowdy/lite-bfx-spark/tree/main</url>
+  </scm>
+
+  <modules>
+    <module>core</module>
+    <module>scala</module>
+  </modules>
+
+  <properties>
+    <!-- spark.version, hadoop.version, scala.version are set by the active Spark profile below -->
+    <scala.binary.version>2.13</scala.binary.version>
+    <htsjdk.version>4.3.0</htsjdk.version>
+    <java.version>17</java.version>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <profiles>
+    <!--
+      Spark 4.0.2 (default)
+        hadoop.version pinned to the version shipped with Spark 4.0.2
+        scala.version  pinned to the Scala runtime bundled with Spark 4.0.2
+
+      Activate explicitly: mvn test -Pspark402
+    -->
+    <profile>
+      <id>spark402</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <properties>
+        <spark.version>4.0.2</spark.version>
+        <hadoop.version>3.4.1</hadoop.version>
+        <scala.version>2.13.16</scala.version>
+      </properties>
+    </profile>
+
+    <!--
+      Spark 4.1.1
+        hadoop.version pinned to the version shipped with Spark 4.1.1
+        scala.version  pinned to the Scala runtime bundled with Spark 4.1.1
+
+      Activate: mvn test -Pspark411
+    -->
+    <profile>
+      <id>spark411</id>
+      <properties>
+        <spark.version>4.1.1</spark.version>
+        <hadoop.version>3.4.2</hadoop.version>
+        <scala.version>2.13.17</scala.version>
+      </properties>
+    </profile>
+
+    <!--
+      Staging profile — activated by -Pstaging in the CI workflow on every push
+      to main.  Identical to -Prelease except the deployment is held in Pending
+      state on Central Portal (autoPublish=false, waitUntil=uploaded) so it is
+      never promoted to Maven Central automatically.  The deployment can be
+      inspected or dropped via the Central Portal UI.
+    -->
+    <profile>
+      <id>staging</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
+          </plugin>
+
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- Upload only — never promote to Maven Central automatically. -->
+              <autoPublish>false</autoPublish>
+              <waitUntil>uploaded</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <!--
+      Release profile — activated by -Prelease in the publish workflow.
+      Attaches: source JAR, javadoc JAR, GPG signatures.
+      Uploads to Sonatype Central Portal via central-publishing-maven-plugin.
+
+      Required secrets (set in GitHub repository settings):
+        OSSRH_USERNAME  — Central Portal token username
+        OSSRH_TOKEN     — Central Portal token password
+        GPG_PRIVATE_KEY — ASCII-armored GPG private key
+        GPG_PASSPHRASE  — Passphrase for the GPG key
+    -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <!-- Attach sources JAR (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Attach javadoc JAR (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Sign all artifacts with GPG (required by Maven Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+            <configuration>
+              <!-- loopback mode reads passphrase from -Dgpg.passphrase in CI -->
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
+          </plugin>
+
+          <!--
+            Upload to Sonatype Central Portal.
+            Credentials supplied via ~/.m2/settings.xml <server id="central">.
+            autoPublish=true releases immediately after validation passes.
+          -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-sql_${scala.binary.version}</artifactId>
+        <version>${spark.version}</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-client</artifactId>
+        <version>${hadoop.version}</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.github.samtools</groupId>
+        <artifactId>htsjdk</artifactId>
+        <version>${htsjdk.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>5.10.2</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.12.1</version>
+          <configuration>
+            <source>${java.version}</source>
+            <target>${java.version}</target>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+          <configuration>
+            <!--
+              @{argLine} is a late-binding reference resolved at test-execution time;
+              it picks up the JaCoCo agent string injected by jacoco:prepare-agent.
+              When JaCoCo is not active the property resolves to an empty string.
+            -->
+            <argLine>@{argLine}
+              --add-opens=java.base/java.lang=ALL-UNNAMED
+              --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+              --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+              --add-opens=java.base/java.io=ALL-UNNAMED
+              --add-opens=java.base/java.net=ALL-UNNAMED
+              --add-opens=java.base/java.nio=ALL-UNNAMED
+              --add-opens=java.base/java.util=ALL-UNNAMED
+              --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+              --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+              --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+              --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+              --add-opens=java.base/sun.security.action=ALL-UNNAMED
+              --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+            </argLine>
+          </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.jacoco</groupId>
+          <artifactId>jacoco-maven-plugin</artifactId>
+          <version>0.8.12</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>3.5.2</version>
+        </plugin>
+
+        <!--
+          Checkstyle 10.x via plugin 3.3.1.
+          Config lives at .github/checkstyle/checkstyle.xml.
+          Bound to verify phase in <build><plugins> below; inherited by all modules.
+          The scala/ module has no Java source so the check passes silently there.
+        -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-checkstyle-plugin</artifactId>
+          <version>3.3.1</version>
+          <dependencies>
+            <dependency>
+              <groupId>com.puppycrawl.tools</groupId>
+              <artifactId>checkstyle</artifactId>
+              <version>10.17.0</version>
+            </dependency>
+          </dependencies>
+          <configuration>
+            <configLocation>${maven.multiModuleProjectDirectory}/.github/checkstyle/checkstyle.xml</configLocation>
+            <consoleOutput>true</consoleOutput>
+            <failsOnError>true</failsOnError>
+            <includeTestSourceDirectory>false</includeTestSourceDirectory>
+            <sourceDirectories>${project.build.sourceDirectory}</sourceDirectories>
+          </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-source-plugin</artifactId>
+          <version>3.3.0</version>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-javadoc-plugin</artifactId>
+          <version>3.6.3</version>
+          <configuration>
+            <doclint>none</doclint>
+          </configuration>
+        </plugin>
+
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-gpg-plugin</artifactId>
+          <version>3.2.4</version>
+        </plugin>
+
+        <plugin>
+          <groupId>org.sonatype.central</groupId>
+          <artifactId>central-publishing-maven-plugin</artifactId>
+          <version>0.6.0</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <!-- Bind checkstyle:check and JaCoCo to verify for all child modules -->
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-checkstyle-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>checkstyle-verify</id>
+            <phase>verify</phase>
+            <goals><goal>check</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!--
+        JaCoCo: inject the coverage agent before tests run, then generate
+        HTML/XML/CSV reports at verify time.  Reports land in
+        <module>/target/site/jacoco/.
+      -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>jacoco-prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>jacoco-report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

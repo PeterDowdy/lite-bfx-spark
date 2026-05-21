@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Core module: Java DataSource V2 readers for BAM, CRAM, FASTA, FASTQ, BED, and VCF. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.litebfx</groupId>
+    <artifactId>lite-bfx-spark-parent</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>lite-bfx-spark</artifactId>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.samtools</groupId>
+      <artifactId>htsjdk</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+    </dependency>
+  </dependencies>
+
+  <profiles>
+    <profile>
+      <id>s3-integration</id>
+      <properties>
+        <s3.bucket>test-bucket</s3.bucket>
+        <s3.accessKey>minioadmin</s3.accessKey>
+        <s3.secretKey>minioadmin</s3.secretKey>
+      </properties>
+      <!--
+        Run S3 range-access integration tests against MinIO (or real S3).
+
+        Usage:
+          mvn test -Ps3-integration \
+            -Ds3.endpoint=http://localhost:9000 \
+            [-Ds3.bucket=test-bucket] \
+            [-Ds3.accessKey=minioadmin] \
+            [-Ds3.secretKey=minioadmin]
+
+        Via Docker (endpoint reachable at the service name):
+          docker compose run spark-test-s3
+      -->
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-s3-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-s3/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <s3.endpoint>${s3.endpoint}</s3.endpoint>
+                <s3.bucket>${s3.bucket}</s3.bucket>
+                <s3.accessKey>${s3.accessKey}</s3.accessKey>
+                <s3.secretKey>${s3.secretKey}</s3.secretKey>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>hadoop-aws</artifactId>
+          <version>${hadoop.version}</version>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>com.amazonaws</groupId>
+          <artifactId>aws-java-sdk-bundle</artifactId>
+          <version>1.12.367</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+    <!--
+      GCS integration profile — activated by -Pgcs-integration.
+      Compiles src/test-gcs/java and runs tests against fake-gcs-server.
+
+      Usage:
+        mvn test -Pgcs-integration \
+          -Dgcs.endpoint=http://localhost:4443 \
+          [-Dgcs.bucket=test-bucket] \
+          [-Dgcs.project=test-project]
+
+      Via Docker:
+        docker compose run spark-test-gcs
+    -->
+    <profile>
+      <id>gcs-integration</id>
+      <properties>
+        <gcs.bucket>test-bucket</gcs.bucket>
+        <gcs.project>test-project</gcs.project>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-gcs-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-gcs/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <!-- GCE_METADATA_HOST points the Google auth library to a local mock server
+                   (started in @BeforeAll by each GCS test class) that returns a fake Bearer
+                   token. fake-gcs-server accepts any Bearer token without validation. -->
+              <environmentVariables>
+                <GCE_METADATA_HOST>127.0.0.1:21999</GCE_METADATA_HOST>
+              </environmentVariables>
+              <systemPropertyVariables>
+                <gcs.endpoint>${gcs.endpoint}</gcs.endpoint>
+                <gcs.bucket>${gcs.bucket}</gcs.bucket>
+                <gcs.project>${gcs.project}</gcs.project>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>com.google.cloud.bigdataoss</groupId>
+          <artifactId>gcs-connector</artifactId>
+          <version>hadoop3-2.2.22</version>
+          <classifier>shaded</classifier>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
+    <!--
+      Azure ABFS integration profile — activated by -Pazure-integration.
+      Compiles src/test-azure/java and runs tests against Azurite.
+
+      The ABFS connector resolves the storage account as a DNS hostname
+      ({account}.dfs.core.windows.net).  In Docker, the azurite service
+      exposes network aliases for these hostnames.  For local runs, add
+      entries to /etc/hosts pointing to 127.0.0.1.
+
+      Usage:
+        mvn test -Pazure-integration \
+          [-Dazure.account=devstoreaccount1] \
+          [-Dazure.container=test-container]
+
+      Via Docker:
+        docker compose run spark-test-azure
+    -->
+    <profile>
+      <id>azure-integration</id>
+      <properties>
+        <azure.account>devstoreaccount1</azure.account>
+        <azure.container>test-container</azure.container>
+        <!-- Well-known Azurite development key — not a real secret  gitleaks:allow -->
+        <azure.key>Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==</azure.key>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.5.0</version>
+            <executions>
+              <execution>
+                <id>add-azure-test-source</id>
+                <phase>generate-test-sources</phase>
+                <goals><goal>add-test-source</goal></goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/src/test-azure/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <systemPropertyVariables>
+                <azure.account>${azure.account}</azure.account>
+                <azure.container>${azure.container}</azure.container>
+                <azure.key>${azure.key}</azure.key>
+              </systemPropertyVariables>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>hadoop-azure</artifactId>
+          <version>${hadoop.version}</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+
+  </profiles>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <shadedArtifactAttached>false</shadedArtifactAttached>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <relocations>
+                <relocation>
+                  <pattern>htsjdk</pattern>
+                  <shadedPattern>com.litebfx.shaded.htsjdk</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.google.common</pattern>
+                  <shadedPattern>com.litebfx.shaded.guava</shadedPattern>
+                </relocation>
+              </relocations>
+              <artifactSet>
+                <excludes>
+                  <exclude>org.apache.spark:*</exclude>
+                  <exclude>org.apache.hadoop:*</exclude>
+                  <exclude>org.scala-lang:*</exclude>
+                </excludes>
+              </artifactSet>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <executions>
+          <execution>
+            <goals><goal>test-jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

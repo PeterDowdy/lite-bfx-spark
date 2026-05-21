@@ -1,0 +1,366 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch so a new push doesn't queue
+# behind a slow build from a previous commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Checkstyle — fast static analysis, no compilation needed.
+  # Runs on production Java source only (test sources excluded per config).
+  # ---------------------------------------------------------------------------
+  checkstyle:
+    name: Checkstyle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: Run Checkstyle
+        run: mvn --batch-mode checkstyle:check -Pspark402
+
+  # ---------------------------------------------------------------------------
+  # Test matrix — runs the full test suite against each supported Spark version.
+  # Tests use a local SparkSession (no Docker needed); samtools is not required
+  # by the Java/Scala test code itself.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (Spark ${{ matrix.spark-profile }})
+    runs-on: ubuntu-latest
+    needs: checkstyle
+
+    strategy:
+      fail-fast: false          # keep both Spark versions running even if one fails
+      matrix:
+        include:
+          - spark-profile: spark402
+            spark-label: "4.0.2"
+          - spark-profile: spark411
+            spark-label: "4.1.1"
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      # Spark 4.x on Java 17 requires these module opens. They are already
+      # configured in maven-surefire-plugin <argLine> in pom.xml, but setting
+      # MAVEN_OPTS ensures they also apply to any forked Maven processes and
+      # matches the environment used in the Docker-based local test setup.
+      - name: Set MAVEN_OPTS
+        run: |
+          echo "MAVEN_OPTS=\
+            --add-opens=java.base/java.lang=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+            --add-opens=java.base/java.io=ALL-UNNAMED \
+            --add-opens=java.base/java.net=ALL-UNNAMED \
+            --add-opens=java.base/java.nio=ALL-UNNAMED \
+            --add-opens=java.base/java.util=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+            -Xmx2g" >> "$GITHUB_ENV"
+
+      - name: Build and test
+        run: mvn --batch-mode test jacoco:report -P${{ matrix.spark-profile }}
+
+      - name: Upload test reports
+        if: always()   # upload even when tests fail so failures are inspectable
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: surefire-reports-${{ matrix.spark-profile }}
+          path: |
+            core/target/surefire-reports/
+            scala/target/surefire-reports/
+          if-no-files-found: ignore
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: coverage-${{ matrix.spark-profile }}
+          path: |
+            core/target/site/jacoco/
+            scala/target/site/jacoco/
+          if-no-files-found: ignore
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo "## Coverage — ${{ matrix.spark-label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Module | Instruction % | Branch % |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------------|----------|" >> "$GITHUB_STEP_SUMMARY"
+          for csv in core/target/site/jacoco/jacoco.csv scala/target/site/jacoco/jacoco.csv; do
+            [ -f "$csv" ] || continue
+            module=$(echo "$csv" | cut -d/ -f1)
+            # Sum covered/missed instruction and branch counts from all rows (skip header)
+            awk -F',' 'NR>1 {im+=$4; ic+=$5; bm+=$6; bc+=$7}
+              END {
+                itot=ic+im; btot=bc+bm
+                ipct = itot>0 ? int(ic*100/itot) : 0
+                bpct = btot>0 ? int(bc*100/btot) : 0
+                printf "| %s | %d%% (%d/%d) | %d%% (%d/%d) |\n",
+                  mod, ipct, ic, itot, bpct, bc, btot
+              }' mod="$module" "$csv" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload JVM crash logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hs-err-${{ matrix.spark-profile }}
+          path: hs_err_pid*.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Cloud integration — runs against S3/MinIO, GCS/fake-gcs, and Azure/Azurite
+  # emulators. Each emulator is started as a step (not a service) so we can
+  # pass the exact startup command; GitHub Actions services do not support
+  # arbitrary command arguments after the image name.
+  # ---------------------------------------------------------------------------
+  cloud-integration:
+    name: Cloud integration (${{ matrix.cloud }})
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cloud: s3
+            profile: s3-integration
+            maven-flags: -Ds3.endpoint=http://localhost:9000
+          - cloud: gcs
+            profile: gcs-integration
+            maven-flags: -Dgcs.endpoint=http://localhost:4443
+          - cloud: azure
+            profile: azure-integration
+            maven-flags: ""
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: Set MAVEN_OPTS
+        run: |
+          echo "MAVEN_OPTS=\
+            --add-opens=java.base/java.lang=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+            --add-opens=java.base/java.io=ALL-UNNAMED \
+            --add-opens=java.base/java.net=ALL-UNNAMED \
+            --add-opens=java.base/java.nio=ALL-UNNAMED \
+            --add-opens=java.base/java.util=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+            -Xmx2g" >> "$GITHUB_ENV"
+
+      # ---- S3 (MinIO) -------------------------------------------------------
+      # Tests create the bucket themselves via the AWS SDK in @BeforeAll.
+      - name: Start MinIO (S3)
+        if: matrix.cloud == 's3'
+        run: |
+          docker run -d \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          until curl -sf http://localhost:9000/minio/health/live; do sleep 2; done
+
+      # ---- GCS (fake-gcs-server) --------------------------------------------
+      # Must pass -scheme http -port 4443 as image arguments, which is impossible
+      # with GHA services (no command override); step-based startup is required.
+      - name: Start fake-gcs-server (GCS)
+        if: matrix.cloud == 'gcs'
+        run: |
+          docker run -d \
+            -p 4443:4443 \
+            fsouza/fake-gcs-server:latest \
+            -scheme http -port 4443
+          until curl -sf http://localhost:4443/storage/v1/b; do sleep 2; done
+
+      # ---- Azure (Azurite) --------------------------------------------------
+      # Tests use WASB (wasb://) with the Blob endpoint on port 80 (HTTP).
+      # Map host port 80 → container port 10000 (Azurite blob default).
+      # DNS aliases resolve the storage account hostname to localhost.
+      - name: Start Azurite (Azure)
+        if: matrix.cloud == 'azure'
+        run: |
+          docker run -d \
+            -p 80:10000 \
+            mcr.microsoft.com/azure-storage/azurite:latest \
+            azurite-blob --blobHost 0.0.0.0
+          until nc -z localhost 80; do sleep 2; done
+          echo "127.0.0.1 devstoreaccount1.blob.core.windows.net" | sudo tee -a /etc/hosts
+
+      - name: Run cloud integration tests
+        run: |
+          mvn --batch-mode test \
+            -pl core \
+            -Pspark402,${{ matrix.profile }} \
+            ${{ matrix.maven-flags }}
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cloud-surefire-${{ matrix.cloud }}
+          path: core/target/surefire-reports/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Staging publish — runs on every push to main (not on PRs).
+  #
+  # Steps:
+  #   1. Verify connectivity and credentials against the Central Portal API.
+  #   2. Set a per-commit version (0.0.0-main-<sha7>) so Central accepts it
+  #      (SNAPSHOT versions are rejected by Maven Central).
+  #   3. Build, sign, and upload a deployment bundle.
+  #      autoPublish=false keeps it in Pending state — it is never promoted to
+  #      Maven Central automatically.  Inspect or drop it in the Portal UI at
+  #      https://central.sonatype.com/publishing/deployments
+  #
+  # Requires the same secrets as the release workflow:
+  #   OSSRH_USERNAME, OSSRH_TOKEN, GPG_PRIVATE_KEY, GPG_PASSPHRASE
+  # ---------------------------------------------------------------------------
+  staging-publish:
+    name: Staging publish
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    # Requires secrets: OSSRH_USERNAME, OSSRH_TOKEN, GPG_PRIVATE_KEY, GPG_PASSPHRASE.
+    # The "Check Central Portal connectivity" step below provides fast-fail when
+    # secrets are absent or wrong — it exits with a non-zero status before the
+    # signing step runs.  Configure these secrets before merging to main.
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: Set MAVEN_OPTS
+        run: |
+          echo "MAVEN_OPTS=\
+            --add-opens=java.base/java.lang=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+            --add-opens=java.base/java.io=ALL-UNNAMED \
+            --add-opens=java.base/java.net=ALL-UNNAMED \
+            --add-opens=java.base/java.nio=ALL-UNNAMED \
+            --add-opens=java.base/java.util=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+            -Xmx2g" >> "$GITHUB_ENV"
+
+      # Fail fast if credentials are wrong or the Portal is unreachable before
+      # spending time on the full build + signing cycle.
+      - name: Check Central Portal connectivity
+        run: |
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "$OSSRH_USERNAME:$OSSRH_TOKEN" \
+            "https://central.sonatype.com/api/v1/publisher/deployments?page=0&size=1")
+          echo "Central Portal HTTP status: $HTTP"
+          [ "$HTTP" = "200" ] || { echo "Cannot reach Central Portal (HTTP $HTTP)"; exit 1; }
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+
+      # Central Portal rejects SNAPSHOT versions, so stamp a unique version
+      # derived from the commit SHA.  The 0.0.0 prefix keeps it clearly
+      # distinct from real release versions (1.x, 2.x, …).
+      - name: Set staging version
+        run: |
+          SHA="${GITHUB_SHA::7}"
+          mvn --batch-mode versions:set \
+            -DnewVersion="0.0.0-main-${SHA}" \
+            -DgenerateBackupPoms=false
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5}' | head -1)
+          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust
+
+      - name: Configure Maven settings
+        run: |
+          mkdir -p "$HOME/.m2"
+          cat > "$HOME/.m2/settings.xml" <<'EOF'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+            <servers>
+              <server>
+                <id>central</id>
+                <username>${env.OSSRH_USERNAME}</username>
+                <password>${env.OSSRH_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
+
+      # Tests already passed in the test matrix above; skip them here.
+      # -Pstaging sets autoPublish=false and waitUntil=uploaded.
+      - name: Build, sign, and upload staging deployment
+        run: |
+          mvn --batch-mode deploy \
+            -Pstaging \
+            -Pspark402 \
+            -DskipTests \
+            -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}"
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
