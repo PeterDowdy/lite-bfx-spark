@@ -9,7 +9,8 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
-import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -18,6 +19,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -34,7 +36,7 @@ import java.util.regex.Pattern;
  *       advances to the next {@code @} record boundary before reading.</li>
  * </ul>
  */
-public class FastqScan implements Scan, Batch {
+public class FastqScan implements Batch, SupportsReportStatistics {
 
     private static final Logger log = LoggerFactory.getLogger(FastqScan.class);
 
@@ -45,10 +47,16 @@ public class FastqScan implements Scan, Batch {
     private static final int DEFAULT_NUM_PARTITIONS = 200;
 
     private final CaseInsensitiveStringMap options;
+    private final int pushedLimit;
 
     FastqScan(CaseInsensitiveStringMap options) {
-        log.trace("FastqScan(options={})", options);
+        this(options, Integer.MAX_VALUE);
+    }
+
+    FastqScan(CaseInsensitiveStringMap options, int pushedLimit) {
+        log.trace("FastqScan(options={}, pushedLimit={})", options, pushedLimit);
         this.options = options;
+        this.pushedLimit = pushedLimit;
     }
 
     @Override
@@ -59,6 +67,28 @@ public class FastqScan implements Scan, Batch {
     @Override
     public Batch toBatch() {
         return this;
+    }
+
+    @Override
+    public Statistics estimateStatistics() {
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            long total = 0;
+            for (FileStatus fs : resolveFiles(options, conf)) {
+                total += fs.getLen();
+            }
+            final long size = total;
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        } catch (IOException e) {
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        }
     }
 
     @Override
@@ -84,9 +114,7 @@ public class FastqScan implements Scan, Batch {
 
         try {
             List<InputPartition> partitions = new ArrayList<>();
-            Path hadoopPath = new Path(pathStr);
-            FileSystem fs = hadoopPath.getFileSystem(hadoopConf);
-            FileStatus[] statuses = resolveFiles(fs, hadoopPath);
+            List<FileStatus> statuses = resolveFiles(options, hadoopConf);
 
             for (FileStatus status : statuses) {
                 String filePath = status.getPath().toUri().toString();
@@ -97,6 +125,7 @@ public class FastqScan implements Scan, Batch {
 
                 if (isGzipped) {
                     long fileSize = status.getLen();
+                    FileSystem fs = status.getPath().getFileSystem(hadoopConf);
                     if (fileSize > bgzfSplitSize && isBgzfFile(fs, status.getPath())) {
                         log.trace("planInputPartitions() BGZF detected -> split partitions for {}", filePath);
                         planBgzfSplitPartitions(filePath, fileSize, bgzfSplitSize, numPartitions,
@@ -118,6 +147,16 @@ public class FastqScan implements Scan, Batch {
                         partitions.add(new FastqInputPartition(filePath, start, end, hadoopConf, readNumber));
                     }
                 }
+            }
+
+            // Limit pushdown: only the first partition is needed; its reader enforces rowLimit.
+            if (pushedLimit < Integer.MAX_VALUE && !partitions.isEmpty()) {
+                FastqInputPartition first = (FastqInputPartition) partitions.get(0);
+                log.trace("planInputPartitions() limit={} -> trimming to 1 partition", pushedLimit);
+                return new InputPartition[]{
+                    new FastqInputPartition(first.getPath(), first.getStartByte(), first.getEndByte(),
+                            first.getHadoopConf(), first.getReadNumber(), first.isBgzf(), pushedLimit)
+                };
             }
 
             log.trace("planInputPartitions() -> {} partition(s)", partitions.size());
@@ -197,13 +236,19 @@ public class FastqScan implements Scan, Batch {
             && header[13] == 0x43;  // 'C'
     }
 
-    private static FileStatus[] resolveFiles(FileSystem fs, Path path) throws IOException {
-        FileStatus status = fs.getFileStatus(path);
+    static List<FileStatus> resolveFiles(CaseInsensitiveStringMap options, Configuration conf)
+            throws IOException {
+        String pathStr = options.get("path");
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        FileStatus status = fs.getFileStatus(hadoopPath);
         if (status.isFile()) {
-            return new FileStatus[]{status};
+            List<FileStatus> result = new ArrayList<>();
+            result.add(status);
+            return result;
         }
         // Directory or glob
-        FileStatus[] globbed = fs.globStatus(path);
+        FileStatus[] globbed = fs.globStatus(hadoopPath);
         if (globbed != null && globbed.length > 0) {
             List<FileStatus> files = new ArrayList<>();
             for (FileStatus s : globbed) {
@@ -217,17 +262,17 @@ public class FastqScan implements Scan, Batch {
                     }
                 }
             }
-            if (!files.isEmpty()) return files.toArray(new FileStatus[0]);
+            if (!files.isEmpty()) return files;
         }
         // Fallback: list directory directly
-        FileStatus[] listed = fs.listStatus(path);
+        FileStatus[] listed = fs.listStatus(hadoopPath);
         List<FileStatus> files = new ArrayList<>();
         for (FileStatus s : listed) {
             if (s.isFile() && isFastqExtension(s.getPath().getName())) {
                 files.add(s);
             }
         }
-        return files.toArray(new FileStatus[0]);
+        return files;
     }
 
     private static boolean isFastqExtension(String name) {

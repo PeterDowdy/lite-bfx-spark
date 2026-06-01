@@ -1,13 +1,22 @@
 package com.litebfx.bed;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.NullOrdering;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.connector.expressions.SortValue;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportOrdering;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -16,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * Plans one {@link BedInputPartition} per BED file (full-file or tabix region).
@@ -32,7 +42,7 @@ import java.util.List;
  * the partition is configured for a region query. Spark post-filters ensure
  * correctness for records near region boundaries.
  */
-public class BedScan implements Scan, Batch {
+public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsReportOrdering {
 
     private static final Logger log = LoggerFactory.getLogger(BedScan.class);
 
@@ -41,17 +51,28 @@ public class BedScan implements Scan, Batch {
     private final String pushedChrom;
     private final long pushedStart;
     private final long pushedEnd;
+    private final int pushedLimit;
 
     BedScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
             String pushedChrom,
             long pushedStart,
             long pushedEnd) {
+        this(options, requiredSchema, pushedChrom, pushedStart, pushedEnd, Integer.MAX_VALUE);
+    }
+
+    BedScan(CaseInsensitiveStringMap options,
+            StructType requiredSchema,
+            String pushedChrom,
+            long pushedStart,
+            long pushedEnd,
+            int pushedLimit) {
         this.options        = options;
         this.requiredSchema = requiredSchema;
         this.pushedChrom    = pushedChrom;
         this.pushedStart    = pushedStart;
         this.pushedEnd      = pushedEnd;
+        this.pushedLimit    = pushedLimit;
     }
 
     @Override
@@ -65,9 +86,42 @@ public class BedScan implements Scan, Batch {
     }
 
     @Override
+    public Statistics estimateStatistics() {
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            long total = 0;
+            for (FileStatus fs : resolveFiles(options, conf)) {
+                total += fs.getLen();
+            }
+            final long size = total;
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        } catch (IOException e) {
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        }
+    }
+
+    @Override
     public InputPartition[] planInputPartitions() {
+        InputPartition[] partitions = doplanInputPartitions();
+        if (pushedLimit < Integer.MAX_VALUE && pushedChrom == null && partitions.length > 0) {
+            log.trace("planInputPartitions() limit={} -> trimming {} -> 1 partition(s)",
+                    pushedLimit, partitions.length);
+            return new InputPartition[]{
+                ((BedInputPartition) partitions[0]).withRowLimit(pushedLimit)
+            };
+        }
+        return partitions;
+    }
+
+    private InputPartition[] doplanInputPartitions() {
         String pathStr = options.get("path");
-        log.trace("planInputPartitions() path={}", pathStr);
         if (pathStr == null) {
             throw new IllegalArgumentException("'path' option is required for the bed data source");
         }
@@ -77,6 +131,9 @@ public class BedScan implements Scan, Batch {
                 .sessionState().newHadoopConf();
 
         try {
+            List<FileStatus> files = resolveFiles(options, hadoopConf);
+            pathStr = files.get(0).getPath().toUri().toString();
+            log.trace("planInputPartitions() path={}", pathStr);
             // Plain-text BED: split into fixed-size byte-range chunks so multiple
             // workers read in parallel. Each worker seeks to its chunk boundary,
             // discards bytes up to the next newline, and reads records until its
@@ -141,6 +198,43 @@ public class BedScan implements Scan, Batch {
     @Override
     public PartitionReaderFactory createReaderFactory() {
         return new BedPartitionReaderFactory();
+    }
+
+    @Override
+    public SortOrder[] outputOrdering() {
+        String path = options.getOrDefault("path", "");
+        boolean isCompressed = path.toLowerCase().endsWith(".gz")
+                || path.toLowerCase().endsWith(".bgz")
+                || path.toLowerCase().endsWith(".bgzf");
+        if (!isCompressed) return new SortOrder[0];
+        boolean useIndex = Boolean.parseBoolean(options.getOrDefault("useIndex", "true"));
+        if (!useIndex) return new SortOrder[0];
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            if (resolveIndexPath(path, conf) == null) return new SortOrder[0];
+        } catch (Exception e) {
+            return new SortOrder[0];
+        }
+        return new SortOrder[]{
+            SortValue.apply(FieldReference.apply("chrom"),      SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
+            SortValue.apply(FieldReference.apply("chromStart"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // File resolution
+    // -------------------------------------------------------------------------
+
+    static List<FileStatus> resolveFiles(CaseInsensitiveStringMap options, Configuration conf)
+            throws IOException {
+        String pathStr = options.get("path");
+        if (pathStr == null) return new ArrayList<>();
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        List<FileStatus> result = new ArrayList<>();
+        result.add(fs.getFileStatus(hadoopPath));
+        return result;
     }
 
     // -------------------------------------------------------------------------

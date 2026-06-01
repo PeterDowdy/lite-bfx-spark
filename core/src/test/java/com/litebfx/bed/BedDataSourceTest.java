@@ -7,6 +7,9 @@ import htsjdk.tribble.index.tabix.TabixIndex;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -376,5 +379,59 @@ class BedDataSourceTest {
         assertEquals("chromStart", df.schema().apply(1).name());
         assertEquals("chromEnd",   df.schema().apply(2).name());
         assertEquals(BedTestGenerator.BED6_TOTAL, df.count());
+    }
+
+    // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_sizeInBytes_greaterThanZero() {
+        Dataset<Row> df = spark.read().format("bed").load(exampleBedGzPath);
+        long sizeBytes = df.queryExecution().optimizedPlan()
+                .stats().sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty BED file");
+        assertTrue(sizeBytes <= new java.io.File(java.net.URI.create(exampleBedGzPath)).length() * 2,
+                "sizeInBytes should be within 2x of the actual file size");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        long count = spark.read().format("bed")
+                .load(fx.bed3Plain().toString())
+                .limit(2)
+                .count();
+        assertEquals(2L, count, "limit(2) should return exactly 2 rows");
+    }
+
+    // -------------------------------------------------------------------------
+    // Ordering (SupportsReportOrdering)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void outputOrdering_tabixIndexed_returnsChromAndChromStart() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        BedScan scan = new BedScan(
+                new CaseInsensitiveStringMap(java.util.Map.of("path", fx.bed6Bgzf().toString())),
+                BedSchema.SCHEMA, null, 0L, Long.MAX_VALUE);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(2, ordering.length, "tabix-indexed BED should report 2 ordering fields");
+        assertEquals("chrom",      ((NamedReference) ordering[0].expression()).fieldNames()[0]);
+        assertEquals("chromStart", ((NamedReference) ordering[1].expression()).fieldNames()[0]);
+    }
+
+    @Test
+    void outputOrdering_plainBed_isEmpty() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        BedScan scan = new BedScan(
+                new CaseInsensitiveStringMap(java.util.Map.of("path", fx.bed3Plain().toString())),
+                BedSchema.SCHEMA, null, 0L, Long.MAX_VALUE);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(0, ordering.length, "plain BED without index should report no ordering");
     }
 }

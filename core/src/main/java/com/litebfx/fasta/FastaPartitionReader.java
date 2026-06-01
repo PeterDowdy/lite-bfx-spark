@@ -56,6 +56,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
 
     private ReferenceSequence current;
     private boolean done = false;
+    private long rowsRead = 0;
 
     public FastaPartitionReader(FastaInputPartition partition) {
         log.trace("FastaPartitionReader(path={}, contigName={})",
@@ -80,6 +81,13 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
 
     @Override
     public boolean next() throws IOException {
+        if (rowsRead >= partition.getRowLimit()) return false;
+        boolean hasNext = nextRecord();
+        if (hasNext) rowsRead++;
+        return hasNext;
+    }
+
+    private boolean nextRecord() throws IOException {
         if (!isOpened()) open();
 
         if (partition.getContigName() != null) {
@@ -93,7 +101,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
                 throw new IllegalStateException("No reader opened for indexed FASTA mode");
             }
             done = true;
-            log.trace("next() indexed contig={}", partition.getContigName());
+            log.trace("nextRecord() indexed contig={}", partition.getContigName());
             return current != null;
         } else {
             // Full-scan mode.
@@ -104,7 +112,7 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
             } else {
                 throw new IllegalStateException("No reader opened for full-scan FASTA mode");
             }
-            if (current != null) log.trace("next() full-scan contig={}", current.getName());
+            if (current != null) log.trace("nextRecord() full-scan contig={}", current.getName());
             return current != null;
         }
     }

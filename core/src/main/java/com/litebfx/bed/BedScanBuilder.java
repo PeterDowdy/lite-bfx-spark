@@ -1,30 +1,31 @@
 package com.litebfx.bed;
 
+import com.litebfx.fasta.FastaScanBuilder;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
-import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
+import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
-import org.apache.spark.sql.sources.EqualTo;
-import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.sources.GreaterThan;
-import org.apache.spark.sql.sources.GreaterThanOrEqual;
-import org.apache.spark.sql.sources.LessThan;
-import org.apache.spark.sql.sources.LessThanOrEqual;
+import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Builds a {@link BedScan} for a BED DataSource V2 read.
  *
  * <h3>Predicate pushdown</h3>
- * Recognized filters ({@code chrom} equality + {@code chromStart}/{@code chromEnd}
- * range) are extracted for tabix-based optimization.  All filters are returned as
- * unhandled so Spark always applies a post-scan safety pass.
+ * Recognized predicates ({@code chrom} equality + {@code chromStart}/{@code chromEnd}
+ * range) are extracted for tabix-based optimization.  Unrecognized predicates are
+ * returned unhandled so Spark applies a post-scan pass for them.
  */
 public class BedScanBuilder
-        implements ScanBuilder, SupportsPushDownFilters, SupportsPushDownRequiredColumns {
+        implements ScanBuilder, SupportsPushDownV2Filters, SupportsPushDownLimit,
+                   SupportsPushDownRequiredColumns {
 
     private static final Logger log = LoggerFactory.getLogger(BedScanBuilder.class);
 
@@ -34,51 +35,91 @@ public class BedScanBuilder
     private String pushedChrom   = null;
     private long   pushedStart   = 0L;
     private long   pushedEnd     = Long.MAX_VALUE;
+    private int    pushedLimit   = Integer.MAX_VALUE;
+    private Predicate[] handledPredicates = new Predicate[0];
 
     BedScanBuilder(CaseInsensitiveStringMap options) {
         this.options = options;
     }
 
     // -------------------------------------------------------------------------
-    // SupportsPushDownFilters
+    // SupportsPushDownV2Filters
     // -------------------------------------------------------------------------
 
     @Override
-    public Filter[] pushFilters(Filter[] filters) {
-        log.trace("pushFilters(filters={})", (Object) filters);
-        String chrom = null;
-        long start = 0L;
-        long end   = Long.MAX_VALUE;
+    public Predicate[] pushPredicates(Predicate[] predicates) {
+        log.trace("pushPredicates(predicates={})", (Object) predicates);
+        Predicate[] flat = FastaScanBuilder.flatten(predicates);
 
-        for (Filter f : filters) {
-            if (f instanceof EqualTo eq && "chrom".equals(eq.attribute())) {
-                chrom = String.valueOf(eq.value());
+        // First pass: extract chrom equality
+        String chrom = null;
+        Predicate chromPredicate = null;
+        for (Predicate p : flat) {
+            if (FastaScanBuilder.isColumnEquality(p, "chrom")) {
+                chrom = String.valueOf(FastaScanBuilder.literalValue(p));
+                chromPredicate = p;
+                break;
             }
         }
+
+        List<Predicate> handled = new ArrayList<>();
+        List<Predicate> unhandled = new ArrayList<>();
+
         if (chrom != null) {
-            for (Filter f : filters) {
-                if (f instanceof GreaterThanOrEqual gte && "chromStart".equals(gte.attribute())) {
-                    start = ((Number) gte.value()).longValue();
-                } else if (f instanceof GreaterThan gt && "chromStart".equals(gt.attribute())) {
-                    start = ((Number) gt.value()).longValue() + 1;
-                } else if (f instanceof LessThanOrEqual lte && "chromEnd".equals(lte.attribute())) {
-                    end = ((Number) lte.value()).longValue();
-                } else if (f instanceof LessThan lt && "chromEnd".equals(lt.attribute())) {
-                    end = ((Number) lt.value()).longValue() - 1;
+            handled.add(chromPredicate);
+            long start = 0L;
+            long end   = Long.MAX_VALUE;
+            // Second pass: extract chromStart/chromEnd for the tabix index query.
+            // Range predicates are returned unhandled so Spark post-filters for exactness;
+            // tabix overlap queries may return records that fall partially outside the range.
+            for (Predicate p : flat) {
+                if (p == chromPredicate) continue;
+                if (FastaScanBuilder.isRangeComparison(p)) {
+                    String field = FastaScanBuilder.columnName(p).toLowerCase();
+                    String op = p.name();
+                    if ("chromstart".equals(field)) {
+                        long val = ((Number) FastaScanBuilder.literalValue(p)).longValue();
+                        if (">=".equals(op)) start = val;
+                        else if (">".equals(op)) start = val + 1;
+                        unhandled.add(p);
+                    } else if ("chromend".equals(field)) {
+                        long val = ((Number) FastaScanBuilder.literalValue(p)).longValue();
+                        if ("<=".equals(op)) end = val;
+                        else if ("<".equals(op)) end = val - 1;
+                        unhandled.add(p);
+                    } else {
+                        unhandled.add(p);
+                    }
+                } else {
+                    unhandled.add(p);
                 }
             }
             pushedChrom = chrom;
             pushedStart = start;
             pushedEnd   = end;
+        } else {
+            for (Predicate p : flat) unhandled.add(p);
         }
-        log.trace("pushFilters() extracted chrom={} start={} end={}", pushedChrom, pushedStart, pushedEnd);
-        // Return ALL filters as unhandled; Spark post-filters for correctness.
-        return filters;
+
+        log.trace("pushPredicates() extracted chrom={} start={} end={}", pushedChrom, pushedStart, pushedEnd);
+        handledPredicates = handled.toArray(new Predicate[0]);
+        return unhandled.toArray(new Predicate[0]);
     }
 
     @Override
-    public Filter[] pushedFilters() {
-        return new Filter[0];
+    public Predicate[] pushedPredicates() {
+        return handledPredicates;
+    }
+
+    // -------------------------------------------------------------------------
+    // SupportsPushDownLimit
+    // -------------------------------------------------------------------------
+
+    @Override
+    public boolean pushLimit(int limit) {
+        log.trace("pushLimit({})", limit);
+        this.pushedLimit = limit;
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -97,6 +138,6 @@ public class BedScanBuilder
     @Override
     public Scan build() {
         log.trace("build()");
-        return new BedScan(options, requiredSchema, pushedChrom, pushedStart, pushedEnd);
+        return new BedScan(options, requiredSchema, pushedChrom, pushedStart, pushedEnd, pushedLimit);
     }
 }

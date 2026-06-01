@@ -1,11 +1,10 @@
 package com.litebfx.bed;
 
-import org.apache.spark.sql.sources.EqualTo;
-import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.sources.GreaterThan;
-import org.apache.spark.sql.sources.GreaterThanOrEqual;
-import org.apache.spark.sql.sources.LessThan;
-import org.apache.spark.sql.sources.LessThanOrEqual;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.LiteralValue;
+import org.apache.spark.sql.connector.expressions.filter.And;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -16,17 +15,24 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for {@link BedScanBuilder#pushFilters}.
+ * Unit tests for {@link BedScanBuilder#pushPredicates}.
  *
  * <p>Drives the builder directly (no SparkSession) to exercise all branch
  * combinations in the predicate-pushdown logic:
  * <ul>
- *   <li>EqualTo on {@code chrom} (match / attribute-mismatch / type-mismatch)</li>
- *   <li>All four range filter types on {@code chromStart}/{@code chromEnd}</li>
- *   <li>Range filters present when no chrom EqualTo is set (must be ignored)</li>
- *   <li>Range filter with wrong attribute (must be ignored)</li>
+ *   <li>Equality predicate on {@code chrom} (match / attribute-mismatch)</li>
+ *   <li>All four range predicate types on {@code chromStart}/{@code chromEnd}</li>
+ *   <li>Case-insensitive matching for {@code chromStart}/{@code chromEnd}</li>
+ *   <li>Range predicates present when no chrom equality is set (must be returned unhandled)</li>
+ *   <li>Range predicate with wrong attribute (must be returned unhandled)</li>
+ *   <li>{@code And}-wrapped compound predicate unwrapping</li>
  *   <li>Column pruning via {@link BedScanBuilder#pruneColumns}</li>
  * </ul>
+ *
+ * <p>Note: range predicates ({@code chromStart}/{@code chromEnd} comparisons) are always
+ * returned unhandled so Spark post-filters for exactness — tabix overlap queries may
+ * return records that fall partially outside the requested range.  Only {@code chrom}
+ * equality is pushed.
  */
 class BedScanBuilderTest {
 
@@ -34,189 +40,216 @@ class BedScanBuilderTest {
         return new CaseInsensitiveStringMap(Map.of("path", "test.bed"));
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — no filters
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_empty_returnsEmptyAndBuilds() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        Filter[] result = b.pushFilters(new Filter[0]);
-        assertEquals(0, result.length);
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on chrom (success path)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToChrom_returnsAllFiltersUnhandled() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        Filter[] filters = {new EqualTo("chrom", "chr1")};
-        Filter[] returned = b.pushFilters(filters);
-        // All filters must be returned as unhandled
-        assertSame(filters, returned);
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on wrong attribute (type matches, attribute doesn't)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToWrongAttribute_chromNotExtracted() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        // EqualTo type matches but attribute != "chrom" → chrom stays null, range loop skipped
-        b.pushFilters(new Filter[]{new EqualTo("score", "500")});
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — range filters without chrom (must be silently ignored)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_rangeFiltersNoChrom_ignored() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        // No EqualTo("chrom") → chrom == null → second loop never entered
-        b.pushFilters(new Filter[]{
-                new GreaterThanOrEqual("chromStart", 500L),
-                new LessThanOrEqual("chromEnd", 1000L)
+    private static Predicate eq(String col, String val) {
+        return new Predicate("=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.StringType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThanOrEqual on chromStart (with chrom set)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusGte_startExtracted() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThanOrEqual("chromStart", 500L)
+    private static Predicate gte(String col, long val) {
+        return new Predicate(">=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThan on chromStart (start + 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusGt_startPlusOneExtracted() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThan("chromStart", 499L)
+    private static Predicate gt(String col, long val) {
+        return new Predicate(">", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThanOrEqual on chromEnd
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusLte_endExtracted() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThanOrEqual("chromEnd", 1000L)
+    private static Predicate lte(String col, long val) {
+        return new Predicate("<=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThan on chromEnd (end - 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusLt_endMinusOneExtracted() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThan("chromEnd", 1001L)
+    private static Predicate lt(String col, long val) {
+        return new Predicate("<", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — no predicates
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_empty_returnsEmptyAndBuilds() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        assertEquals(0, b.pushPredicates(new Predicate[0]).length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — range filter with wrong attribute (type matches, attr doesn't)
+    // pushPredicates — chrom equality (success path)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_chromPlusGteWrongAttr_ignored() {
+    void pushPredicates_equalToChrom_handledNotReturned() {
         BedScanBuilder b = new BedScanBuilder(opts());
-        // GreaterThanOrEqual type matches but attribute != "chromStart"
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThanOrEqual("score", 0L)
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusLteWrongAttr_ignored() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        // LessThanOrEqual type matches but attribute != "chromEnd"
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThanOrEqual("score", 1000L)
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusGtWrongAttr_ignored() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        // GreaterThan type matches but attribute != "chromStart"
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThan("score", 0L)
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusLtWrongAttr_ignored() {
-        BedScanBuilder b = new BedScanBuilder(opts());
-        // LessThan type matches but attribute != "chromEnd"
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThan("score", 1000L)
-        });
+        Predicate chrom = eq("chrom", "chr1");
+        assertEquals(0, b.pushPredicates(new Predicate[]{chrom}).length);
+        assertEquals(1, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — all four range filter types together with chrom
+    // pushPredicates — case-insensitive chromStart/chromEnd (Spark 4.x lowercasing)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_allRangeFilterTypes_allProcessed() {
+    void pushPredicates_chromStartLowercase_handled() {
         BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chrX"),
-                new GreaterThanOrEqual("chromStart", 100L),
-                new GreaterThan("chromStart", 99L),
-                new LessThanOrEqual("chromEnd", 200L),
-                new LessThan("chromEnd", 201L)
-        });
+        Predicate[] preds = {eq("chrom", "chr1"), gte("chromstart", 500L)};
+        Predicate[] unhandled = b.pushPredicates(preds);
+        assertEquals(1, unhandled.length, "chromStart range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromEndLowercase_handled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] preds = {eq("chrom", "chr1"), lte("chromend", 1000L)};
+        Predicate[] unhandled = b.pushPredicates(preds);
+        assertEquals(1, unhandled.length, "chromEnd range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushedFilters — always empty
+    // pushPredicates — chrom equality on wrong attribute
     // -------------------------------------------------------------------------
 
     @Test
-    void pushedFilters_alwaysReturnsEmpty() {
+    void pushPredicates_equalToWrongAttribute_chromNotExtracted() {
         BedScanBuilder b = new BedScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("chrom", "chr1")});
-        assertEquals(0, b.pushedFilters().length);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("score", "500")});
+        assertEquals(1, unhandled.length);
+        assertEquals(0, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range without chrom (must be returned unhandled)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_rangeFiltersNoChrom_allReturnedUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{gte("chromStart", 500L), lte("chromEnd", 1000L)});
+        assertEquals(2, unhandled.length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — gte/gt on chromStart (with chrom):
+    // chrom equality is pushed; chromStart range is returned unhandled for Spark post-filtering
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_chromPlusGte_chromPushedRangeUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gte("chromStart", 500L)});
+        assertEquals(1, unhandled.length, "chromStart range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromPlusGt_chromPushedRangeUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gt("chromStart", 499L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — lte/lt on chromEnd (with chrom):
+    // chrom equality is pushed; chromEnd range is returned unhandled for Spark post-filtering
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_chromPlusLte_chromPushedRangeUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), lte("chromEnd", 1000L)});
+        assertEquals(1, unhandled.length, "chromEnd range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromPlusLt_chromPushedRangeUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), lt("chromEnd", 1001L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range with wrong attribute (chrom present, wrong range col)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_chromPlusGteWrongAttr_rangeUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gte("score", 0L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — And-wrapped compound predicate
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_andWrapped_chromPushedStartUnhandled() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate chrom = eq("chrom", "chr1");
+        Predicate start = gte("chromStart", 500L);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{new And(chrom, start)});
+        assertEquals(1, unhandled.length, "chromStart range from And should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — all four range types together with chrom
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_allRangeTypes_onlyChromPushed() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        Predicate[] preds = {
+                eq("chrom", "chrX"),
+                gte("chromStart", 100L),
+                gt("chromStart", 99L),
+                lte("chromEnd", 200L),
+                lt("chromEnd", 201L)
+        };
+        assertEquals(4, b.pushPredicates(preds).length, "all range predicates should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushedPredicates — reflects handled set (equality only)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushedPredicates_returnsHandledPredicates() {
+        BedScanBuilder b = new BedScanBuilder(opts());
+        b.pushPredicates(new Predicate[]{eq("chrom", "chr1")});
+        assertEquals(1, b.pushedPredicates().length);
     }
 
     // -------------------------------------------------------------------------

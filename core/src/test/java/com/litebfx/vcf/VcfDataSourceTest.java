@@ -3,6 +3,8 @@ package com.litebfx.vcf;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
@@ -811,5 +813,72 @@ class VcfDataSourceTest {
                 .count();
         assertEquals(VcfTestGenerator.VCF_TOTAL, count,
                 "bad explicit indexPath should fall back to full-scan returning all records");
+    }
+
+    // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_sizeInBytes_greaterThanZero() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Dataset<Row> df = spark.read().format("vcf").load(fx.plainVcf().toString());
+        long sizeBytes = df.queryExecution().optimizedPlan()
+                .stats().sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty VCF file");
+        assertTrue(sizeBytes <= new java.io.File(fx.plainVcf()).length() * 2,
+                "sizeInBytes should be within 2x of the actual file size");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        long count = spark.read().format("vcf")
+                .load(fx.plainVcf().toString())
+                .limit(2)
+                .count();
+        assertEquals(2L, count, "limit(2) should return exactly 2 rows");
+    }
+
+    @Test
+    void limit_withChromFilter_returnsCorrectRows() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        long count = spark.read().format("vcf")
+                .load(fx.plainVcf().toString())
+                .filter("chrom = 'chr1'")
+                .limit(2)
+                .count();
+        assertTrue(count <= 2L, "chrom filter + limit(2) should return at most 2 rows");
+        assertTrue(count > 0L, "chrom filter + limit(2) should return at least 1 row");
+    }
+
+    // -------------------------------------------------------------------------
+    // Ordering (SupportsReportOrdering)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void outputOrdering_tabixIndexed_returnsChromAndPos() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        VcfScan scan = new VcfScan(
+                new CaseInsensitiveStringMap(Map.of("path", fx.bgzVcf().toString())),
+                VcfSchema.SCHEMA, null, 1, Integer.MAX_VALUE);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(2, ordering.length, "tabix-indexed VCF should report 2 ordering fields");
+        assertEquals("chrom", ((NamedReference) ordering[0].expression()).fieldNames()[0]);
+        assertEquals("pos",   ((NamedReference) ordering[1].expression()).fieldNames()[0]);
+    }
+
+    @Test
+    void outputOrdering_plainVcf_isEmpty() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        VcfScan scan = new VcfScan(
+                new CaseInsensitiveStringMap(Map.of("path", fx.plainVcf().toString())),
+                VcfSchema.SCHEMA, null, 1, Integer.MAX_VALUE);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(0, ordering.length, "plain VCF without index should report no ordering");
     }
 }

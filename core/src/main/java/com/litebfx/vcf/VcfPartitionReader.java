@@ -66,6 +66,7 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
 
     private final VcfInputPartition partition;
     private boolean opened = false;
+    private long rowsRead = 0;
 
     // --- VCFFileReader path (local only: BCF, bgzipped VCF, plain VCF) ---
     private VCFFileReader reader;
@@ -112,6 +113,13 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
+        if (rowsRead >= partition.getRowLimit()) return false;
+        boolean hasNext = nextRecord();
+        if (hasNext) rowsRead++;
+        return hasNext;
+    }
+
+    private boolean nextRecord() throws IOException {
         if (isVcfSplitMode) return nextSplitMode();
         if (isVcfBgzfMode)  return nextBgzfMode();
         if (pendingChroms != null) return nextMultiChromMode();

@@ -45,6 +45,7 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
     private static final Logger log = LoggerFactory.getLogger(BedPartitionReader.class);
 
     private final BedInputPartition partition;
+    private long rowsRead = 0;
 
     // Resources opened on first next() call
     private FSDataInputStream fsIn;
@@ -79,6 +80,13 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
+        if (rowsRead >= partition.getRowLimit()) return false;
+        boolean hasNext = nextRecord();
+        if (hasNext) rowsRead++;
+        return hasNext;
+    }
+
+    private boolean nextRecord() throws IOException {
         while (true) {
             String line = readLine();
             if (line == null) {

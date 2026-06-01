@@ -76,6 +76,9 @@ public class VcfInputPartition implements InputPartition {
         this(path, indexPath, queryChrom, queryStart, queryEnd, null, startByte, endByte, hadoopConf);
     }
 
+    /** Maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    private final int rowLimit;
+
     /** Primary constructor. */
     private VcfInputPartition(String path,
                               String indexPath,
@@ -86,6 +89,20 @@ public class VcfInputPartition implements InputPartition {
                               long startByte,
                               long endByte,
                               Configuration hadoopConf) {
+        this(path, indexPath, queryChrom, queryStart, queryEnd, queryChroms,
+             startByte, endByte, hadoopConf, Integer.MAX_VALUE);
+    }
+
+    private VcfInputPartition(String path,
+                              String indexPath,
+                              String queryChrom,
+                              int queryStart,
+                              int queryEnd,
+                              String[] queryChroms,
+                              long startByte,
+                              long endByte,
+                              Configuration hadoopConf,
+                              int rowLimit) {
         this.path        = path;
         this.indexPath   = indexPath;
         this.queryChrom  = queryChrom;
@@ -95,6 +112,13 @@ public class VcfInputPartition implements InputPartition {
         this.startByte   = startByte;
         this.endByte     = endByte;
         this.hadoopConf  = new SerializableConfiguration(hadoopConf);
+        this.rowLimit    = rowLimit;
+    }
+
+    /** Returns a copy of this partition with the given row limit. */
+    public VcfInputPartition withRowLimit(int limit) {
+        return new VcfInputPartition(path, indexPath, queryChrom, queryStart, queryEnd,
+                queryChroms, startByte, endByte, hadoopConf.get(), limit);
     }
 
     public String   getPath()        { return path; }
@@ -106,4 +130,6 @@ public class VcfInputPartition implements InputPartition {
     public long     getStartByte()   { return startByte; }
     public long     getEndByte()     { return endByte; }
     public Configuration getHadoopConf() { return hadoopConf.get(); }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int      getRowLimit()    { return rowLimit; }
 }

@@ -40,19 +40,27 @@ public class FastaInputPartition implements InputPartition {
      */
     public static final int DEFAULT_MAX_MERGE_GAP = 128;
     private final int maxMergeGap;
+    /** Maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    private final int rowLimit;
 
     public FastaInputPartition(String path, String contigName, String faiPath,
                                Configuration hadoopConf) {
-        this(path, contigName, faiPath, hadoopConf, DEFAULT_MAX_MERGE_GAP);
+        this(path, contigName, faiPath, hadoopConf, DEFAULT_MAX_MERGE_GAP, Integer.MAX_VALUE);
     }
 
     public FastaInputPartition(String path, String contigName, String faiPath,
                                Configuration hadoopConf, int maxMergeGap) {
+        this(path, contigName, faiPath, hadoopConf, maxMergeGap, Integer.MAX_VALUE);
+    }
+
+    public FastaInputPartition(String path, String contigName, String faiPath,
+                               Configuration hadoopConf, int maxMergeGap, int rowLimit) {
         this.path = path;
         this.contigName = contigName;
         this.faiPath = faiPath;
         this.hadoopConf = new SerializableConfiguration(hadoopConf);
         this.maxMergeGap = maxMergeGap;
+        this.rowLimit = rowLimit;
     }
 
     public String getPath() { return path; }
@@ -60,4 +68,6 @@ public class FastaInputPartition implements InputPartition {
     public String getFaiPath() { return faiPath; }
     public Configuration getHadoopConf() { return hadoopConf.get(); }
     public int getMaxMergeGap() { return maxMergeGap; }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int getRowLimit() { return rowLimit; }
 }

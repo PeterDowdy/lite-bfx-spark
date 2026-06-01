@@ -69,6 +69,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private static final byte[] BGZF_MAGIC = {(byte) 0x1f, (byte) 0x8b, 0x08, 0x04};
 
     private boolean opened = false;
+    private long rowsRead = 0;
     private FSDataInputStream fsInputStream;
     private FSDataInputStream baiInputStream;
     private SamReader samReader;
@@ -102,7 +103,13 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
+        if (rowsRead >= partition.rowLimit()) return false;
+        boolean hasNext = nextRecord();
+        if (hasNext) rowsRead++;
+        return hasNext;
+    }
 
+    private boolean nextRecord() throws IOException {
         // SAM line-split mode: read one text line per record, stop at endByte.
         if (isSamSplitMode) {
             if (samLineParser == null) return false; // empty partition
@@ -113,7 +120,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                 if (line == null) return false; // EOF
                 if (line.isEmpty() || line.startsWith("@")) continue; // header or blank
                 current = samLineParser.parseLine(line);
-                log.trace("next() SAM split -> readName={}", current.getReadName());
+                log.trace("nextRecord() SAM split -> readName={}", current.getReadName());
                 return true;
             }
         }
@@ -125,20 +132,20 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             if (endByte != Long.MAX_VALUE) {
                 long blockAddr = BlockCompressedFilePointerUtil.getBlockAddress(bcis.getFilePointer());
                 if (blockAddr >= endByte) {
-                    log.trace("next() BGZF split: reached end boundary blockAddr={} endByte={}", blockAddr, endByte);
+                    log.trace("nextRecord() BGZF split: reached end boundary blockAddr={} endByte={}", blockAddr, endByte);
                     return false;
                 }
             }
             SAMRecord r = (SAMRecord) bamRecordCodec.decode();
             if (r == null) return false;
             current = r;
-            log.trace("next() BGZF split -> readName={}", current.getReadName());
+            log.trace("nextRecord() BGZF split -> readName={}", current.getReadName());
             return true;
         }
 
         if (iterator == null || !iterator.hasNext()) return false;
         current = iterator.next();
-        log.trace("next() -> read record readName={}", current.getReadName());
+        log.trace("nextRecord() -> readName={}", current.getReadName());
         return true;
     }
 

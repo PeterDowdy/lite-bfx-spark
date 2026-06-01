@@ -53,6 +53,9 @@ public class BamInputPartition implements InputPartition {
     // ---- CRAM container-split ----
     private final long[] cramContainerSpans;
 
+    // ---- limit pushdown ----
+    private final int rowLimit;
+
     // -------------------------------------------------------------------------
     // Factory methods — one per partition mode
     // -------------------------------------------------------------------------
@@ -199,6 +202,27 @@ public class BamInputPartition implements InputPartition {
                               boolean queryUnmapped,
                               boolean samSplit,
                               long[] cramContainerSpans) {
+        this(path, conf, indexPath, isCram, referenceFile, referenceMode,
+             startByte, endByte, querySequence, queryStart, queryEnd,
+             querySequences, queryUnmapped, samSplit, cramContainerSpans, Integer.MAX_VALUE);
+    }
+
+    private BamInputPartition(String path,
+                              Configuration conf,
+                              String indexPath,
+                              boolean isCram,
+                              String referenceFile,
+                              String referenceMode,
+                              long startByte,
+                              long endByte,
+                              String querySequence,
+                              int queryStart,
+                              int queryEnd,
+                              String[] querySequences,
+                              boolean queryUnmapped,
+                              boolean samSplit,
+                              long[] cramContainerSpans,
+                              int rowLimit) {
         this.path              = path;
         this.hadoopConf        = new SerializableConfiguration(conf);
         this.indexPath         = indexPath;
@@ -214,6 +238,15 @@ public class BamInputPartition implements InputPartition {
         this.queryUnmapped     = queryUnmapped;
         this.samSplit          = samSplit;
         this.cramContainerSpans = cramContainerSpans;
+        this.rowLimit          = rowLimit;
+    }
+
+    /** Returns a copy of this partition with the given row limit. */
+    public BamInputPartition withRowLimit(int limit) {
+        return new BamInputPartition(path, hadoopConf.get(), indexPath, isCram,
+                referenceFile, referenceMode, startByte, endByte,
+                querySequence, queryStart, queryEnd, querySequences,
+                queryUnmapped, samSplit, cramContainerSpans, limit);
     }
 
     // -------------------------------------------------------------------------
@@ -242,4 +275,6 @@ public class BamInputPartition implements InputPartition {
      * container-split mode, or {@code null} for all other partition modes.
      */
     public long[] getCramContainerSpans() { return cramContainerSpans; }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int rowLimit() { return rowLimit; }
 }

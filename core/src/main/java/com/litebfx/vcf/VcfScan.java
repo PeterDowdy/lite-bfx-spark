@@ -4,13 +4,22 @@ import htsjdk.samtools.util.BlockCompressedInputStream;
 import htsjdk.tribble.index.tabix.TabixIndex;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.NullOrdering;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.connector.expressions.SortValue;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportOrdering;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -19,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * Plans one or more {@link VcfInputPartition}s for a VCF/BCF file.
@@ -54,7 +64,7 @@ import java.util.List;
  * the partition is configured for a region query. Spark post-filters ensure
  * correctness for records near region boundaries.
  */
-public class VcfScan implements Scan, Batch {
+public class VcfScan implements Scan, Batch, SupportsReportStatistics, SupportsReportOrdering {
 
     private static final Logger log = LoggerFactory.getLogger(VcfScan.class);
 
@@ -63,17 +73,28 @@ public class VcfScan implements Scan, Batch {
     private final String pushedChrom;
     private final int pushedStart;
     private final int pushedEnd;
+    private final int pushedLimit;
 
     VcfScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
             String pushedChrom,
             int pushedStart,
             int pushedEnd) {
+        this(options, requiredSchema, pushedChrom, pushedStart, pushedEnd, Integer.MAX_VALUE);
+    }
+
+    VcfScan(CaseInsensitiveStringMap options,
+            StructType requiredSchema,
+            String pushedChrom,
+            int pushedStart,
+            int pushedEnd,
+            int pushedLimit) {
         this.options        = options;
         this.requiredSchema = requiredSchema;
         this.pushedChrom    = pushedChrom;
         this.pushedStart    = pushedStart;
         this.pushedEnd      = pushedEnd;
+        this.pushedLimit    = pushedLimit;
     }
 
     @Override
@@ -87,9 +108,42 @@ public class VcfScan implements Scan, Batch {
     }
 
     @Override
+    public Statistics estimateStatistics() {
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            long total = 0;
+            for (FileStatus fs : resolveFiles(options, conf)) {
+                total += fs.getLen();
+            }
+            final long size = total;
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        } catch (IOException e) {
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        }
+    }
+
+    @Override
     public InputPartition[] planInputPartitions() {
+        InputPartition[] partitions = doplanInputPartitions();
+        if (pushedLimit < Integer.MAX_VALUE && pushedChrom == null && partitions.length > 0) {
+            log.trace("planInputPartitions() limit={} -> trimming {} -> 1 partition(s)",
+                    pushedLimit, partitions.length);
+            return new InputPartition[]{
+                ((VcfInputPartition) partitions[0]).withRowLimit(pushedLimit)
+            };
+        }
+        return partitions;
+    }
+
+    private InputPartition[] doplanInputPartitions() {
         String pathStr = options.get("path");
-        log.trace("planInputPartitions() path={}", pathStr);
         if (pathStr == null) {
             throw new IllegalArgumentException("'path' option is required for the vcf data source");
         }
@@ -99,6 +153,9 @@ public class VcfScan implements Scan, Batch {
                 .sessionState().newHadoopConf();
 
         try {
+            List<FileStatus> files = resolveFiles(options, hadoopConf);
+            pathStr = files.get(0).getPath().toUri().toString();
+            log.trace("planInputPartitions() path={}", pathStr);
             // Plain-text VCF: split into fixed-size byte-range chunks for parallel reads.
             if (isPlainTextVcf(pathStr)) {
                 return planVcfSplitPartitions(pathStr, hadoopConf);
@@ -132,6 +189,25 @@ public class VcfScan implements Scan, Batch {
     @Override
     public PartitionReaderFactory createReaderFactory() {
         return new VcfPartitionReaderFactory();
+    }
+
+    @Override
+    public SortOrder[] outputOrdering() {
+        String path = options.getOrDefault("path", "");
+        if (isPlainTextVcf(path)) return new SortOrder[0];
+        boolean useIndex = Boolean.parseBoolean(options.getOrDefault("useIndex", "true"));
+        if (!useIndex) return new SortOrder[0];
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            if (resolveIndexPath(path, conf) == null) return new SortOrder[0];
+        } catch (Exception e) {
+            return new SortOrder[0];
+        }
+        return new SortOrder[]{
+            SortValue.apply(FieldReference.apply("chrom"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
+            SortValue.apply(FieldReference.apply("pos"),   SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -243,6 +319,21 @@ public class VcfScan implements Scan, Batch {
             idx += size;
         }
         return groups;
+    }
+
+    // -------------------------------------------------------------------------
+    // File resolution
+    // -------------------------------------------------------------------------
+
+    static List<FileStatus> resolveFiles(CaseInsensitiveStringMap options, Configuration conf)
+            throws IOException {
+        String pathStr = options.get("path");
+        if (pathStr == null) return new ArrayList<>();
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        List<FileStatus> result = new ArrayList<>();
+        result.add(fs.getFileStatus(hadoopPath));
+        return result;
     }
 
     // -------------------------------------------------------------------------

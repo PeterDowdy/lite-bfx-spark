@@ -1,8 +1,10 @@
 package com.litebfx.fasta;
 
-import org.apache.spark.sql.sources.EqualTo;
-import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.sources.GreaterThan;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.LiteralValue;
+import org.apache.spark.sql.connector.expressions.filter.And;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -13,12 +15,13 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for {@link FastaScanBuilder#pushFilters}.
+ * Unit tests for {@link FastaScanBuilder#pushPredicates}.
  *
  * <p>Drives the builder directly (no SparkSession) to exercise all branch
  * combinations in the predicate-pushdown logic:
  * <ul>
- *   <li>EqualTo on {@code name} (match / attribute-mismatch / non-EqualTo type)</li>
+ *   <li>Equality predicate on {@code name} (match / attribute-mismatch / non-equality type)</li>
+ *   <li>{@code And}-wrapped predicate unwrapping</li>
  *   <li>Column pruning via {@link FastaScanBuilder#pruneColumns}</li>
  * </ul>
  */
@@ -28,80 +31,116 @@ class FastaScanBuilderTest {
         return new CaseInsensitiveStringMap(Map.of("path", "test.fa"));
     }
 
+    /** Creates a V2 equality predicate: col = value. */
+    private static Predicate eq(String col, String val) {
+        return new Predicate("=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.StringType)
+        });
+    }
+
+    /** Creates a V2 greater-than predicate: col > value. */
+    private static Predicate gt(String col, long val) {
+        return new Predicate(">", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
+        });
+    }
+
     // -------------------------------------------------------------------------
-    // pushFilters — no filters
+    // pushPredicates — no predicates
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_empty_returnsEmptyAndBuilds() {
+    void pushPredicates_empty_returnsEmptyAndBuilds() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        Filter[] result = b.pushFilters(new Filter[0]);
+        Predicate[] result = b.pushPredicates(new Predicate[0]);
         assertEquals(0, result.length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on name (success path)
+    // pushPredicates — equality on name (success path)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_equalToName_returnsAllFiltersUnhandled() {
+    void pushPredicates_equalToName_handledAndNotReturned() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        Filter[] filters = {new EqualTo("name", "chr1")};
-        assertSame(filters, b.pushFilters(filters));
+        Predicate namePred = eq("name", "chr1");
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{namePred});
+        assertEquals(0, unhandled.length, "name equality should be handled");
+        assertEquals(1, b.pushedPredicates().length, "name equality should be in pushedPredicates");
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on wrong attribute (type matches, attribute doesn't)
+    // pushPredicates — equality on wrong attribute
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_equalToWrongAttribute_nameNotExtracted() {
+    void pushPredicates_equalToWrongAttribute_notHandled() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        // EqualTo type matches but attribute != "name" → pushedName stays null
-        b.pushFilters(new Filter[]{new EqualTo("length", "100")});
+        Predicate wrongAttr = eq("length", "100");
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{wrongAttr});
+        assertEquals(1, unhandled.length, "wrong attribute should remain unhandled");
+        assertEquals(0, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — non-EqualTo filter type (instanceof check fails)
+    // pushPredicates — non-equality type (range predicate)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_nonEqualToType_ignored() {
+    void pushPredicates_rangePredicateOnName_notHandled() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        // GreaterThan is not EqualTo → instanceof check = false → nameNotExtracted
-        b.pushFilters(new Filter[]{new GreaterThan("length", 100L)});
+        Predicate rangePred = gt("length", 100L);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{rangePred});
+        assertEquals(1, unhandled.length, "range predicate should remain unhandled");
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — multiple filters including one matching EqualTo("name")
+    // pushPredicates — mixed predicates
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_mixedFilters_onlyNameExtracted() {
+    void pushPredicates_mixedPredicates_onlyNameHandled() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        Filter[] filters = {
-                new GreaterThan("length", 100L),
-                new EqualTo("name", "chr2"),
-                new EqualTo("someOtherField", "value")
-        };
-        Filter[] returned = b.pushFilters(filters);
-        assertSame(filters, returned);
+        Predicate namePred = eq("name", "chr2");
+        Predicate otherPred = gt("length", 100L);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{namePred, otherPred});
+        assertEquals(1, unhandled.length, "only the non-name predicate should be unhandled");
+        assertEquals(1, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushedFilters — always empty
+    // pushPredicates — And-wrapped predicate
     // -------------------------------------------------------------------------
 
     @Test
-    void pushedFilters_alwaysReturnsEmpty() {
+    void pushPredicates_andWrapped_nameExtracted() {
         FastaScanBuilder b = new FastaScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("name", "chrM")});
-        assertEquals(0, b.pushedFilters().length);
+        Predicate namePred = eq("name", "chrM");
+        Predicate otherPred = gt("length", 1000L);
+        Predicate andPred = new And(namePred, otherPred);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{andPred});
+        // namePred is handled, otherPred is unhandled
+        assertEquals(1, unhandled.length, "non-name predicate from And should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "name predicate from And should be handled");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushedPredicates — reflects handled predicates
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushedPredicates_returnsHandledPredicates() {
+        FastaScanBuilder b = new FastaScanBuilder(opts());
+        b.pushPredicates(new Predicate[]{eq("name", "chrM")});
+        assertEquals(1, b.pushedPredicates().length);
     }
 
     // -------------------------------------------------------------------------

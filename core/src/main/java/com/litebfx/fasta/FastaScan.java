@@ -2,6 +2,7 @@ package com.litebfx.fasta;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.SparkSession;
@@ -9,6 +10,8 @@ import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -20,6 +23,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * Plans one {@link FastaInputPartition} per contig when a FAI index is found,
@@ -32,7 +36,7 @@ import java.util.List;
  *   <li>None → single partition, full sequential scan</li>
  * </ol>
  */
-public class FastaScan implements Scan, Batch {
+public class FastaScan implements Scan, Batch, SupportsReportStatistics {
 
     private static final Logger log = LoggerFactory.getLogger(FastaScan.class);
 
@@ -40,16 +44,31 @@ public class FastaScan implements Scan, Batch {
     private final StructType requiredSchema;
     /** When non-null, only create a partition for the contig whose name matches this value. */
     private final String pushedName;
+    /** Number of contigs in the FAI index; -1 when unknown (no FAI resolved at build time). */
+    private final int faiEntryCount;
+    private final int pushedLimit;
 
     FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema) {
-        this(options, requiredSchema, null);
+        this(options, requiredSchema, null, -1, Integer.MAX_VALUE);
     }
 
     FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema, String pushedName) {
-        log.trace("FastaScan(options={}, pushedName={})", options, pushedName);
+        this(options, requiredSchema, pushedName, -1, Integer.MAX_VALUE);
+    }
+
+    FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema, String pushedName, int faiEntryCount) {
+        this(options, requiredSchema, pushedName, faiEntryCount, Integer.MAX_VALUE);
+    }
+
+    FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema, String pushedName,
+              int faiEntryCount, int pushedLimit) {
+        log.trace("FastaScan(options={}, pushedName={}, faiEntryCount={}, pushedLimit={})",
+                options, pushedName, faiEntryCount, pushedLimit);
         this.options = options;
         this.requiredSchema = requiredSchema;
         this.pushedName = pushedName;
+        this.faiEntryCount = faiEntryCount;
+        this.pushedLimit = pushedLimit;
     }
 
     @Override
@@ -65,7 +84,6 @@ public class FastaScan implements Scan, Batch {
     @Override
     public InputPartition[] planInputPartitions() {
         String pathStr = options.get("path");
-        log.trace("planInputPartitions() path={}", pathStr);
         if (pathStr == null) {
             throw new IllegalArgumentException("'path' option is required for the fasta data source");
         }
@@ -74,6 +92,9 @@ public class FastaScan implements Scan, Batch {
                 .sessionState().newHadoopConf();
 
         try {
+            List<FileStatus> files = resolveFiles(options, hadoopConf);
+            pathStr = files.get(0).getPath().toUri().toString();
+            log.trace("planInputPartitions() path={}", pathStr);
             int maxMergeGap = FastaInputPartition.DEFAULT_MAX_MERGE_GAP;
             String maxMergeGapOpt = options.get("maxMergeGap");
             if (maxMergeGapOpt != null) {
@@ -81,7 +102,7 @@ public class FastaScan implements Scan, Batch {
                 log.trace("planInputPartitions() maxMergeGap={}", maxMergeGap);
             }
 
-            String faiPath = resolveFaiPath(pathStr, hadoopConf);
+            String faiPath = resolveFaiPath(options, pathStr, hadoopConf);
             if (faiPath != null) {
                 List<String> contigNames = readContigNames(faiPath, hadoopConf);
                 if (pushedName != null) {
@@ -92,14 +113,24 @@ public class FastaScan implements Scan, Batch {
                 } else {
                     log.trace("planInputPartitions() FAI found, {} contig(s)", contigNames.size());
                 }
+                // Limit pushdown: if a limit is active and no name filter was pushed, plan only 1 contig.
+                if (pushedLimit < Integer.MAX_VALUE && pushedName == null && contigNames.size() > 1) {
+                    log.trace("planInputPartitions() limit={} -> trimming {} contig(s) -> 1", pushedLimit, contigNames.size());
+                    contigNames = contigNames.subList(0, 1);
+                }
                 InputPartition[] partitions = new InputPartition[contigNames.size()];
                 for (int i = 0; i < contigNames.size(); i++) {
-                    partitions[i] = new FastaInputPartition(pathStr, contigNames.get(i), faiPath, hadoopConf, maxMergeGap);
+                    int rowLimitForPartition = (pushedLimit < Integer.MAX_VALUE) ? pushedLimit : Integer.MAX_VALUE;
+                    partitions[i] = new FastaInputPartition(pathStr, contigNames.get(i), faiPath,
+                            hadoopConf, maxMergeGap, rowLimitForPartition);
                 }
                 return partitions;
             } else {
                 log.trace("planInputPartitions() no FAI found, single full-scan partition");
-                return new InputPartition[]{new FastaInputPartition(pathStr, null, null, hadoopConf, maxMergeGap)};
+                int rowLimitForPartition = (pushedLimit < Integer.MAX_VALUE) ? pushedLimit : Integer.MAX_VALUE;
+                return new InputPartition[]{
+                    new FastaInputPartition(pathStr, null, null, hadoopConf, maxMergeGap, rowLimitForPartition)
+                };
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to plan FASTA input partitions for path: " + pathStr, e);
@@ -112,11 +143,52 @@ public class FastaScan implements Scan, Batch {
         return new FastaPartitionReaderFactory();
     }
 
+    @Override
+    public Statistics estimateStatistics() {
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            long total = 0;
+            for (FileStatus fs : resolveFiles(options, conf)) {
+                total += fs.getLen();
+            }
+            final long size = total;
+            final OptionalLong rows = faiEntryCount >= 0
+                    ? OptionalLong.of(faiEntryCount)
+                    : OptionalLong.empty();
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
+                public OptionalLong numRows()     { return rows; }
+            };
+        } catch (IOException e) {
+            return new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // File resolution
+    // -------------------------------------------------------------------------
+
+    static List<FileStatus> resolveFiles(CaseInsensitiveStringMap options, Configuration conf)
+            throws IOException {
+        String pathStr = options.get("path");
+        if (pathStr == null) return new ArrayList<>();
+        Path hadoopPath = new Path(pathStr);
+        FileSystem fs = hadoopPath.getFileSystem(conf);
+        List<FileStatus> result = new ArrayList<>();
+        result.add(fs.getFileStatus(hadoopPath));
+        return result;
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
-    private String resolveFaiPath(String fastaPath, Configuration conf) throws IOException {
+    static String resolveFaiPath(CaseInsensitiveStringMap options, String fastaPath, Configuration conf)
+            throws IOException {
         // 1. Explicit indexPath option
         String explicit = options.get("indexPath");
         if (explicit != null) {
@@ -143,7 +215,7 @@ public class FastaScan implements Scan, Batch {
      * Parses contig names from a FAI file.
      * FAI format: NAME\tLENGTH\tOFFSET\tBASES_PER_LINE\tBYTES_PER_LINE
      */
-    private static List<String> readContigNames(String faiPath, Configuration conf) throws IOException {
+    static List<String> readContigNames(String faiPath, Configuration conf) throws IOException {
         log.trace("readContigNames(faiPath={})", faiPath);
         Path path = new Path(faiPath);
         List<String> names = new ArrayList<>();

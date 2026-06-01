@@ -28,6 +28,8 @@ public class BedInputPartition implements InputPartition {
     /** Exclusive byte offset where this partition's chunk ends (Long.MAX_VALUE = EOF). */
     private final long endByte;
     private final SerializableConfiguration hadoopConf;
+    /** Maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    private final int rowLimit;
 
     /** Full-file partition — no region filter, no tabix, no byte range. */
     public BedInputPartition(String path,
@@ -55,6 +57,19 @@ public class BedInputPartition implements InputPartition {
                              long startByte,
                              long endByte,
                              Configuration hadoopConf) {
+        this(path, indexPath, queryChrom, queryStart, queryEnd, startByte, endByte,
+             hadoopConf, Integer.MAX_VALUE);
+    }
+
+    private BedInputPartition(String path,
+                              String indexPath,
+                              String queryChrom,
+                              long queryStart,
+                              long queryEnd,
+                              long startByte,
+                              long endByte,
+                              Configuration hadoopConf,
+                              int rowLimit) {
         this.path       = path;
         this.indexPath  = indexPath;
         this.queryChrom = queryChrom;
@@ -63,6 +78,13 @@ public class BedInputPartition implements InputPartition {
         this.startByte  = startByte;
         this.endByte    = endByte;
         this.hadoopConf = new SerializableConfiguration(hadoopConf);
+        this.rowLimit   = rowLimit;
+    }
+
+    /** Returns a copy of this partition with the given row limit. */
+    public BedInputPartition withRowLimit(int limit) {
+        return new BedInputPartition(path, indexPath, queryChrom, queryStart, queryEnd,
+                startByte, endByte, hadoopConf.get(), limit);
     }
 
     public String getPath() { return path; }
@@ -73,4 +95,6 @@ public class BedInputPartition implements InputPartition {
     public long getStartByte() { return startByte; }
     public long getEndByte() { return endByte; }
     public Configuration getHadoopConf() { return hadoopConf.get(); }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int getRowLimit() { return rowLimit; }
 }
