@@ -2,7 +2,9 @@ package com.litebfx.bam;
 
 import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.HasPartitionStatistics;
+
+import java.util.OptionalLong;
 
 
 /**
@@ -23,7 +25,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
  * can reconstruct a {@link org.apache.hadoop.fs.FileSystem} with the correct
  * S3A/ADLS credentials even when they differ from the default Hadoop config.
  */
-public class BamInputPartition implements InputPartition {
+public class BamInputPartition implements HasPartitionStatistics {
 
     // ---- fields shared by all modes ----
     private final String path;
@@ -277,4 +279,28 @@ public class BamInputPartition implements InputPartition {
     public long[] getCramContainerSpans() { return cramContainerSpans; }
     /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
     public int rowLimit() { return rowLimit; }
+
+    // -------------------------------------------------------------------------
+    // HasPartitionStatistics
+    // -------------------------------------------------------------------------
+
+    @Override
+    public OptionalLong sizeInBytes() {
+        // Byte-range splits (BGZF and SAM): exact compressed byte span.
+        if ((endByte != Long.MAX_VALUE) && cramContainerSpans == null) {
+            return OptionalLong.of(endByte - startByte);
+        }
+        // CRAM container splits: derive from the VFO span (upper 48 bits = raw byte offset).
+        if (cramContainerSpans != null && cramContainerSpans.length >= 2) {
+            long rawBytes = (cramContainerSpans[1] >> 16) - (cramContainerSpans[0] >> 16);
+            return rawBytes > 0 ? OptionalLong.of(rawBytes) : OptionalLong.empty();
+        }
+        return OptionalLong.empty();
+    }
+
+    @Override
+    public OptionalLong numRows() { return OptionalLong.empty(); }
+
+    @Override
+    public OptionalLong filesCount() { return OptionalLong.of(1L); }
 }

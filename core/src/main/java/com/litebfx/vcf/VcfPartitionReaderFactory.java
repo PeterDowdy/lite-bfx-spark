@@ -14,9 +14,17 @@ public class VcfPartitionReaderFactory implements PartitionReaderFactory {
 
     private static final Logger log = LoggerFactory.getLogger(VcfPartitionReaderFactory.class);
 
+    private final boolean includeInfo;
+    private final boolean includeGenotypes;
+
+    VcfPartitionReaderFactory(boolean includeInfo, boolean includeGenotypes) {
+        this.includeInfo      = includeInfo;
+        this.includeGenotypes = includeGenotypes;
+    }
+
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new VcfPartitionReader((VcfInputPartition) partition);
+        return new VcfPartitionReader((VcfInputPartition) partition, includeInfo, includeGenotypes);
     }
 }

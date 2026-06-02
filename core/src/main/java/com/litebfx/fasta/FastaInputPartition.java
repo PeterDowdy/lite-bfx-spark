@@ -2,7 +2,9 @@ package com.litebfx.fasta;
 
 import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.HasPartitionStatistics;
+
+import java.util.OptionalLong;
 
 /**
  * Describes a single Spark partition over a FASTA file.
@@ -15,7 +17,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
  * {@code contigName=null}; the reader iterates all sequences via
  * {@code nextSequence()}.
  */
-public class FastaInputPartition implements InputPartition {
+public class FastaInputPartition implements HasPartitionStatistics {
 
     private final String path;
     /** Contig to read; null means "iterate all contigs in order". */
@@ -70,4 +72,9 @@ public class FastaInputPartition implements InputPartition {
     public int getMaxMergeGap() { return maxMergeGap; }
     /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
     public int getRowLimit() { return rowLimit; }
+
+    // FASTA partitions are per-contig; byte size is not known without reading the FAI entry.
+    @Override public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+    @Override public OptionalLong numRows()     { return OptionalLong.empty(); }
+    @Override public OptionalLong filesCount()  { return OptionalLong.of(1L); }
 }

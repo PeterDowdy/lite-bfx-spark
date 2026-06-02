@@ -89,6 +89,8 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     private boolean headerRead = false;
     private boolean isCoordinateSorted = false;
+    private Statistics cachedStatistics = null;
+    private SortOrder[] cachedOrdering = null;
 
     BamScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
@@ -109,7 +111,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
             int pushedEnd,
             boolean isCram,
             int pushedLimit) {
-        log.trace("BamScan(includeAttributes={}, pushedReferenceName={}, pushedStart={}, pushedEnd={}, isCram={}, pushedLimit={})",
+        log.trace("BamScan(incAttr={}, ref={}, start={}, end={}, cram={}, limit={})",
                 includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit);
         this.options = options;
         this.requiredSchema = requiredSchema;
@@ -144,6 +146,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public Statistics estimateStatistics() {
+        if (cachedStatistics != null) return cachedStatistics;
         try {
             Configuration conf = SparkSession.builder().getOrCreate()
                     .sessionState().newHadoopConf();
@@ -152,28 +155,34 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                 total += fs.getLen();
             }
             final long size = total;
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         } catch (IOException e) {
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         }
+        return cachedStatistics;
     }
 
     @Override
     public SortOrder[] outputOrdering() {
+        if (cachedOrdering != null) return cachedOrdering;
         Configuration conf = SparkSession.builder().getOrCreate()
                 .sessionState().newHadoopConf();
         ensureHeaderRead(conf);
-        if (!isCoordinateSorted) return new SortOrder[0];
-        return new SortOrder[]{
-            SortValue.apply(FieldReference.apply("referenceName"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
-            SortValue.apply(FieldReference.apply("start"),         SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
-        };
+        if (!isCoordinateSorted) {
+            cachedOrdering = new SortOrder[0];
+        } else {
+            cachedOrdering = new SortOrder[]{
+                SortValue.apply(FieldReference.apply("referenceName"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
+                SortValue.apply(FieldReference.apply("start"),         SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
+            };
+        }
+        return cachedOrdering;
     }
 
     // -------------------------------------------------------------------------

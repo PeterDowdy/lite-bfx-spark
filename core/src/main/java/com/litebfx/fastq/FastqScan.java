@@ -8,6 +8,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Statistics;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
@@ -36,7 +37,7 @@ import java.util.regex.Pattern;
  *       advances to the next {@code @} record boundary before reading.</li>
  * </ul>
  */
-public class FastqScan implements Batch, SupportsReportStatistics {
+public class FastqScan implements Scan, Batch, SupportsReportStatistics {
 
     private static final Logger log = LoggerFactory.getLogger(FastqScan.class);
 
@@ -48,6 +49,7 @@ public class FastqScan implements Batch, SupportsReportStatistics {
 
     private final CaseInsensitiveStringMap options;
     private final int pushedLimit;
+    private Statistics cachedStatistics = null;
 
     FastqScan(CaseInsensitiveStringMap options) {
         this(options, Integer.MAX_VALUE);
@@ -71,6 +73,7 @@ public class FastqScan implements Batch, SupportsReportStatistics {
 
     @Override
     public Statistics estimateStatistics() {
+        if (cachedStatistics != null) return cachedStatistics;
         try {
             Configuration conf = SparkSession.builder().getOrCreate()
                     .sessionState().newHadoopConf();
@@ -79,16 +82,17 @@ public class FastqScan implements Batch, SupportsReportStatistics {
                 total += fs.getLen();
             }
             final long size = total;
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         } catch (IOException e) {
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         }
+        return cachedStatistics;
     }
 
     @Override

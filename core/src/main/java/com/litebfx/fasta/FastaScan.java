@@ -47,6 +47,7 @@ public class FastaScan implements Scan, Batch, SupportsReportStatistics {
     /** Number of contigs in the FAI index; -1 when unknown (no FAI resolved at build time). */
     private final int faiEntryCount;
     private final int pushedLimit;
+    private Statistics cachedStatistics = null;
 
     FastaScan(CaseInsensitiveStringMap options, StructType requiredSchema) {
         this(options, requiredSchema, null, -1, Integer.MAX_VALUE);
@@ -145,6 +146,7 @@ public class FastaScan implements Scan, Batch, SupportsReportStatistics {
 
     @Override
     public Statistics estimateStatistics() {
+        if (cachedStatistics != null) return cachedStatistics;
         try {
             Configuration conf = SparkSession.builder().getOrCreate()
                     .sessionState().newHadoopConf();
@@ -156,16 +158,17 @@ public class FastaScan implements Scan, Batch, SupportsReportStatistics {
             final OptionalLong rows = faiEntryCount >= 0
                     ? OptionalLong.of(faiEntryCount)
                     : OptionalLong.empty();
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
                 public OptionalLong numRows()     { return rows; }
             };
         } catch (IOException e) {
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         }
+        return cachedStatistics;
     }
 
     // -------------------------------------------------------------------------

@@ -2,7 +2,9 @@ package com.litebfx.bed;
 
 import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.HasPartitionStatistics;
+
+import java.util.OptionalLong;
 
 /**
  * Describes a single Spark partition over a BED/BED.GZ file.
@@ -15,7 +17,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
  * discards bytes up to the next newline to land on a clean line start, and reads
  * records until the next line would begin at or past {@code endByte}.
  */
-public class BedInputPartition implements InputPartition {
+public class BedInputPartition implements HasPartitionStatistics {
 
     private final String path;
     private final String indexPath;
@@ -97,4 +99,13 @@ public class BedInputPartition implements InputPartition {
     public Configuration getHadoopConf() { return hadoopConf.get(); }
     /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
     public int getRowLimit() { return rowLimit; }
+
+    @Override
+    public OptionalLong sizeInBytes() {
+        if (endByte != Long.MAX_VALUE) return OptionalLong.of(endByte - startByte);
+        return OptionalLong.empty();
+    }
+
+    @Override public OptionalLong numRows()    { return OptionalLong.empty(); }
+    @Override public OptionalLong filesCount() { return OptionalLong.of(1L); }
 }

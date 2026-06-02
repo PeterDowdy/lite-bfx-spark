@@ -52,6 +52,8 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
     private final long pushedStart;
     private final long pushedEnd;
     private final int pushedLimit;
+    private Statistics cachedStatistics = null;
+    private SortOrder[] cachedOrdering = null;
 
     BedScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
@@ -87,6 +89,7 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public Statistics estimateStatistics() {
+        if (cachedStatistics != null) return cachedStatistics;
         try {
             Configuration conf = SparkSession.builder().getOrCreate()
                     .sessionState().newHadoopConf();
@@ -95,16 +98,17 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                 total += fs.getLen();
             }
             final long size = total;
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         } catch (IOException e) {
-            return new Statistics() {
+            cachedStatistics = new Statistics() {
                 public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
                 public OptionalLong numRows()     { return OptionalLong.empty(); }
             };
         }
+        return cachedStatistics;
     }
 
     @Override
@@ -202,21 +206,22 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public SortOrder[] outputOrdering() {
+        if (cachedOrdering != null) return cachedOrdering;
         String path = options.getOrDefault("path", "");
         boolean isCompressed = path.toLowerCase().endsWith(".gz")
                 || path.toLowerCase().endsWith(".bgz")
                 || path.toLowerCase().endsWith(".bgzf");
-        if (!isCompressed) return new SortOrder[0];
+        if (!isCompressed) return cachedOrdering = new SortOrder[0];
         boolean useIndex = Boolean.parseBoolean(options.getOrDefault("useIndex", "true"));
-        if (!useIndex) return new SortOrder[0];
+        if (!useIndex) return cachedOrdering = new SortOrder[0];
         try {
             Configuration conf = SparkSession.builder().getOrCreate()
                     .sessionState().newHadoopConf();
-            if (resolveIndexPath(path, conf) == null) return new SortOrder[0];
+            if (resolveIndexPath(path, conf) == null) return cachedOrdering = new SortOrder[0];
         } catch (Exception e) {
-            return new SortOrder[0];
+            return cachedOrdering = new SortOrder[0];
         }
-        return new SortOrder[]{
+        return cachedOrdering = new SortOrder[]{
             SortValue.apply(FieldReference.apply("chrom"),      SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
             SortValue.apply(FieldReference.apply("chromStart"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
         };

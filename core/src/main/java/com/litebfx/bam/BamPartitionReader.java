@@ -33,6 +33,7 @@ import org.apache.spark.unsafe.types.UTF8String;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.util.List;
 
@@ -508,23 +509,37 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         FileSystem fs = samPath.getFileSystem(conf);
 
         // ── Step A: parse SAM header from byte 0 ──
+        // Use BufferedInputStream to amortize per-byte read overhead on cloud streams.
+        // Position is tracked manually because BufferedInputStream's read-ahead makes
+        // FSDataInputStream.getPos() unreliable for logical line boundaries.
         SAMFileHeader header;
         long dataStartByte;
         FSDataInputStream hdrStream = fs.open(samPath);
         try {
+            BufferedInputStream bufferedHdr = new BufferedInputStream(hdrStream, 65536);
             StringBuilder headerText = new StringBuilder();
+            long pos = 0;
             long lineEndPos = 0;
             while (true) {
-                long lineStartPos = hdrStream.getPos();
-                String line = readLineFrom(hdrStream);
-                if (line == null) {
+                long lineStartPos = pos;
+                StringBuilder lineBuilder = new StringBuilder(256);
+                boolean anyBytes = false;
+                int b;
+                while ((b = bufferedHdr.read()) != -1) {
+                    pos++;
+                    anyBytes = true;
+                    if (b == '\n') break;
+                    if (b != '\r') lineBuilder.append((char) b);
+                }
+                if (!anyBytes) {
                     // File is entirely header (or empty) — data starts at EOF.
                     dataStartByte = lineEndPos;
                     break;
                 }
+                String line = lineBuilder.toString();
                 if (line.startsWith("@")) {
                     headerText.append(line).append('\n');
-                    lineEndPos = hdrStream.getPos();
+                    lineEndPos = pos;
                 } else {
                     // First non-header line: data starts at lineStartPos.
                     dataStartByte = lineStartPos;
