@@ -103,6 +103,10 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private String[] sampleNames = new String[0];
     private String[] currentColumns = null;
 
+    VcfPartitionReader(VcfInputPartition partition) {
+        this(partition, true, true);
+    }
+
     VcfPartitionReader(VcfInputPartition partition, boolean includeInfo, boolean includeGenotypes) {
         log.trace("VcfPartitionReader(path={}, queryChrom={}, includeInfo={}, includeGenotypes={})",
                 partition.getPath(), partition.getQueryChrom(), includeInfo, includeGenotypes);
