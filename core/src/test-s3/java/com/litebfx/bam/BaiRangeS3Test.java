@@ -225,8 +225,13 @@ class BaiRangeS3Test {
      */
     private static File generateTestBam(Path dir) throws IOException {
         SAMFileHeader header = new SAMFileHeader();
-        header.addSequence(new SAMSequenceRecord(CHR1_NAME, 100_000_000));
-        header.addSequence(new SAMSequenceRecord(CHR2_NAME, 100_000_000));
+        // Chromosome length is set to 1 Mbp (just above the highest read position of
+        // CHR2_READS * 1000 = 900,000) to keep the BAI linear index small. A 100 Mbp
+        // chromosome produces ~49 KB of linear index per reference regardless of read
+        // count, which can exceed the compressed size of the minority chromosome's data
+        // and cause the regionBytes < fullBytes assertion to fail.
+        header.addSequence(new SAMSequenceRecord(CHR1_NAME, 1_000_000));
+        header.addSequence(new SAMSequenceRecord(CHR2_NAME, 1_000_000));
         header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
 
         String cigar     = READ_LENGTH + "M";
