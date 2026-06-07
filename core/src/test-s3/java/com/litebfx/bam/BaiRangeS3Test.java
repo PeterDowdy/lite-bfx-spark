@@ -222,16 +222,23 @@ class BaiRangeS3Test {
      * distinct BGZF blocks even after BGZF compression.  With repetitive sequences
      * (e.g. {@code "A".repeat(n)}) the entire file can collapse into one or two BGZF
      * blocks, making BAI-guided savings invisible.
+     *
+     * <p><b>Chromosome ordering:</b> CHR2 (bulk, 900 reads) is declared at reference
+     * index 0 and CHR1 (minority, 100 reads) at reference index 1.  In a
+     * coordinate-sorted BAM this places CHR2 data first and CHR1 data last.  When
+     * the BAI-guided query seeks to CHR1, it lands near EOF and there are almost no
+     * bytes left to drain on close — making the {@code regionBytes < fullBytes}
+     * assertion robust regardless of whether the S3A stream aborts or drains its
+     * HTTP connection on close.  Putting the minority chromosome first (the previous
+     * arrangement) caused S3A to drain the majority's bytes after reading CHR1,
+     * inflating {@code regionBytes} above {@code fullBytes}.
      */
     private static File generateTestBam(Path dir) throws IOException {
         SAMFileHeader header = new SAMFileHeader();
-        // Chromosome length is set to 1 Mbp (just above the highest read position of
-        // CHR2_READS * 1000 = 900,000) to keep the BAI linear index small. A 100 Mbp
-        // chromosome produces ~49 KB of linear index per reference regardless of read
-        // count, which can exceed the compressed size of the minority chromosome's data
-        // and cause the regionBytes < fullBytes assertion to fail.
-        header.addSequence(new SAMSequenceRecord(CHR1_NAME, 1_000_000));
+        // CHR2 at index 0 → sorts first; CHR1 at index 1 → sorts last.
+        // Chromosome length covers the highest read position (CHR2_READS * 1000 = 900,000).
         header.addSequence(new SAMSequenceRecord(CHR2_NAME, 1_000_000));
+        header.addSequence(new SAMSequenceRecord(CHR1_NAME, 1_000_000));
         header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
 
         String cigar     = READ_LENGTH + "M";
@@ -241,13 +248,15 @@ class BaiRangeS3Test {
         SAMFileWriterFactory factory = new SAMFileWriterFactory().setCreateIndex(true);
 
         try (SAMFileWriter writer = factory.makeBAMWriter(header, true, bamFile)) {
-            for (int i = 0; i < CHR1_READS; i++) {
-                writer.addAlignment(makeRecord(header, "chr1_read" + (i + 1), 0,
-                        (i + 1) * 1000, cigar, pseudoRandomSeq(i, 0), qualities));
-            }
+            // Write CHR2 records first (refIdx=0 → coordinate-sorts before CHR1).
             for (int i = 0; i < CHR2_READS; i++) {
-                writer.addAlignment(makeRecord(header, "chr2_read" + (i + 1), 1,
+                writer.addAlignment(makeRecord(header, "chr2_read" + (i + 1), 0,
                         (i + 1) * 1000, cigar, pseudoRandomSeq(i, 1), qualities));
+            }
+            // Write CHR1 records second (refIdx=1 → coordinate-sorts after CHR2).
+            for (int i = 0; i < CHR1_READS; i++) {
+                writer.addAlignment(makeRecord(header, "chr1_read" + (i + 1), 1,
+                        (i + 1) * 1000, cigar, pseudoRandomSeq(i, 0), qualities));
             }
         }
         return bamFile;
