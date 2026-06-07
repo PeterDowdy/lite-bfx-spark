@@ -4,7 +4,9 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 
 /**
- * Coordinate note: {@code start} and {@code mateStart} are <b>1-based</b> positions
+ * Spark schema for BAM/SAM/CRAM: column names, types, and nullability for all alignment fields.
+ *
+ * <p>Coordinate note: {@code start} and {@code mateStart} are <b>1-based</b> positions
  * as defined by the SAM specification. This differs from BED ({@code chromStart} is
  * 0-based), so take care when joining BAM and BED data on genomic coordinates.
  */

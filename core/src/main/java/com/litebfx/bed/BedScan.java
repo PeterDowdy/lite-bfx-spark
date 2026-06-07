@@ -28,7 +28,7 @@ import java.util.List;
 import java.util.OptionalLong;
 
 /**
- * Plans one {@link BedInputPartition} per BED file (full-file or tabix region).
+ * Plans {@link BedInputPartition}s for a BED file: byte-range splits for plain-text, tabix region queries for bgzipped.
  *
  * <h3>Index resolution order (per BED file)</h3>
  * <ol>

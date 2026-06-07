@@ -27,9 +27,9 @@ describe() {
     sam)      echo "SAM alignment file (Sequence Alignment/Map text format)"; return ;;
   esac
 
-  # Read first 40 lines for comment extraction
+  # Read first 60 lines for comment extraction (Java files with many imports need the extra room)
   local head
-  head="$(head -n 40 "$file" 2>/dev/null)" || { echo "—"; return; }
+  head="$(head -n 60 "$file" 2>/dev/null)" || { echo "—"; return; }
 
   case "$ext" in
     java|scala)
