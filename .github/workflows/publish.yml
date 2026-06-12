@@ -78,9 +78,11 @@ jobs:
       - name: Import GPG key
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          # Trust the key fully so gpg doesn't prompt during signing
-          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5}' | head -1)
-          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust
+          # Trust the key fully so gpg doesn't prompt during signing.
+          # gpg --import-ownertrust requires the full 40-char fingerprint (fpr
+          # record, field 10), not the short key ID (sec record, field 5).
+          GPG_FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
+          echo "$GPG_FPR:6:" | gpg --import-ownertrust
 
       # Write a Maven settings.xml that supplies the Sonatype Central Portal
       # credentials under the server id "central" (referenced by the
