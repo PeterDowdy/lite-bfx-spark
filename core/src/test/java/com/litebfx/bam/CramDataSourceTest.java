@@ -10,7 +10,11 @@ import htsjdk.samtools.SAMSequenceRecord;
 import htsjdk.samtools.cram.ref.ReferenceSource;
 import htsjdk.samtools.cram.structure.CRAMEncodingStrategy;
 import htsjdk.samtools.reference.FastaSequenceIndexCreator;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -204,6 +208,63 @@ public class CramDataSourceTest {
                 .first().getLong(0);
         assertEquals(TestBamGenerator.RECORD_COUNT, count);
         spark.sql("DROP VIEW IF EXISTS cram_region_view");
+    }
+
+    // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_sizeInBytes_greaterThanZero() {
+        Dataset<Row> df = spark.read().format("cram")
+                .option("referenceFile", fastaPath)
+                .load(cramPath);
+        long sizeBytes = df.queryExecution().optimizedPlan()
+                .stats().sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty CRAM file");
+        assertTrue(sizeBytes <= new java.io.File(java.nio.file.Paths.get(
+                java.net.URI.create(cramPath)).toString()).length() * 2,
+                "sizeInBytes should be within 2x of the actual file size");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() {
+        long count = spark.read().format("cram")
+                .option("referenceFile", fastaPath)
+                .load(cramPath)
+                .limit(3)
+                .count();
+        assertEquals(3L, count, "limit(3) should return exactly 3 rows from CRAM");
+    }
+
+    // -------------------------------------------------------------------------
+    // Ordering (SupportsReportOrdering)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void outputOrdering_craiIndexed_returnsReferenceNameAndStart() {
+        // multiCramPath has a co-located .crai and is coordinate-sorted
+        BamScan scan = new BamScan(
+                new CaseInsensitiveStringMap(Map.of("path", multiCramPath)),
+                BamSchema.SCHEMA, false, null, 1, Integer.MAX_VALUE, true);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(2, ordering.length, "CRAM with CRAI should report 2 ordering fields");
+        assertEquals("referenceName", ((NamedReference) ordering[0].expression()).fieldNames()[0]);
+        assertEquals("start",         ((NamedReference) ordering[1].expression()).fieldNames()[0]);
+    }
+
+    @Test
+    void outputOrdering_cramWithoutIndex_isEmpty() {
+        // cramPath has no .crai
+        BamScan scan = new BamScan(
+                new CaseInsensitiveStringMap(Map.of("path", cramPath)),
+                BamSchema.SCHEMA, false, null, 1, Integer.MAX_VALUE, true);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(0, ordering.length, "CRAM without CRAI should report no ordering");
     }
 
     // -------------------------------------------------------------------------

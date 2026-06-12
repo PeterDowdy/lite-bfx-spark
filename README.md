@@ -211,22 +211,36 @@ val df = LiteBfxSpark.readRegion(spark, "s3a://data/sample.bam",
 |---|---|---|---|
 | `indexPath` | — | BAM, CRAM, VCF, FASTA, BED | Explicit index path; single-file reads only |
 | `indexDir` | — | BAM, CRAM, VCF, BED | Directory of index files; resolved as `<dir>/<filename>.<ext>` |
-| `numPartitions` | `200` | All | Max partitions per file when index-based splitting is available |
+| `numPartitions` | `200` | BAM, CRAM, VCF, FASTQ | Max partitions per file for index-guided and byte-range splits |
 | `useIndex` | `true` | BAM, CRAM, VCF, BED | Set `false` to skip index lookup and force a single partition |
+| `vcfSplitSize` | `134217728` | VCF | Byte-range chunk size (bytes) for plain-text VCF splits |
+| `bedSplitSize` | `134217728` | BED | Byte-range chunk size (bytes) for plain-text BED splits |
+| `minSplitBytes` | `67108864` | FASTQ | Minimum partition size (bytes) for uncompressed FASTQ byte-range splits |
+| `bgzfSplitSize` | `134217728` | FASTQ | Compressed-byte chunk size for BGZF `.gz` FASTQ splits |
 | `referenceFile` | — | CRAM | FASTA reference path; `.fai` must be co-located |
 | `referenceMode` | `file` | CRAM | `file`, `md5` (ENA/NCBI lookup), or `none` |
 
 ### Partitioning behavior
 
-| Format | With index | Without index |
+| Format | Scenario | Partitions |
 |---|---|---|
-| BAM | One partition per reference sequence group (capped by `numPartitions`), plus one unmapped partition | Single partition |
-| BAM + region filter | Single partition (BAI-guided region query) | Single partition |
-| CRAM | One partition per CRAI entry | Single partition |
-| VCF / BED (bgzipped + tabix) | One or more partitions per pushed region | Single partition |
-| FASTA | One partition per contig (FAI) | Single partition |
-| FASTQ (uncompressed) | Byte-range splits (64 MB min, readers align to next `@`) | — |
-| FASTQ (gzipped) | Single partition always (gzip is not seekable) | — |
+| BAM | BAI present, no region filter | One per reference group (capped by `numPartitions`), plus unmapped |
+| BAM | BAI present, region filter pushed | Single (BAI-guided range query) |
+| BAM | No BAI | Single |
+| CRAM | CRAI present | One per CRAI entry (capped by `numPartitions`) |
+| CRAM | No CRAI | Single |
+| VCF (plain-text `.vcf`) | — | Byte-range splits (128 MiB default; tune with `vcfSplitSize`) |
+| VCF (bgzipped, tabix present, no region filter) | — | One per chromosome group (capped by `numPartitions`) |
+| VCF (bgzipped, tabix present, region filter pushed) | — | Single (tabix-guided range query) |
+| VCF (bgzipped, no tabix) | — | Single |
+| BED (plain-text `.bed`) | — | Byte-range splits (128 MiB default; tune with `bedSplitSize`) |
+| BED (bgzipped, tabix present, region filter pushed) | — | Single (tabix-guided range query) |
+| BED (bgzipped, no tabix or no pushed filter) | — | Single |
+| FASTA | FAI present | One per contig |
+| FASTA | No FAI | Single |
+| FASTQ (uncompressed) | — | Byte-range splits (min 64 MiB; capped by `numPartitions`) |
+| FASTQ (BGZF `.gz`, file ≥ `bgzfSplitSize`) | — | Byte-range splits at BGZF block boundaries (128 MiB; capped by `numPartitions`) |
+| FASTQ (regular `.gz` or small BGZF) | — | Single (gzip is not seekable) |
 
 ---
 

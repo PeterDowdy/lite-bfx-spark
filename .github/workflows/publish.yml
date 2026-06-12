@@ -1,7 +1,6 @@
 name: Publish
 
-# Triggered by pushing a version tag, e.g.:
-#   git tag v1.0.0 && git push origin v1.0.0
+# Publishes release artifacts to Maven Central when a version tag (e.g. v1.0.0) is pushed.
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   OSSRH_USERNAME    — Sonatype Central Portal username (token username)

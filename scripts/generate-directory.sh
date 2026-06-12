@@ -27,9 +27,9 @@ describe() {
     sam)      echo "SAM alignment file (Sequence Alignment/Map text format)"; return ;;
   esac
 
-  # Read first 40 lines for comment extraction
+  # Read first 60 lines for comment extraction (Java files with many imports need the extra room)
   local head
-  head="$(head -n 40 "$file" 2>/dev/null)" || { echo "—"; return; }
+  head="$(head -n 60 "$file" 2>/dev/null)" || { echo "—"; return; }
 
   case "$ext" in
     java|scala)
@@ -153,11 +153,22 @@ human_size() {
       size="$(human_size "$bytes")"
 
       # Hardcoded descriptions for files that cannot carry inline comments
+      # or whose auto-extracted comment is not a useful file summary.
       case "$rel" in
         CLAUDE.md)
           desc="Claude Code project instructions (loads DIRECTORY.md and TESTING.md)" ;;
         LICENSE)
           desc="MIT License" ;;
+        README.md)
+          desc="Project overview: supported formats, schemas, quick-start examples, and common options" ;;
+        .gitignore)
+          desc="Maven/Java build output and IDE artifacts excluded from version control" ;;
+        .gitattributes)
+          desc="Git LFS configuration for binary test fixtures (FASTQ, BAM, CRAM, BED)" ;;
+        .github/workflows/ci.yml)
+          desc="CI workflow: checkstyle, compile, and full test suite on pull requests and pushes" ;;
+        .github/workflows/publish.yml)
+          desc="Publish workflow: releases core and Scala JARs to Maven Central on version tags" ;;
         .claude/settings.json)
           desc="Claude Code project permission and tool settings" ;;
         .vscode/settings.json)

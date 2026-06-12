@@ -2,7 +2,9 @@ package com.litebfx.fastq;
 
 import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.HasPartitionStatistics;
+
+import java.util.OptionalLong;
 
 /**
  * Describes a single Spark partition over a FASTQ file.
@@ -19,7 +21,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
  * Each reader seeks to {@code startByte} then advances forward to the next
  * {@code @} record boundary before beginning iteration.
  */
-public class FastqInputPartition implements InputPartition {
+public class FastqInputPartition implements HasPartitionStatistics {
 
     private final String path;
     private final long startByte;
@@ -32,24 +34,33 @@ public class FastqInputPartition implements InputPartition {
      * False for plain-gzip (single full-file partition) and uncompressed byte-range splits.
      */
     private final boolean bgzf;
+    /** Maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    private final int rowLimit;
 
     public FastqInputPartition(String path, long startByte, long endByte, Configuration hadoopConf) {
-        this(path, startByte, endByte, hadoopConf, null, false);
+        this(path, startByte, endByte, hadoopConf, null, false, Integer.MAX_VALUE);
     }
 
     public FastqInputPartition(String path, long startByte, long endByte,
                                Configuration hadoopConf, Integer readNumber) {
-        this(path, startByte, endByte, hadoopConf, readNumber, false);
+        this(path, startByte, endByte, hadoopConf, readNumber, false, Integer.MAX_VALUE);
     }
 
     public FastqInputPartition(String path, long startByte, long endByte,
                                Configuration hadoopConf, Integer readNumber, boolean bgzf) {
+        this(path, startByte, endByte, hadoopConf, readNumber, bgzf, Integer.MAX_VALUE);
+    }
+
+    public FastqInputPartition(String path, long startByte, long endByte,
+                               Configuration hadoopConf, Integer readNumber, boolean bgzf,
+                               int rowLimit) {
         this.path = path;
         this.startByte = startByte;
         this.endByte = endByte;
         this.hadoopConf = new SerializableConfiguration(hadoopConf);
         this.readNumber = readNumber;
         this.bgzf = bgzf;
+        this.rowLimit = rowLimit;
     }
 
     public String getPath() { return path; }
@@ -60,4 +71,15 @@ public class FastqInputPartition implements InputPartition {
     public Integer getReadNumber() { return readNumber; }
     /** Returns true when this partition is a byte-range split of a BGZF-compressed file. */
     public boolean isBgzf() { return bgzf; }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int getRowLimit() { return rowLimit; }
+
+    @Override
+    public OptionalLong sizeInBytes() {
+        if (endByte != Long.MAX_VALUE) return OptionalLong.of(endByte - startByte);
+        return OptionalLong.empty();
+    }
+
+    @Override public OptionalLong numRows()    { return OptionalLong.empty(); }
+    @Override public OptionalLong filesCount() { return OptionalLong.of(1L); }
 }

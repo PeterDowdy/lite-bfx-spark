@@ -2,7 +2,9 @@ package com.litebfx.bam;
 
 import com.litebfx.SerializableConfiguration;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.HasPartitionStatistics;
+
+import java.util.OptionalLong;
 
 
 /**
@@ -23,7 +25,7 @@ import org.apache.spark.sql.connector.read.InputPartition;
  * can reconstruct a {@link org.apache.hadoop.fs.FileSystem} with the correct
  * S3A/ADLS credentials even when they differ from the default Hadoop config.
  */
-public class BamInputPartition implements InputPartition {
+public class BamInputPartition implements HasPartitionStatistics {
 
     // ---- fields shared by all modes ----
     private final String path;
@@ -52,6 +54,9 @@ public class BamInputPartition implements InputPartition {
 
     // ---- CRAM container-split ----
     private final long[] cramContainerSpans;
+
+    // ---- limit pushdown ----
+    private final int rowLimit;
 
     // -------------------------------------------------------------------------
     // Factory methods — one per partition mode
@@ -199,6 +204,27 @@ public class BamInputPartition implements InputPartition {
                               boolean queryUnmapped,
                               boolean samSplit,
                               long[] cramContainerSpans) {
+        this(path, conf, indexPath, isCram, referenceFile, referenceMode,
+             startByte, endByte, querySequence, queryStart, queryEnd,
+             querySequences, queryUnmapped, samSplit, cramContainerSpans, Integer.MAX_VALUE);
+    }
+
+    private BamInputPartition(String path,
+                              Configuration conf,
+                              String indexPath,
+                              boolean isCram,
+                              String referenceFile,
+                              String referenceMode,
+                              long startByte,
+                              long endByte,
+                              String querySequence,
+                              int queryStart,
+                              int queryEnd,
+                              String[] querySequences,
+                              boolean queryUnmapped,
+                              boolean samSplit,
+                              long[] cramContainerSpans,
+                              int rowLimit) {
         this.path              = path;
         this.hadoopConf        = new SerializableConfiguration(conf);
         this.indexPath         = indexPath;
@@ -214,6 +240,15 @@ public class BamInputPartition implements InputPartition {
         this.queryUnmapped     = queryUnmapped;
         this.samSplit          = samSplit;
         this.cramContainerSpans = cramContainerSpans;
+        this.rowLimit          = rowLimit;
+    }
+
+    /** Returns a copy of this partition with the given row limit. */
+    public BamInputPartition withRowLimit(int limit) {
+        return new BamInputPartition(path, hadoopConf.get(), indexPath, isCram,
+                referenceFile, referenceMode, startByte, endByte,
+                querySequence, queryStart, queryEnd, querySequences,
+                queryUnmapped, samSplit, cramContainerSpans, limit);
     }
 
     // -------------------------------------------------------------------------
@@ -242,4 +277,30 @@ public class BamInputPartition implements InputPartition {
      * container-split mode, or {@code null} for all other partition modes.
      */
     public long[] getCramContainerSpans() { return cramContainerSpans; }
+    /** Returns the maximum number of rows to return; Integer.MAX_VALUE means no limit. */
+    public int rowLimit() { return rowLimit; }
+
+    // -------------------------------------------------------------------------
+    // HasPartitionStatistics
+    // -------------------------------------------------------------------------
+
+    @Override
+    public OptionalLong sizeInBytes() {
+        // Byte-range splits (BGZF and SAM): exact compressed byte span.
+        if ((endByte != Long.MAX_VALUE) && cramContainerSpans == null) {
+            return OptionalLong.of(endByte - startByte);
+        }
+        // CRAM container splits: derive from the VFO span (upper 48 bits = raw byte offset).
+        if (cramContainerSpans != null && cramContainerSpans.length >= 2) {
+            long rawBytes = (cramContainerSpans[1] >> 16) - (cramContainerSpans[0] >> 16);
+            return rawBytes > 0 ? OptionalLong.of(rawBytes) : OptionalLong.empty();
+        }
+        return OptionalLong.empty();
+    }
+
+    @Override
+    public OptionalLong numRows() { return OptionalLong.empty(); }
+
+    @Override
+    public OptionalLong filesCount() { return OptionalLong.of(1L); }
 }

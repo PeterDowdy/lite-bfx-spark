@@ -1,11 +1,10 @@
 package com.litebfx.bam;
 
-import org.apache.spark.sql.sources.EqualTo;
-import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.sources.GreaterThan;
-import org.apache.spark.sql.sources.GreaterThanOrEqual;
-import org.apache.spark.sql.sources.LessThan;
-import org.apache.spark.sql.sources.LessThanOrEqual;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.LiteralValue;
+import org.apache.spark.sql.connector.expressions.filter.And;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -16,18 +15,24 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for {@link BamScanBuilder#pushFilters} and
+ * Unit tests for {@link BamScanBuilder#pushPredicates} and
  * {@link BamScanBuilder#pruneColumns}.
  *
  * <p>Drives the builder directly (no SparkSession) to exercise all branch
  * combinations in the predicate-pushdown logic:
  * <ul>
- *   <li>EqualTo on {@code referenceName} (match / attribute-mismatch)</li>
- *   <li>All four range filter types on {@code start}</li>
- *   <li>Range filters when no referenceName EqualTo is set (must be ignored)</li>
- *   <li>Range filter with wrong attribute (must be ignored)</li>
+ *   <li>Equality predicate on {@code referenceName} (match / attribute-mismatch)</li>
+ *   <li>Case-insensitive {@code referenceName} column matching (Spark 4.x lowercasing)</li>
+ *   <li>All four range predicate types on {@code start}</li>
+ *   <li>Range predicates when no referenceName equality is set (must be returned unhandled)</li>
+ *   <li>Range predicate with wrong attribute (must be returned unhandled)</li>
+ *   <li>{@code And}-wrapped compound predicate unwrapping</li>
  *   <li>Column pruning — with and without {@code attributes} in the required schema</li>
  * </ul>
+ *
+ * <p>Note: range predicates ({@code start} comparisons) are always returned unhandled so
+ * Spark post-filters for exactness — BAI overlap queries may return reads that fall
+ * partially outside the requested range.  Only {@code referenceName} equality is pushed.
  */
 class BamScanBuilderTest {
 
@@ -35,181 +40,209 @@ class BamScanBuilderTest {
         return new CaseInsensitiveStringMap(Map.of("path", "test.bam"));
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — no filters
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_empty_returnsEmptyAndBuilds() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        Filter[] result = b.pushFilters(new Filter[0]);
-        assertEquals(0, result.length);
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on referenceName (success path)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToReferenceName_returnsAllFiltersUnhandled() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        Filter[] filters = {new EqualTo("referenceName", "chr1")};
-        assertSame(filters, b.pushFilters(filters));
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on wrong attribute (type matches, attribute doesn't)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToWrongAttribute_refNameNotExtracted() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("readName", "read1")});
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — range filters without referenceName (must be silently ignored)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_rangeFiltersNoReferenceName_ignored() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new GreaterThanOrEqual("start", 100),
-                new LessThanOrEqual("start", 1000)
+    private static Predicate eq(String col, String val) {
+        return new Predicate("=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.StringType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThanOrEqual on start (with referenceName set)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_refNamePlusGte_startExtracted() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new GreaterThanOrEqual("start", 100)
+    private static Predicate gte(String col, long val) {
+        return new Predicate(">=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThan on start (start + 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_refNamePlusGt_startPlusOneExtracted() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new GreaterThan("start", 99)
+    private static Predicate gt(String col, long val) {
+        return new Predicate(">", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThanOrEqual on start
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_refNamePlusLte_endExtracted() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new LessThanOrEqual("start", 1000)
+    private static Predicate lte(String col, long val) {
+        return new Predicate("<=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThan on start (end - 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_refNamePlusLt_endMinusOneExtracted() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new LessThan("start", 1001)
+    private static Predicate lt(String col, long val) {
+        return new Predicate("<", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.LongType)
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — no predicates
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_empty_returnsEmptyAndBuilds() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        assertEquals(0, b.pushPredicates(new Predicate[0]).length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — range filter with wrong attribute (type matches, attr doesn't)
+    // pushPredicates — referenceName equality (success path)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_refNamePlusGteWrongAttr_ignored() {
+    void pushPredicates_equalToReferenceName_handledNotReturned() {
         BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new GreaterThanOrEqual("mapQ", 30)   // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_refNamePlusLtWrongAttr_ignored() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new LessThan("mapQ", 255)            // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_refNamePlusGtWrongAttr_ignored() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new GreaterThan("mapQ", 20)           // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_refNamePlusLteWrongAttr_ignored() {
-        BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new LessThanOrEqual("mapQ", 255)      // wrong attribute
-        });
+        Predicate refPred = eq("referenceName", "chr1");
+        assertEquals(0, b.pushPredicates(new Predicate[]{refPred}).length);
+        assertEquals(1, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — all four range filter types together with referenceName
+    // pushPredicates — case-insensitive referenceName (Spark 4.x lowercasing)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_allRangeFilterTypes_allProcessed() {
+    void pushPredicates_referenceNameLowercase_handled() {
         BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chrX"),
-                new GreaterThanOrEqual("start", 100),
-                new GreaterThan("start", 99),
-                new LessThanOrEqual("start", 200),
-                new LessThan("start", 201)
-        });
+        Predicate refPred = eq("referencename", "chr1");
+        assertEquals(0, b.pushPredicates(new Predicate[]{refPred}).length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_refNameLowercasePlusGte_refNameHandledRangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] preds = {eq("referencename", "chr1"), gte("start", 100L)};
+        assertEquals(1, b.pushPredicates(preds).length, "start range should be returned unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only referenceName equality is pushed");
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushedFilters — always empty
+    // pushPredicates — equality on wrong attribute
     // -------------------------------------------------------------------------
 
     @Test
-    void pushedFilters_alwaysReturnsEmpty() {
+    void pushPredicates_equalToWrongAttribute_refNameNotExtracted() {
         BamScanBuilder b = new BamScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("referenceName", "chr1")});
-        assertEquals(0, b.pushedFilters().length);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("readName", "read1")});
+        assertEquals(1, unhandled.length);
+        assertEquals(0, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range without referenceName (must be returned unhandled)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_rangeFiltersNoReferenceName_allReturnedUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{gte("start", 100L), lte("start", 1000L)});
+        assertEquals(2, unhandled.length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range types (with referenceName):
+    // referenceName equality is pushed; range is returned unhandled for Spark post-filtering
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_refNamePlusGte_refNamePushedRangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), gte("start", 100L)});
+        assertEquals(1, unhandled.length, "start range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only referenceName equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_refNamePlusGt_refNamePushedRangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), gt("start", 99L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_refNamePlusLte_refNamePushedRangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), lte("start", 1000L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_refNamePlusLt_refNamePushedRangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), lt("start", 1001L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range with wrong attribute (referenceName present)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_refNamePlusGteWrongAttr_rangeUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), gte("mapQ", 30L)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — And-wrapped compound predicate
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_andWrapped_refNamePushedStartUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate refPred  = eq("referenceName", "chr1");
+        Predicate startGte = gte("start", 100L);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{new And(refPred, startGte)});
+        assertEquals(1, unhandled.length, "start range from And should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only referenceName equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — all four range types together with referenceName
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_allRangeTypes_onlyRefNamePushed() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        Predicate[] preds = {
+                eq("referenceName", "chrX"),
+                gte("start", 100L),
+                gt("start", 99L),
+                lte("start", 200L),
+                lt("start", 201L)
+        };
+        assertEquals(4, b.pushPredicates(preds).length, "all four range predicates should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only referenceName equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushedPredicates — reflects handled set (equality only)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushedPredicates_returnsHandledPredicates() {
+        BamScanBuilder b = new BamScanBuilder(opts());
+        b.pushPredicates(new Predicate[]{eq("referenceName", "chr1")});
+        assertEquals(1, b.pushedPredicates().length);
     }
 
     // -------------------------------------------------------------------------
@@ -246,12 +279,11 @@ class BamScanBuilderTest {
     // -------------------------------------------------------------------------
 
     @Test
-    void cramVariant_pushFilters_sameLogicAsBam() {
+    void cramVariant_pushPredicates_sameLogicAsBam() {
         BamScanBuilder b = new BamScanBuilder(opts(), true);
-        b.pushFilters(new Filter[]{
-                new EqualTo("referenceName", "chr1"),
-                new GreaterThanOrEqual("start", 1000)
-        });
+        Predicate[] preds = {eq("referenceName", "chr1"), gte("start", 1000L)};
+        assertEquals(1, b.pushPredicates(preds).length, "start range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only referenceName equality is pushed");
         assertNotNull(b.build());
     }
 }

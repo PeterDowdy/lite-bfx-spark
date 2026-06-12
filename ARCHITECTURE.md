@@ -14,10 +14,12 @@ spark.read.format("bam").load(...)
       BamTable            ← SupportsRead
           │
           ▼
-   BamScanBuilder         ← SupportsPushDownFilters + SupportsPushDownRequiredColumns
-          │  extracts referenceName / start filters, tracks attribute pruning
+   BamScanBuilder         ← SupportsPushDownV2Filters + SupportsPushDownLimit
+          │               + SupportsPushDownRequiredColumns
+          │  pushes referenceName equality; extracts start range for BAI query
           ▼
-       BamScan            ← Scan + Batch
+       BamScan            ← Scan + Batch + SupportsReportStatistics
+          │               + SupportsReportOrdering
           │  planInputPartitions(): produces BamInputPartition[]
           ▼
 BamPartitionReaderFactory ← PartitionReaderFactory
@@ -77,27 +79,46 @@ core/src/main/resources/META-INF/services/
 
 This file lists all `DataSource` class names. Spark discovers them at runtime through `DataSourceRegister.shortName()`, which is how `spark.read.format("bam")` resolves to `BamDataSource`.
 
-### ScanBuilder: filter pushdown and column pruning
+### ScanBuilder: predicate pushdown, limit, and column pruning
 
-`ScanBuilder` is the only place Spark communicates query intent to the library before reading starts.
+`ScanBuilder` is the only place Spark communicates query intent to the library before reading starts. Each format's builder implements a subset of the following interfaces.
 
-**Filter pushdown** (`SupportsPushDownFilters.pushFilters`): The builder inspects the filter array for recognizable predicates and stores them for use in partition planning. All filters are returned as "unhandled" — Spark re-applies every filter post-scan as a correctness guarantee.
+**V2 predicate pushdown** (`SupportsPushDownV2Filters`): The builder receives a flat array of V2 `Predicate` objects (after `And`-tree flattening). Recognized predicates are split into two categories:
 
-| Format | Pushable filters | Column |
+- **Fully pushed** (returned from `pushedPredicates()`): Equality predicates on the reference-name column (`referenceName`, `chrom`, `name`). The index query for a given reference guarantees an exact match, so Spark trusts the scan and removes the predicate from the physical plan — it never appears in a post-scan `Filter` node.
+- **Extracted but not pushed** (returned as unhandled from `pushPredicates()`): Range predicates on the coordinate column (`start`, `pos`, `chromStart`, `chromEnd`). Their values are stored and used to construct a narrower BAI/tabix query, reducing I/O. However, because BAI and tabix use overlap queries that may return records whose alignment starts outside the exact range, these predicates are returned as unhandled so Spark adds a post-scan `Filter` node for correctness.
+
+| Format | Pushed (exact) | Extracted for index, post-filtered by Spark |
 |---|---|---|
-| BAM/CRAM | Equality + range | `referenceName`, `start` |
-| VCF/BCF | Equality + range | `chrom`, `pos` |
-| BED | Equality + range | `chrom`, `chromStart`, `chromEnd` |
-| FASTA | Equality | `name` |
+| BAM/CRAM | `referenceName =` | `start >=`, `start >`, `start <=`, `start <` |
+| VCF/BCF | `chrom =` | `pos >=`, `pos >`, `pos <=`, `pos <` |
+| BED | `chrom =` | `chromStart >=`, `chromStart >`, `chromEnd <=`, `chromEnd <` |
+| FASTA | `name =` | _(none — FAI lookup is exact)_ |
 | FASTQ | _(none — no index)_ | — |
+
+Helper methods (`flatten`, `isColumnEquality`, `isRangeComparison`, `literalValue`, `columnName`) live in `FastaScanBuilder` as `public static` utilities reused by all other builders.
+
+**Limit pushdown** (`SupportsPushDownLimit`): All formats implement `pushLimit(int limit)`. The pushed limit is passed to the `Scan`, which uses it to plan fewer partitions and cap the per-partition row count. This makes `df.limit(N)` avoid reading the entire file when only the first N rows are needed. The method returns `false` so Spark also enforces the limit post-scan.
 
 **Column pruning** (`SupportsPushDownRequiredColumns.pruneColumns`): The builder records the required schema. For BAM, if `attributes` is absent the reader skips per-record SAM tag parsing — a meaningful speedup for aggregation queries that don't need optional tags.
 
-### Scan: partition planning
+### Scan: partition planning, statistics, and ordering
 
 `Scan.planInputPartitions()` runs on the **driver** and returns a serializable array of partition descriptors. The driver opens indexes (BAI, tabix, FAI) here so executors never parse index files independently.
 
 See the [Partition planning](#partition-planning) section for the full decision trees.
+
+**Statistics** (`SupportsReportStatistics`): All five format scans implement `estimateStatistics()`. The driver resolves files and sums their sizes to produce a `sizeInBytes` estimate, which the Spark optimizer uses for join reordering and broadcast decisions. `FastaScan` also reports `numRows` as the FAI contig count when an index is present, enabling accurate cardinality estimates for FASTA queries.
+
+**Ordering** (`SupportsReportOrdering`): Three formats report output ordering when an appropriate index confirms sorted data:
+
+| Format | Condition | Reported order |
+|---|---|---|
+| BAM/CRAM | BAI/CRAI present **and** `SO:coordinate` in header | `[referenceName ASC NULLS LAST, start ASC NULLS LAST]` |
+| VCF/BCF | tabix index present | `[chrom ASC NULLS LAST, pos ASC NULLS LAST]` |
+| BED | tabix index present | `[chrom ASC NULLS LAST, chromStart ASC NULLS LAST]` |
+
+When ordering is reported, the Spark optimizer can eliminate sort operations for queries like `ORDER BY chrom, pos` or merge-joins on genomic coordinates without adding a shuffle.
 
 ### PartitionReader: record conversion
 
@@ -355,8 +376,9 @@ spark.read.format("bam")
 
 **Driver:**
 1. Spark instantiates `BamDataSource` → `BamTable` → `BamScanBuilder`
-2. `pushFilters([EqualTo("referenceName","chr1"), GTE("start",1000000), LTE("start",2000000)])`:
-   stores `pushedReferenceName="chr1"`, `pushedStart=1000000`, `pushedEnd=2000000`; returns all filters unhandled
+2. `pushPredicates([=(referenceName,"chr1"), >=(start,1000000), <=(start,2000000)])`:
+   - `referenceName =` equality → **pushed** (stored as `pushedReferenceName="chr1"`; absent from physical plan)
+   - `start >=` / `start <=` range → **extracted** (stored as `pushedStart`, `pushedEnd`) but returned unhandled → Spark adds post-scan `Filter` nodes for these
 3. `pruneColumns({readName, start, cigar})`: sets `includeAttributes=false`
 4. `build()` → `BamScan(…, "chr1", 1000000, 2000000, isCram=false)`
 5. `BamScan.planInputPartitions()`:
@@ -372,10 +394,10 @@ spark.read.format("bam")
    - Wrapped in `HadoopSeekableStream`
    - BAI opened the same way → second `HadoopSeekableStream`
    - `SamReaderFactory.open(SamInputResource.of(bamStream).index(baiStream))`
-   - `samReader.query("chr1", 1000000, 2000000, false)` — htsjdk seeks via BAI VFOs
+   - `samReader.query("chr1", 1000000, 2000000, false)` — htsjdk seeks via BAI VFOs; may return reads overlapping the boundary
 9. For each record from htsjdk iterator:
-   - `next()` advances iterator
+   - `next()` advances iterator; if `rowsRead >= rowLimit` returns false immediately
    - `get()` converts `SAMRecord` → `GenericInternalRow(13 values)` — `attributes` skipped (pruned)
-10. Spark applies post-filter (correctness pass), projects `{readName, start, cigar}`, counts
+10. Spark applies post-scan `Filter` for `start >= 1000000 AND start <= 2000000` (correctness pass for overlap reads), projects `{readName, start, cigar}`, counts
 
 Only BGZF blocks containing chr1:1000000–2000000 are fetched from S3 — not the full file.

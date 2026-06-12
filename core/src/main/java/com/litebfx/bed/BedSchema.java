@@ -4,7 +4,9 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 
 /**
- * Coordinate note: {@code chromStart}, {@code chromEnd}, {@code thickStart}, and
+ * Spark schema for BED: column names, types, and nullability for BED3–BED12 fields.
+ *
+ * <p>Coordinate note: {@code chromStart}, {@code chromEnd}, {@code thickStart}, and
  * {@code thickEnd} are <b>0-based half-open</b> intervals as defined by the BED
  * specification. This differs from BAM ({@code start} is 1-based), so take care
  * when joining BED and BAM data on genomic coordinates.

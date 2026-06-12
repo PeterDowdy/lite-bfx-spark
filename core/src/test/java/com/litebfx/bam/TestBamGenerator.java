@@ -131,6 +131,26 @@ public class TestBamGenerator {
         return bamPath;
     }
 
+    /**
+     * Generates a queryname-sorted BAM (no BAI) with {@value #RECORD_COUNT} records.
+     * Used to verify that {@code BamScan.outputOrdering()} returns empty for non-coordinate sort.
+     */
+    public static Path generateQuerynameSortedBam(Path dir) throws IOException {
+        SAMFileHeader header = new SAMFileHeader();
+        header.addSequence(new SAMSequenceRecord(REF_NAME, REF_LENGTH));
+        header.setSortOrder(SAMFileHeader.SortOrder.queryname);
+        Path bamPath = dir.resolve("queryname.bam");
+        // presorted=false: records are in coordinate order; htsjdk sorts by queryname before writing
+        try (SAMFileWriter writer = new SAMFileWriterFactory()
+                .setCreateIndex(false)
+                .makeBAMWriter(header, false, bamPath.toFile())) {
+            for (SAMRecord r : buildRecords(header)) {
+                writer.addAlignment(r);
+            }
+        }
+        return bamPath;
+    }
+
     private static SAMRecord[] buildRecords(SAMFileHeader header) {
         SAMRecord[] records = new SAMRecord[RECORD_COUNT];
         for (int i = 0; i < RECORD_COUNT; i++) {

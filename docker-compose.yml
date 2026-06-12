@@ -1,4 +1,4 @@
-# spark-bam-reader test environments
+# lite-bfx-spark test environments
 #
 # Test environments (run mvn test):
 #   spark-test       Pure Spark 4.x, no Databricks, no Unity Catalog    (maven:3.9-eclipse-temurin-17)

@@ -76,6 +76,7 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
     private boolean opened    = false;
     private boolean exhausted = false;
     private FastqRecord current;
+    private long rowsRead = 0;
 
     public FastqPartitionReader(FastqInputPartition partition) {
         log.trace("FastqPartitionReader(path={}, startByte={}, endByte={}, bgzf={})",
@@ -94,23 +95,26 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
             opened = true;
         }
         if (exhausted) return false;
+        if (rowsRead >= partition.getRowLimit()) return false;
 
+        boolean hasNext;
         if (bcis != null) {
-            return nextBgzf();
+            hasNext = nextBgzf();
+        } else if (plainSplit) {
+            hasNext = nextPlainSplit();
+        } else {
+            // plain-gzip / uncompressed path via FastqReader (no boundary check needed)
+            if (!fastqReader.hasNext()) {
+                exhausted = true;
+                hasNext = false;
+            } else {
+                current = fastqReader.next();
+                log.trace("next() readName={}", current.getReadName());
+                hasNext = true;
+            }
         }
-
-        if (plainSplit) {
-            return nextPlainSplit();
-        }
-
-        // plain-gzip / uncompressed path via FastqReader (no boundary check needed)
-        if (!fastqReader.hasNext()) {
-            exhausted = true;
-            return false;
-        }
-        current = fastqReader.next();
-        log.trace("next() readName={}", current.getReadName());
-        return true;
+        if (hasNext) rowsRead++;
+        return hasNext;
     }
 
     @Override

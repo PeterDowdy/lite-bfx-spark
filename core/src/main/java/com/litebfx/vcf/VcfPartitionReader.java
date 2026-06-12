@@ -65,7 +65,14 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private static final Logger log = LoggerFactory.getLogger(VcfPartitionReader.class);
 
     private final VcfInputPartition partition;
+    private final boolean includeInfo;
+    private final boolean includeGenotypes;
     private boolean opened = false;
+    private long rowsRead = 0;
+
+    /** Reusable empty-map sentinel returned when info is not needed (info is non-nullable). */
+    private static final ArrayBasedMapData EMPTY_MAP = new ArrayBasedMapData(
+            new GenericArrayData(new Object[0]), new GenericArrayData(new Object[0]));
 
     // --- VCFFileReader path (local only: BCF, bgzipped VCF, plain VCF) ---
     private VCFFileReader reader;
@@ -96,10 +103,16 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private String[] sampleNames = new String[0];
     private String[] currentColumns = null;
 
-    public VcfPartitionReader(VcfInputPartition partition) {
-        log.trace("VcfPartitionReader(path={}, queryChrom={})",
-                partition.getPath(), partition.getQueryChrom());
-        this.partition = partition;
+    VcfPartitionReader(VcfInputPartition partition) {
+        this(partition, true, true);
+    }
+
+    VcfPartitionReader(VcfInputPartition partition, boolean includeInfo, boolean includeGenotypes) {
+        log.trace("VcfPartitionReader(path={}, queryChrom={}, includeInfo={}, includeGenotypes={})",
+                partition.getPath(), partition.getQueryChrom(), includeInfo, includeGenotypes);
+        this.partition        = partition;
+        this.includeInfo      = includeInfo;
+        this.includeGenotypes = includeGenotypes;
     }
 
     // -------------------------------------------------------------------------
@@ -112,6 +125,13 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             open();
             opened = true;
         }
+        if (rowsRead >= partition.getRowLimit()) return false;
+        boolean hasNext = nextRecord();
+        if (hasNext) rowsRead++;
+        return hasNext;
+    }
+
+    private boolean nextRecord() throws IOException {
         if (isVcfSplitMode) return nextSplitMode();
         if (isVcfBgzfMode)  return nextBgzfMode();
         if (pendingChroms != null) return nextMultiChromMode();
@@ -510,11 +530,11 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
             filter = UTF8String.fromString(filterStr);
         }
 
-        ArrayBasedMapData infoMap = parseInfoString(c[7]);
+        ArrayBasedMapData infoMap = includeInfo ? parseInfoString(c[7]) : EMPTY_MAP;
 
         UTF8String format = null;
         ArrayBasedMapData genotypesMap = null;
-        if (c.length > 8 && !c[8].trim().isEmpty()) {
+        if (includeGenotypes && c.length > 8 && !c[8].trim().isEmpty()) {
             format = UTF8String.fromString(c[8].trim());
             if (sampleNames.length > 0 && c.length > 9) {
                 genotypesMap = buildGenotypesFromColumns(c);
@@ -528,7 +548,7 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         return new GenericInternalRow(values);
     }
 
-    private static InternalRow getFromVariantContext(VariantContext vc) {
+    private InternalRow getFromVariantContext(VariantContext vc) {
         UTF8String chrom = UTF8String.fromString(vc.getContig());
         int pos = vc.getStart();
 
@@ -557,11 +577,11 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
                     : UTF8String.fromString(String.join(";", vc.getFilters()));
         }
 
-        ArrayBasedMapData infoMap = buildInfoMap(vc.getAttributes());
+        ArrayBasedMapData infoMap = includeInfo ? buildInfoMap(vc.getAttributes()) : EMPTY_MAP;
 
         UTF8String format = null;
         ArrayBasedMapData genotypesMap = null;
-        if (!vc.getGenotypes().isEmpty()) {
+        if (includeGenotypes && !vc.getGenotypes().isEmpty()) {
             Genotype first = vc.getGenotype(0);
             format = UTF8String.fromString(buildFormatString(first));
             genotypesMap = buildGenotypesMap(vc, first);

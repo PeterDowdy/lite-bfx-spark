@@ -3,7 +3,10 @@ package com.litebfx.bam;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -94,6 +97,45 @@ class BamDataSourceTest {
                 .count();
         // Verified: samtools view range.bam CHROMOSOME_I | awk '$4 >= 1000 && $4 <= 2000' | wc -l → 12
         assertEquals(12L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Physical plan (EXPLAIN) — pushed vs. post-scan predicate visibility
+    // -------------------------------------------------------------------------
+
+    @Test
+    void explain_referenceNameEquality_removedFromPhysicalPlan() {
+        // When referenceName equality is in pushedPredicates(), Spark trusts the scan
+        // for that condition and removes it from the physical plan (no post-scan Filter).
+        // In Spark 4.x this means the literal "CHROMOSOME_I" does not appear in the
+        // executedPlan string at all — the only remaining Filter is isnotnull(referenceName).
+        String plan = spark.read().format("bam").load(bamPath)
+                .filter("referenceName = 'CHROMOSOME_I'")
+                .queryExecution().executedPlan().toString();
+        assertFalse(plan.contains("CHROMOSOME_I"),
+                "Pushed equality should be absent from the physical plan (Spark trusts the scan):\n" + plan);
+        assertTrue(plan.contains("BatchScan"),
+                "Plan should still contain the BatchScan node:\n" + plan);
+    }
+
+    @Test
+    void explain_startRange_appearsAsPostScanFilter() {
+        // start >= 1000 is returned unhandled from pushPredicates() so Spark adds a Filter
+        // node above the scan.  The referenceName equality remains pushed (still absent).
+        String planEquality = spark.read().format("bam").load(bamPath)
+                .filter("referenceName = 'CHROMOSOME_I'")
+                .queryExecution().executedPlan().toString();
+        String planWithRange = spark.read().format("bam").load(bamPath)
+                .filter("referenceName = 'CHROMOSOME_I' AND start >= 1000")
+                .queryExecution().executedPlan().toString();
+        // Pushed equality absent in both plans
+        assertFalse(planWithRange.contains("CHROMOSOME_I"),
+                "Pushed equality should remain absent when range is also present:\n" + planWithRange);
+        // Unhandled start range visible only in the range plan
+        assertFalse(planEquality.contains("1000"),
+                "Equality-only plan should not mention 1000:\n" + planEquality);
+        assertTrue(planWithRange.contains("1000"),
+                "Unpushed start >= 1000 should appear as a post-scan Filter:\n" + planWithRange);
     }
 
     // -------------------------------------------------------------------------
@@ -425,5 +467,82 @@ class BamDataSourceTest {
                 .filter("referenceName = 'NONEXISTENT_CHROM'")
                 .count();
         assertEquals(0L, count);
+    }
+
+    // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_sizeInBytes_greaterThanZero() {
+        Dataset<Row> df = spark.read().format("bam").load(bamPath);
+        long sizeBytes = df.queryExecution().optimizedPlan()
+                .stats().sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty BAM file");
+        assertTrue(sizeBytes <= new java.io.File(java.nio.file.Paths.get(
+                java.net.URI.create(bamPath)).toString()).length() * 2,
+                "sizeInBytes should be within 2x of the actual file size");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() {
+        long count = spark.read().format("bam")
+                .option("indexPath", baiPath)
+                .load(bamPath)
+                .limit(3)
+                .count();
+        assertEquals(3L, count, "limit(3) should return exactly 3 rows");
+    }
+
+    @Test
+    void limit_withRegionFilter_returnsCorrectRows() {
+        // Region filter combined with limit: region still applied first, limit on top.
+        long count = spark.read().format("bam")
+                .option("indexPath", baiPath)
+                .load(bamPath)
+                .filter("referenceName = 'CHROMOSOME_I'")
+                .limit(2)
+                .count();
+        assertEquals(2L, count, "region filter + limit(2) should return exactly 2 rows");
+    }
+
+    // -------------------------------------------------------------------------
+    // Ordering (SupportsReportOrdering)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void outputOrdering_coordinateSortedWithIndex_returnsReferenceNameAndStart() {
+        // range.bam is coordinate-sorted and has a co-located .bai
+        BamScan scan = new BamScan(
+                new CaseInsensitiveStringMap(java.util.Map.of("path", bamPath)),
+                BamSchema.SCHEMA, false, null, 1, Integer.MAX_VALUE, false);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(2, ordering.length, "coordinate-sorted BAM with index should report 2 ordering fields");
+        assertEquals("referenceName", ((NamedReference) ordering[0].expression()).fieldNames()[0]);
+        assertEquals("start",         ((NamedReference) ordering[1].expression()).fieldNames()[0]);
+    }
+
+    @Test
+    void outputOrdering_sam_isEmpty() throws Exception {
+        TestBamGenerator.Fixtures fx = TestBamGenerator.generate(tempDir);
+        BamScan scan = new BamScan(
+                new CaseInsensitiveStringMap(java.util.Map.of("path", fx.sam().toUri().toString())),
+                BamSchema.SCHEMA, false, null, 1, Integer.MAX_VALUE, false);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(0, ordering.length, "SAM without index should report no ordering");
+    }
+
+    @Test
+    void outputOrdering_querynameSortedBam_isEmpty() throws Exception {
+        java.nio.file.Path qnameBam = TestBamGenerator.generateQuerynameSortedBam(tempDir);
+        BamScan scan = new BamScan(
+                new CaseInsensitiveStringMap(java.util.Map.of("path", qnameBam.toUri().toString())),
+                BamSchema.SCHEMA, false, null, 1, Integer.MAX_VALUE, false);
+        SortOrder[] ordering = scan.outputOrdering();
+        assertEquals(0, ordering.length, "queryname-sorted BAM should report no ordering");
     }
 }

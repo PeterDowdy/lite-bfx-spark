@@ -1,11 +1,10 @@
 package com.litebfx.vcf;
 
-import org.apache.spark.sql.sources.EqualTo;
-import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.sources.GreaterThan;
-import org.apache.spark.sql.sources.GreaterThanOrEqual;
-import org.apache.spark.sql.sources.LessThan;
-import org.apache.spark.sql.sources.LessThanOrEqual;
+import org.apache.spark.sql.connector.expressions.Expression;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.LiteralValue;
+import org.apache.spark.sql.connector.expressions.filter.And;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -16,17 +15,22 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for {@link VcfScanBuilder#pushFilters}.
+ * Unit tests for {@link VcfScanBuilder#pushPredicates}.
  *
  * <p>Drives the builder directly (no SparkSession) to exercise all branch
  * combinations in the predicate-pushdown logic:
  * <ul>
- *   <li>EqualTo on {@code chrom} (match / attribute-mismatch)</li>
- *   <li>All four range filter types on {@code pos}</li>
- *   <li>Range filters present when no chrom EqualTo is set (must be ignored)</li>
- *   <li>Range filter with wrong attribute (must be ignored)</li>
+ *   <li>Equality predicate on {@code chrom} (match / attribute-mismatch)</li>
+ *   <li>All four range predicate types on {@code pos}</li>
+ *   <li>Range predicates present when no chrom equality is set (must be ignored)</li>
+ *   <li>Range predicate with wrong attribute (must be ignored)</li>
+ *   <li>{@code And}-wrapped compound predicate unwrapping</li>
  *   <li>Column pruning via {@link VcfScanBuilder#pruneColumns}</li>
  * </ul>
+ *
+ * <p>Note: range predicates ({@code pos} comparisons) are always returned unhandled so
+ * Spark post-filters for exactness — tabix overlap queries may return records that
+ * fall partially outside the requested range.  Only {@code chrom} equality is pushed.
  */
 class VcfScanBuilderTest {
 
@@ -34,181 +38,181 @@ class VcfScanBuilderTest {
         return new CaseInsensitiveStringMap(Map.of("path", "test.vcf"));
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — no filters
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_empty_returnsEmptyAndBuilds() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        Filter[] result = b.pushFilters(new Filter[0]);
-        assertEquals(0, result.length);
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on chrom (success path)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToChrom_returnsAllFiltersUnhandled() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        Filter[] filters = {new EqualTo("chrom", "chr1")};
-        assertSame(filters, b.pushFilters(filters));
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — EqualTo on wrong attribute (type matches, attribute doesn't)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_equalToWrongAttribute_chromNotExtracted() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("filter", "PASS")});
-        assertNotNull(b.build());
-    }
-
-    // -------------------------------------------------------------------------
-    // pushFilters — range filters without chrom (must be silently ignored)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_rangeFiltersNoChrom_ignored() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new GreaterThanOrEqual("pos", 100),
-                new LessThanOrEqual("pos", 1000)
+    private static Predicate eq(String col, String val) {
+        return new Predicate("=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.StringType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThanOrEqual on pos (with chrom set)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusGte_startExtracted() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThanOrEqual("pos", 100)
+    private static Predicate gte(String col, int val) {
+        return new Predicate(">=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.IntegerType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — GreaterThan on pos (start + 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusGt_startPlusOneExtracted() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThan("pos", 99)
+    private static Predicate gt(String col, int val) {
+        return new Predicate(">", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.IntegerType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThanOrEqual on pos
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusLte_endExtracted() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThanOrEqual("pos", 1000)
+    private static Predicate lte(String col, int val) {
+        return new Predicate("<=", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.IntegerType)
         });
-        assertNotNull(b.build());
     }
 
-    // -------------------------------------------------------------------------
-    // pushFilters — LessThan on pos (end - 1 semantic)
-    // -------------------------------------------------------------------------
-
-    @Test
-    void pushFilters_chromPlusLt_endMinusOneExtracted() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThan("pos", 1001)
+    private static Predicate lt(String col, int val) {
+        return new Predicate("<", new Expression[]{
+                FieldReference.apply(col),
+                LiteralValue.apply(val, DataTypes.IntegerType)
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — no predicates
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_empty_returnsEmptyAndBuilds() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        assertEquals(0, b.pushPredicates(new Predicate[0]).length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — range filter with wrong attribute (type matches, attr doesn't)
+    // pushPredicates — chrom equality (success path)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_chromPlusGteWrongAttr_ignored() {
+    void pushPredicates_equalToChrom_handledNotReturned() {
         VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThanOrEqual("qual", 30)   // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusLtWrongAttr_ignored() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThan("qual", 100)             // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusGtWrongAttr_ignored() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new GreaterThan("qual", 20)           // wrong attribute
-        });
-        assertNotNull(b.build());
-    }
-
-    @Test
-    void pushFilters_chromPlusLteWrongAttr_ignored() {
-        VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chr1"),
-                new LessThanOrEqual("qual", 100)      // wrong attribute
-        });
+        Predicate chrom = eq("chrom", "chr1");
+        assertEquals(0, b.pushPredicates(new Predicate[]{chrom}).length);
+        assertEquals(1, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushFilters — all four range filter types together with chrom
+    // pushPredicates — chrom equality on wrong attribute
     // -------------------------------------------------------------------------
 
     @Test
-    void pushFilters_allRangeFilterTypes_allProcessed() {
+    void pushPredicates_equalToWrongAttribute_chromNotExtracted() {
         VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{
-                new EqualTo("chrom", "chrX"),
-                new GreaterThanOrEqual("pos", 100),
-                new GreaterThan("pos", 99),
-                new LessThanOrEqual("pos", 200),
-                new LessThan("pos", 201)
-        });
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("filter", "PASS")});
+        assertEquals(1, unhandled.length);
+        assertEquals(0, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 
     // -------------------------------------------------------------------------
-    // pushedFilters — always empty
+    // pushPredicates — range without chrom (must be silently ignored / returned)
     // -------------------------------------------------------------------------
 
     @Test
-    void pushedFilters_alwaysReturnsEmpty() {
+    void pushPredicates_rangeFiltersNoChrom_allReturnedUnhandled() {
         VcfScanBuilder b = new VcfScanBuilder(opts());
-        b.pushFilters(new Filter[]{new EqualTo("chrom", "chr1")});
-        assertEquals(0, b.pushedFilters().length);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{gte("pos", 100), lte("pos", 1000)});
+        assertEquals(2, unhandled.length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range types (with chrom):
+    // chrom equality is pushed; pos range is returned unhandled for Spark post-filtering
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_chromPlusGte_chromPushedRangeUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gte("pos", 100)});
+        assertEquals(1, unhandled.length, "pos range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromPlusGt_chromPushedRangeUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gt("pos", 99)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromPlusLte_chromPushedRangeUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), lte("pos", 1000)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_chromPlusLt_chromPushedRangeUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), lt("pos", 1001)});
+        assertEquals(1, unhandled.length);
+        assertEquals(1, b.pushedPredicates().length);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — range with wrong attribute (chrom present, wrong range col)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_chromPlusGteWrongAttr_rangeUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("chrom", "chr1"), gte("qual", 30)});
+        assertEquals(1, unhandled.length, "wrong-attr range predicate should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom should be handled");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — And-wrapped compound predicate unwrapping
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_andWrapped_chromPushedPosUnhandled() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate chrom = eq("chrom", "chr1");
+        Predicate pos   = gte("pos", 1000);
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{new And(chrom, pos)});
+        assertEquals(1, unhandled.length, "pos range from And should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — all four range types together with chrom
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_allRangeTypes_onlyChromPushed() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        Predicate[] preds = {eq("chrom", "chrX"), gte("pos", 100), gt("pos", 99), lte("pos", 200), lt("pos", 201)};
+        assertEquals(4, b.pushPredicates(preds).length, "all four pos range predicates should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "only chrom equality is pushed");
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushedPredicates — reflects handled set (equality only)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushedPredicates_returnsHandledPredicates() {
+        VcfScanBuilder b = new VcfScanBuilder(opts());
+        b.pushPredicates(new Predicate[]{eq("chrom", "chr1")});
+        assertEquals(1, b.pushedPredicates().length);
     }
 
     // -------------------------------------------------------------------------

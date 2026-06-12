@@ -254,6 +254,26 @@ class FastaDataSourceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_indexedFasta_sizeInBytesAndNumRows() {
+        Dataset<Row> df = spark.read().format("fasta").load(fastaPath);
+        var planStats = df.queryExecution().optimizedPlan().stats();
+        long sizeBytes = planStats.sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty FASTA file");
+        assertTrue(sizeBytes <= new java.io.File(java.nio.file.Paths.get(
+                java.net.URI.create(fastaPath)).toString()).length() * 2,
+                "sizeInBytes should be within 2x of file size");
+        // FAI has 1 contig (000000F) → numRows should be reported as 1
+        assertTrue(planStats.rowCount().isDefined(),
+                "rowCount should be defined for FAI-indexed FASTA");
+        assertEquals(1L, ((Number) planStats.rowCount().get()).longValue(),
+                "numRows should equal FAI contig count (1 for realn01.fa)");
+    }
+
+    // -------------------------------------------------------------------------
     // Column pruning
     // -------------------------------------------------------------------------
 
@@ -266,5 +286,15 @@ class FastaDataSourceTest {
         Row row = df.first();
         assertEquals(EXPECTED_CONTIG, row.getString(0));
         assertEquals(EXPECTED_LENGTH, row.getLong(1));
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() {
+        long count = spark.read().format("fasta").load(fastaPath).limit(1).count();
+        assertEquals(1L, count, "limit(1) should return exactly 1 row");
     }
 }

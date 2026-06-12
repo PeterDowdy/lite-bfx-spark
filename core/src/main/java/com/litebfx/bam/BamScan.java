@@ -13,10 +13,18 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.NullOrdering;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.connector.expressions.SortValue;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportOrdering;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -31,6 +39,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.TreeSet;
 import java.util.zip.GZIPInputStream;
 
@@ -65,7 +74,7 @@ import java.util.zip.GZIPInputStream;
  * <h3>Fallback</h3>
  * SAM files and BAM files without a BAI always get a single full-scan partition.
  */
-public class BamScan implements Scan, Batch {
+public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsReportOrdering {
 
     private static final Logger log = LoggerFactory.getLogger(BamScan.class);
 
@@ -76,6 +85,12 @@ public class BamScan implements Scan, Batch {
     private final int pushedStart;
     private final int pushedEnd;
     private final boolean isCram;
+    private final int pushedLimit;
+
+    private boolean headerRead = false;
+    private boolean isCoordinateSorted = false;
+    private Statistics cachedStatistics = null;
+    private SortOrder[] cachedOrdering = null;
 
     BamScan(CaseInsensitiveStringMap options,
             StructType requiredSchema,
@@ -84,8 +99,20 @@ public class BamScan implements Scan, Batch {
             int pushedStart,
             int pushedEnd,
             boolean isCram) {
-        log.trace("BamScan(includeAttributes={}, pushedReferenceName={}, pushedStart={}, pushedEnd={}, isCram={})",
-                includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram);
+        this(options, requiredSchema, includeAttributes, pushedReferenceName,
+             pushedStart, pushedEnd, isCram, Integer.MAX_VALUE);
+    }
+
+    BamScan(CaseInsensitiveStringMap options,
+            StructType requiredSchema,
+            boolean includeAttributes,
+            String pushedReferenceName,
+            int pushedStart,
+            int pushedEnd,
+            boolean isCram,
+            int pushedLimit) {
+        log.trace("BamScan(incAttr={}, ref={}, start={}, end={}, cram={}, limit={})",
+                includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit);
         this.options = options;
         this.requiredSchema = requiredSchema;
         this.includeAttributes = includeAttributes;
@@ -93,6 +120,7 @@ public class BamScan implements Scan, Batch {
         this.pushedStart = pushedStart;
         this.pushedEnd = pushedEnd;
         this.isCram = isCram;
+        this.pushedLimit = pushedLimit;
     }
 
     // -------------------------------------------------------------------------
@@ -114,6 +142,47 @@ public class BamScan implements Scan, Batch {
     public Batch toBatch() {
         log.trace("toBatch()");
         return this;
+    }
+
+    @Override
+    public Statistics estimateStatistics() {
+        if (cachedStatistics != null) return cachedStatistics;
+        try {
+            Configuration conf = SparkSession.builder().getOrCreate()
+                    .sessionState().newHadoopConf();
+            long total = 0;
+            for (FileStatus fs : resolveFiles(options, conf)) {
+                total += fs.getLen();
+            }
+            final long size = total;
+            cachedStatistics = new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.of(size); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        } catch (IOException e) {
+            cachedStatistics = new Statistics() {
+                public OptionalLong sizeInBytes() { return OptionalLong.empty(); }
+                public OptionalLong numRows()     { return OptionalLong.empty(); }
+            };
+        }
+        return cachedStatistics;
+    }
+
+    @Override
+    public SortOrder[] outputOrdering() {
+        if (cachedOrdering != null) return cachedOrdering;
+        Configuration conf = SparkSession.builder().getOrCreate()
+                .sessionState().newHadoopConf();
+        ensureHeaderRead(conf);
+        if (!isCoordinateSorted) {
+            cachedOrdering = new SortOrder[0];
+        } else {
+            cachedOrdering = new SortOrder[]{
+                SortValue.apply(FieldReference.apply("referenceName"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
+                SortValue.apply(FieldReference.apply("start"),         SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
+            };
+        }
+        return cachedOrdering;
     }
 
     // -------------------------------------------------------------------------
@@ -138,10 +207,12 @@ public class BamScan implements Scan, Batch {
 
         Configuration hadoopConf = SparkSession.builder().getOrCreate()
                 .sessionState().newHadoopConf();
+        ensureHeaderRead(hadoopConf);
 
         List<BamInputPartition> partitions = new ArrayList<>();
         try {
-            for (Path filePath : resolveBamFiles(pathStr, hadoopConf)) {
+            for (FileStatus fileStatus : resolveFiles(options, hadoopConf)) {
+                Path filePath = fileStatus.getPath();
                 String fileUri = filePath.toUri().toString();
                 String indexPath = useIndex ? resolveIndexPath(filePath, hadoopConf) : null;
                 boolean isSam = fileUri.toLowerCase().endsWith(".sam");
@@ -193,6 +264,19 @@ public class BamScan implements Scan, Batch {
         } catch (IOException e) {
             String fmt = isCram ? "CRAM" : "BAM";
             throw new RuntimeException("Failed to plan " + fmt + " input partitions for path: " + pathStr, e);
+        }
+
+        // Limit pushdown: when no region was pushed and a limit is active, keep only the first
+        // one or two partitions (first reference group + unmapped) and apply rowLimit.
+        if (pushedLimit < Integer.MAX_VALUE && pushedReferenceName == null && !partitions.isEmpty()) {
+            int keep = Math.min(2, partitions.size());
+            List<BamInputPartition> limited = new ArrayList<>(keep);
+            for (int i = 0; i < keep; i++) {
+                limited.add(partitions.get(i).withRowLimit(pushedLimit));
+            }
+            log.trace("planInputPartitions() limit={} -> trimming {} -> {} partition(s)",
+                    pushedLimit, partitions.size(), limited.size());
+            return limited.toArray(new InputPartition[0]);
         }
 
         log.trace("planInputPartitions() -> {} partition(s)", partitions.size());
@@ -528,14 +612,52 @@ public class BamScan implements Scan, Batch {
     }
 
     // -------------------------------------------------------------------------
+    // Header helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lazily opens the first resolved file, reads the {@link SAMFileHeader}, and sets
+     * {@link #isCoordinateSorted}. Idempotent — subsequent calls are no-ops.
+     */
+    private void ensureHeaderRead(Configuration conf) {
+        if (headerRead) return;
+        headerRead = true;
+        try {
+            List<FileStatus> files = resolveFiles(options, conf);
+            if (files.isEmpty()) return;
+            Path filePath = files.get(0).getPath();
+            // No index → full sequential scan, no global ordering guarantee.
+            boolean hasIndex = resolveIndexPath(filePath, conf) != null;
+            FileSystem fs = filePath.getFileSystem(conf);
+            long fileLen = fs.getFileStatus(filePath).getLen();
+            try (FSDataInputStream stream = fs.open(filePath)) {
+                HadoopSeekableStream seekable = new HadoopSeekableStream(
+                        stream, fileLen, filePath.toUri().toString());
+                SamReaderFactory factory = SamReaderFactory.makeDefault()
+                        .validationStringency(ValidationStringency.LENIENT);
+                try (SamReader reader = factory.open(SamInputResource.of(seekable))) {
+                    SAMFileHeader header = reader.getFileHeader();
+                    isCoordinateSorted = hasIndex &&
+                            header.getSortOrder() == SAMFileHeader.SortOrder.coordinate;
+                    log.trace("ensureHeaderRead() sortOrder={} hasIndex={} isCoordinateSorted={}",
+                            header.getSortOrder(), hasIndex, isCoordinateSorted);
+                }
+            }
+        } catch (IOException e) {
+            log.debug("ensureHeaderRead() failed to read header", e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // File resolution helpers
     // -------------------------------------------------------------------------
 
-    private List<Path> resolveBamFiles(String pathStr, Configuration conf) throws IOException {
-        log.trace("resolveBamFiles(pathStr={})", pathStr);
+    List<FileStatus> resolveFiles(CaseInsensitiveStringMap options, Configuration conf) throws IOException {
+        String pathStr = options.get("path");
+        log.trace("resolveFiles(pathStr={})", pathStr);
         Path hadoopPath = new Path(pathStr);
         FileSystem fs = hadoopPath.getFileSystem(conf);
-        List<Path> result = new ArrayList<>();
+        List<FileStatus> result = new ArrayList<>();
 
         FileStatus[] statuses = fs.globStatus(hadoopPath);
         if (statuses != null && statuses.length == 1 && statuses[0].isDirectory()) {
@@ -545,25 +667,25 @@ public class BamScan implements Scan, Batch {
                 if (s.isDirectory()) {
                     collectBamChildren(fs, s.getPath(), result);
                 } else if (isAcceptedExtension(s.getPath())) {
-                    result.add(s.getPath());
+                    result.add(s);
                 }
             }
         }
 
         if (result.isEmpty()) {
             // Treat path as a literal file (lets htsjdk detect format by magic bytes)
-            result.add(hadoopPath);
+            result.add(fs.getFileStatus(hadoopPath));
         }
-        log.trace("resolveBamFiles() -> {} file(s)", result.size());
+        log.trace("resolveFiles() -> {} file(s)", result.size());
         return result;
     }
 
-    private void collectBamChildren(FileSystem fs, Path dir, List<Path> result) throws IOException {
+    private void collectBamChildren(FileSystem fs, Path dir, List<FileStatus> result) throws IOException {
         log.trace("collectBamChildren(dir={})", dir);
         for (FileStatus s : fs.listStatus(dir)) {
             if (!s.isDirectory() && isAcceptedExtension(s.getPath())) {
                 log.trace("collectBamChildren() found {}", s.getPath());
-                result.add(s.getPath());
+                result.add(s);
             }
         }
     }

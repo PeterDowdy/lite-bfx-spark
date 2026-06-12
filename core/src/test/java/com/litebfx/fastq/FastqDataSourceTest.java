@@ -542,4 +542,31 @@ class FastqDataSourceTest {
         long count = spark.read().format("fastq").load(dir.toUri().toString()).count();
         assertEquals(2L, count);
     }
+
+    // -------------------------------------------------------------------------
+    // Statistics (SupportsReportStatistics)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void estimateStatistics_sizeInBytes_greaterThanZero() {
+        Dataset<Row> df = spark.read().format("fastq").load(realGzipPath);
+        long sizeBytes = df.queryExecution().optimizedPlan()
+                .stats().sizeInBytes().longValue();
+        assertTrue(sizeBytes > 0, "sizeInBytes should be > 0 for a non-empty FASTQ file");
+        assertTrue(sizeBytes <= new java.io.File(java.nio.file.Paths.get(
+                java.net.URI.create(realGzipPath)).toString()).length() * 2,
+                "sizeInBytes should be within 2x of the actual file size");
+    }
+
+    // -------------------------------------------------------------------------
+    // Limit pushdown (SupportsPushDownLimit)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void limit_pushdown_returnsExactCount() {
+        Dataset<Row> df = spark.read().format("fastq").load(realGzipPath).limit(5);
+        assertEquals(5L, df.count(), "limit(5) should return exactly 5 rows");
+        assertEquals(1, df.rdd().getNumPartitions(),
+                "limit pushdown should restrict planning to 1 partition");
+    }
 }

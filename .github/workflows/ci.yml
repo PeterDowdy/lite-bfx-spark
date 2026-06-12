@@ -271,9 +271,7 @@ jobs:
     needs: test
     if: github.event_name == 'push'
     # Requires secrets: OSSRH_USERNAME, OSSRH_TOKEN, GPG_PRIVATE_KEY, GPG_PASSPHRASE.
-    # The "Check Central Portal connectivity" step below provides fast-fail when
-    # secrets are absent or wrong — it exits with a non-zero status before the
-    # signing step runs.  Configure these secrets before merging to main.
+    # Configure these secrets before merging to main.
 
     steps:
       - uses: actions/checkout@v6.0.2
@@ -304,19 +302,6 @@ jobs:
             --add-opens=java.base/sun.security.action=ALL-UNNAMED \
             --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
             -Xmx2g" >> "$GITHUB_ENV"
-
-      # Fail fast if credentials are wrong or the Portal is unreachable before
-      # spending time on the full build + signing cycle.
-      - name: Check Central Portal connectivity
-        run: |
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -u "$OSSRH_USERNAME:$OSSRH_TOKEN" \
-            "https://central.sonatype.com/api/v1/publisher/deployments?page=0&size=1")
-          echo "Central Portal HTTP status: $HTTP"
-          [ "$HTTP" = "200" ] || { echo "Cannot reach Central Portal (HTTP $HTTP)"; exit 1; }
-        env:
-          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
-          OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
 
       # Central Portal rejects SNAPSHOT versions, so stamp a unique version
       # derived from the commit SHA.  The 0.0.0 prefix keeps it clearly

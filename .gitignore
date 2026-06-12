@@ -1,3 +1,5 @@
+# Build output and IDE artifacts excluded from version control.
+
 # Maven
 target/
 dependency-reduced-pom.xml
