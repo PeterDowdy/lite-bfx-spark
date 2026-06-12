@@ -75,14 +75,14 @@ jobs:
 
       # Import the GPG key so maven-gpg-plugin can sign artifacts.
       # The key is stored as a repository secret and piped into gpg --import.
+      # Loopback pinentry lets the Maven GPG plugin supply the passphrase via
+      # -Dgpg.passphrase without a tty or ownertrust setup.
       - name: Import GPG key
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          # Trust the key fully so gpg doesn't prompt during signing.
-          # gpg --import-ownertrust requires the full 40-char fingerprint (fpr
-          # record, field 10), not the short key ID (sec record, field 5).
-          GPG_FPR=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
-          echo "$GPG_FPR:6:" | gpg --import-ownertrust
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpg-connect-agent reloadagent /bye || true
 
       # Write a Maven settings.xml that supplies the Sonatype Central Portal
       # credentials under the server id "central" (referenced by the
@@ -115,7 +115,8 @@ jobs:
           mvn --batch-mode deploy \
             -Prelease \
             -Pspark402 \
-            -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}"
+            -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}" \
+            -Dgpg.gpgArguments="--pinentry-mode loopback"
         env:
           OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
           OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
