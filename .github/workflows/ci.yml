@@ -316,8 +316,9 @@ jobs:
       - name: Import GPG key
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5}' | head -1)
-          echo "$GPG_KEY_ID:6:" | gpg --import-ownertrust
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpg-connect-agent reloadagent /bye || true
 
       - name: Configure Maven settings
         run: |
@@ -345,7 +346,8 @@ jobs:
             -Pstaging \
             -Pspark402 \
             -DskipTests \
-            -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}"
+            -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}" \
+            -Dgpg.gpgArguments="--pinentry-mode loopback"
         env:
           OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
           OSSRH_TOKEN: ${{ secrets.OSSRH_TOKEN }}
