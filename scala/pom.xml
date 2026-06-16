@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>com.litebfx</groupId>
+    <groupId>io.github.peterdowdy</groupId>
     <artifactId>lite-bfx-spark-parent</artifactId>
     <version>1.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
@@ -14,10 +14,14 @@
 
   <artifactId>lite-bfx-spark-scala_2.13</artifactId>
 
+  <name>lite-bfx-spark-scala</name>
+  <description>Scala API for lite-bfx-spark: native Apache Spark 4.x DataSource V2 readers for BAM, SAM, CRAM, FASTQ, VCF, BCF, FASTA, and BED.</description>
+  <url>https://github.com/PeterDowdy/lite-bfx-spark</url>
+
   <dependencies>
     <!-- Java core — merged into the fat JAR by maven-shade-plugin -->
     <dependency>
-      <groupId>com.litebfx</groupId>
+      <groupId>io.github.peterdowdy</groupId>
       <artifactId>lite-bfx-spark</artifactId>
       <version>${project.version}</version>
     </dependency>
@@ -43,7 +47,7 @@
     </dependency>
     <!-- Core test-jar: gives access to TestBamGenerator, VcfTestGenerator, etc. -->
     <dependency>
-      <groupId>com.litebfx</groupId>
+      <groupId>io.github.peterdowdy</groupId>
       <artifactId>lite-bfx-spark</artifactId>
       <version>${project.version}</version>
       <classifier>tests</classifier>
@@ -70,8 +74,14 @@
         <executions>
           <execution>
             <goals>
+              <!-- add-source registers src/main/scala so maven-source-plugin's
+                   sources JAR includes the Scala files (required by Central) -->
+              <goal>add-source</goal>
               <goal>compile</goal>
               <goal>testCompile</goal>
+              <!-- doc-jar produces the scaladoc JAR with the javadoc classifier
+                   (required by Central; the Java javadoc plugin is skipped below) -->
+              <goal>doc-jar</goal>
             </goals>
           </execution>
         </executions>
@@ -119,10 +129,11 @@
       </plugin>
 
       <!--
-        Skip javadoc in this module: source is Scala, not Java.
-        The release profile in the parent would otherwise attempt to run
-        maven-javadoc-plugin over the scala/ source tree and fail.
-        Scaladoc is not currently published as a separate artifact.
+        Skip the Java javadoc plugin in this module: source is Scala, not Java.
+        The release/staging profiles in the parent would otherwise run
+        maven-javadoc-plugin over the scala/ source tree and produce nothing.
+        The javadoc-classified JAR required by Central is instead produced by
+        scala-maven-plugin's doc-jar goal above (scaladoc).
       -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

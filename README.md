@@ -166,8 +166,8 @@ df = spark.read.format("bed").load("s3a://bucket/peaks.bed.gz") \
 ### Scala (scala fat JAR)
 
 ```scala
-import com.litebfx.scala.implicits._
-import com.litebfx.scala.GenomicRegion
+import io.github.peterdowdy.litebfx.scala.implicits._
+import io.github.peterdowdy.litebfx.scala.GenomicRegion
 
 // BAM — simple read
 val df = spark.read.bam("dbfs:/mnt/genomics/sample.bam")
@@ -252,7 +252,7 @@ lite-bfx-spark/
 ├── core/                       Java module — lite-bfx-spark.jar
 │   ├── pom.xml
 │   └── src/
-│       ├── main/java/com/litebfx/
+│       ├── main/java/io/github/peterdowdy/litebfx/
 │       │   ├── HadoopSeekableStream.java   htsjdk SeekableStream over FSDataInputStream
 │       │   ├── SerializableConfiguration.java  Hadoop Configuration for Java serialization
 │       │   ├── bam/    BAM / SAM / CRAM DataSource V2
@@ -260,20 +260,20 @@ lite-bfx-spark/
 │       │   ├── vcf/    VCF / BCF DataSource V2
 │       │   ├── fasta/  FASTA DataSource V2
 │       │   └── bed/    BED DataSource V2
-│       ├── test/java/com/litebfx/          JUnit 5 integration tests
-│       ├── test-s3/java/com/litebfx/       S3 range-access tests (MinIO, -Ps3-integration)
-│       ├── test-gcs/java/com/litebfx/      GCS range-access tests (fake-gcs-server, -Pgcs-integration)
-│       ├── test-azure/java/com/litebfx/    Azure range-access tests (Azurite, -Pazure-integration)
+│       ├── test/java/io/github/peterdowdy/litebfx/          JUnit 5 integration tests
+│       ├── test-s3/java/io/github/peterdowdy/litebfx/       S3 range-access tests (MinIO, -Ps3-integration)
+│       ├── test-gcs/java/io/github/peterdowdy/litebfx/      GCS range-access tests (fake-gcs-server, -Pgcs-integration)
+│       ├── test-azure/java/io/github/peterdowdy/litebfx/    Azure range-access tests (Azurite, -Pazure-integration)
 │       └── test/resources/                 Binary fixtures (range.bam, realn01.fa, FASTQ files, …)
 ├── scala/                      Scala wrapper module — lite-bfx-spark-scala_2.13.jar
 │   ├── pom.xml
 │   └── src/
-│       ├── main/scala/com/litebfx/scala/
+│       ├── main/scala/io/github/peterdowdy/litebfx/scala/
 │       │   ├── package.scala           implicits object (single import)
 │       │   ├── GenomicRegion.scala     Typed genomic interval value class
 │       │   ├── DataFrameReaderOps.scala  spark.read.bam/cram/fastq/vcf/fasta/bed(...)
 │       │   └── LiteBfxSpark.scala      Explicit (non-implicit) entry point
-│       └── test/scala/com/litebfx/scala/  ScalaTest suites
+│       └── test/scala/io/github/peterdowdy/litebfx/scala/  ScalaTest suites
 ├── tests/smoke/                Minimal Maven project — SparkSession + SELECT 1
 ├── docker/                     Per-runtime Dockerfiles (spark402, spark411, databricks)
 ├── docker-compose.yml          Test environments + cloud storage sidecars
@@ -335,7 +335,7 @@ Output JARs:
 | `core/target/lite-bfx-spark-1.0-SNAPSHOT.jar` | Java DataSource V2 + shaded htsjdk | Python, Java, PySpark |
 | `scala/target/lite-bfx-spark-scala_2.13-1.0-SNAPSHOT.jar` | Scala API + core (merged) | Scala, notebooks |
 
-Both JARs are self-contained — htsjdk is shaded under `com.litebfx.shaded.htsjdk` and Guava under `com.litebfx.shaded.guava` to avoid classpath conflicts on Databricks. Spark and Hadoop are excluded (`provided` scope) and must be present in the cluster runtime.
+Both JARs are self-contained — htsjdk is shaded under `io.github.peterdowdy.litebfx.shaded.htsjdk` and Guava under `io.github.peterdowdy.litebfx.shaded.guava` to avoid classpath conflicts on Databricks. Spark and Hadoop are excluded (`provided` scope) and must be present in the cluster runtime.
 
 ---
 
@@ -484,5 +484,5 @@ spark.hadoop.fs.gs.auth.service.account.enable=true
 | FASTA splitting | FAI | One contig per partition; `IndexedFastaSequenceFile.getSequence()` for random access |
 | FASTQ splitting | Byte-range + `@` boundary scan | No standard seekable index; readers align to the next record header |
 | Filesystem | Hadoop `FileSystem` | One abstraction covers local, HDFS, S3, ADLS, GCS, DBFS, Unity Catalog Volumes |
-| Shading | htsjdk → `com.litebfx.shaded.htsjdk`, Guava → `com.litebfx.shaded.guava` | Eliminates version conflicts with Databricks Runtime's bundled libraries |
+| Shading | htsjdk → `io.github.peterdowdy.litebfx.shaded.htsjdk`, Guava → `io.github.peterdowdy.litebfx.shaded.guava` | Eliminates version conflicts with Databricks Runtime's bundled libraries |
 | Scala API | Separate `scala/` module | Clean separation of Scala binary-version concerns from the Java core |

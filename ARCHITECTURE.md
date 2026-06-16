@@ -39,7 +39,7 @@ The same chain exists for every format: `{Vcf,Fastq,Fasta,Bed}{DataSource,Table,
 pom.xml                    ← parent; Spark profile sets spark/hadoop/scala versions
 core/                      ← Java-only library JAR (published to Maven Central)
 │   pom.xml                ← shades htsjdk + Guava; three cloud integration profiles
-│   src/main/java/com/litebfx/
+│   src/main/java/io/github/peterdowdy/litebfx/
 │   │   HadoopSeekableStream.java
 │   │   SerializableConfiguration.java
 │   │   bam/   vcf/   fastq/   fasta/   bed/
@@ -48,7 +48,7 @@ core/                      ← Java-only library JAR (published to Maven Central
 │   src/test-gcs/          ← compiled only with -Pgcs-integration
 │   src/test-azure/        ← compiled only with -Pazure-integration
 scala/                     ← Scala API fat JAR (embeds core via shade merge)
-    src/main/scala/com/litebfx/scala/
+    src/main/scala/io/github/peterdowdy/litebfx/scala/
         package.scala          ← implicits wiring
         GenomicRegion.scala    ← typed interval value object
         DataFrameReaderOps.scala
@@ -318,8 +318,8 @@ This propagates S3A endpoints, IAM credentials, ADLS service principals, and GCS
 
 | Original | Relocated to |
 |---|---|
-| `htsjdk.*` | `com.litebfx.shaded.htsjdk.*` |
-| `com.google.common.*` (Guava) | `com.litebfx.shaded.guava.*` |
+| `htsjdk.*` | `io.github.peterdowdy.litebfx.shaded.htsjdk.*` |
+| `com.google.common.*` (Guava) | `io.github.peterdowdy.litebfx.shaded.guava.*` |
 
 Spark and Hadoop jars are excluded from the shade (they are `provided`-scope dependencies).
 

@@ -9,8 +9,8 @@ The `lite-bfx-spark-scala_2.13` module provides a Spark-idiomatic Scala API over
 Add a single import to bring all extension methods into scope:
 
 ```scala
-import com.litebfx.scala.implicits._
-import com.litebfx.scala.GenomicRegion   // if using typed regions
+import io.github.peterdowdy.litebfx.scala.implicits._
+import io.github.peterdowdy.litebfx.scala.GenomicRegion   // if using typed regions
 ```
 
 This follows the same opt-in pattern as `spark.implicits._`. The import wires two implicit conversions:
@@ -259,8 +259,8 @@ val region = LiteBfxSpark.region("chr1", 1000, 5000)
 The explicit (non-implicit) entry point. Use this if you want to avoid wildcard imports, or when calling the Scala API from Java.
 
 ```scala
-import com.litebfx.scala.LiteBfxSpark
-import com.litebfx.scala.GenomicRegion
+import io.github.peterdowdy.litebfx.scala.LiteBfxSpark
+import io.github.peterdowdy.litebfx.scala.GenomicRegion
 ```
 
 ### Methods
@@ -306,7 +306,7 @@ val df = LiteBfxSpark.readRegion(
 The reader extension methods return a `DataFrame`, so standard Spark operations chain naturally:
 
 ```scala
-import com.litebfx.scala.implicits._
+import io.github.peterdowdy.litebfx.scala.implicits._
 
 val highQualReads = spark.read
   .bam("s3a://bucket/cohort/", indexDir = Some("s3a://idx/cohort/"))
@@ -329,8 +329,8 @@ The fat Scala JAR includes the DataSource V2 implementation, so `format("bam")` 
 
 ```scala
 // Databricks notebook (Scala)
-import com.litebfx.scala.implicits._
-import com.litebfx.scala.GenomicRegion
+import io.github.peterdowdy.litebfx.scala.implicits._
+import io.github.peterdowdy.litebfx.scala.GenomicRegion
 
 val df = spark.read.bam("dbfs:/mnt/genomics/sample.bam")
 df.filter("referenceName = 'chr1' AND start >= 1000000 AND start <= 2000000").show()

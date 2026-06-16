@@ -7,7 +7,7 @@
   </Appenders>
   <Loggers>
     <!-- Enable TRACE for HadoopSeekableStream to cover isTraceEnabled() branches -->
-    <Logger name="com.litebfx.HadoopSeekableStream" level="TRACE" additivity="false">
+    <Logger name="io.github.peterdowdy.litebfx.HadoopSeekableStream" level="TRACE" additivity="false">
       <AppenderRef ref="Console"/>
     </Logger>
     <Root level="WARN">
