@@ -14,6 +14,10 @@
 
   <artifactId>lite-bfx-spark</artifactId>
 
+  <name>lite-bfx-spark</name>
+  <description>Native Apache Spark 4.x DataSource V2 readers for BAM, SAM, CRAM, FASTQ, VCF, BCF, FASTA, and BED.</description>
+  <url>https://github.com/PeterDowdy/lite-bfx-spark</url>
+
   <dependencies>
     <dependency>
       <groupId>org.apache.spark</groupId>
