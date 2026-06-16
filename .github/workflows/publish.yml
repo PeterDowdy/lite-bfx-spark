@@ -10,8 +10,8 @@ name: Publish
 #   GPG_PASSPHRASE    — Passphrase for the GPG key
 #
 # The workflow publishes two artifacts to Maven Central:
-#   com.litebfx:lite-bfx-spark              (Java core fat JAR)
-#   com.litebfx:lite-bfx-spark-scala_2.13  (Scala fat JAR, includes core)
+#   io.github.peterdowdy:lite-bfx-spark              (Java core fat JAR)
+#   io.github.peterdowdy:lite-bfx-spark-scala_2.13  (Scala fat JAR, includes core)
 #
 # Each artifact is accompanied by a sources JAR, a javadoc JAR, and GPG
 # signatures on all four files — the minimum required by Maven Central.

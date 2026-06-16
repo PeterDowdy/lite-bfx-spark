@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>com.litebfx</groupId>
+    <groupId>io.github.peterdowdy</groupId>
     <artifactId>lite-bfx-spark-parent</artifactId>
     <version>1.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
@@ -260,11 +260,11 @@
               <relocations>
                 <relocation>
                   <pattern>htsjdk</pattern>
-                  <shadedPattern>com.litebfx.shaded.htsjdk</shadedPattern>
+                  <shadedPattern>io.github.peterdowdy.litebfx.shaded.htsjdk</shadedPattern>
                 </relocation>
                 <relocation>
                   <pattern>com.google.common</pattern>
-                  <shadedPattern>com.litebfx.shaded.guava</shadedPattern>
+                  <shadedPattern>io.github.peterdowdy.litebfx.shaded.guava</shadedPattern>
                 </relocation>
               </relocations>
               <artifactSet>

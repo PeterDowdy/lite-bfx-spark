@@ -62,8 +62,8 @@ Every existing Spark genomics library is either abandoned or architecturally loc
 === "Scala"
 
     ```scala
-    import com.litebfx.scala.implicits._
-    import com.litebfx.scala.GenomicRegion
+    import io.github.peterdowdy.litebfx.scala.implicits._
+    import io.github.peterdowdy.litebfx.scala.GenomicRegion
 
     // BAM — simple read
     val df = spark.read.bam("s3a://data/sample.bam")

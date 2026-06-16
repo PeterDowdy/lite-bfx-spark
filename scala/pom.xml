@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>com.litebfx</groupId>
+    <groupId>io.github.peterdowdy</groupId>
     <artifactId>lite-bfx-spark-parent</artifactId>
     <version>1.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
@@ -21,7 +21,7 @@
   <dependencies>
     <!-- Java core — merged into the fat JAR by maven-shade-plugin -->
     <dependency>
-      <groupId>com.litebfx</groupId>
+      <groupId>io.github.peterdowdy</groupId>
       <artifactId>lite-bfx-spark</artifactId>
       <version>${project.version}</version>
     </dependency>
@@ -47,7 +47,7 @@
     </dependency>
     <!-- Core test-jar: gives access to TestBamGenerator, VcfTestGenerator, etc. -->
     <dependency>
-      <groupId>com.litebfx</groupId>
+      <groupId>io.github.peterdowdy</groupId>
       <artifactId>lite-bfx-spark</artifactId>
       <version>${project.version}</version>
       <classifier>tests</classifier>
