@@ -3,7 +3,7 @@
 BAM, SAM, and CRAM are the standard formats for storing aligned sequencing reads. All three formats share an identical Spark schema. Format detection is automatic: htsjdk reads the file magic bytes and selects the correct decoder regardless of the file extension.
 
 - **BAM** — binary, BGZF-compressed. Indexed by `.bai`.
-- **SAM** — plain text. No index possible; always reads as a single partition.
+- **SAM** — plain text. No index possible; split into fixed-size line-based byte-range partitions.
 - **CRAM** — reference-compressed. Indexed by `.cram.crai`. Requires an external FASTA reference for full sequence decoding.
 
 ---
@@ -52,7 +52,7 @@ df = spark.read.format("bam") \
     .option("indexDir", "s3a://idx/cohort/") \
     .load("s3a://bucket/cohort/")
 
-# Disable index lookup (single partition, full scan)
+# Disable index lookup (BGZF-split partitions, no BAI seek)
 df = spark.read.format("bam") \
     .option("useIndex", "false") \
     .load("s3a://bucket/sample.bam")
@@ -213,7 +213,7 @@ Region filters in the `WHERE` clause trigger the same BAI/CRAI-guided partition 
 | `numPartitions` | `200` | Maximum partitions per file for index-guided splitting. For BAM + BAI: references are grouped into `min(numPartitions, numRefs)` partitions plus one unmapped partition. For CRAM (with or without CRAI): containers are grouped into `min(numPartitions, numContainers)` partitions. Has no effect when a region filter is pushed. Unindexed BAM files use `bgzfSplitSize` instead. |
 | `bgzfSplitSize` | `134217728` (128 MB) | Byte size of each BGZF-split partition for unindexed BAM files. Has no effect when a BAI index is found or when `useIndex` is false. |
 | `samSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for SAM files. Has no effect for BAM or CRAM. |
-| `useIndex` | `true` | Set `false` to skip index resolution. For BAM this forces a single BGZF-split scan. For CRAM this falls back to container header scanning (still multi-partition, but without seeking via CRAI). |
+| `useIndex` | `true` | Set `false` to skip index resolution. For BAM this forces the BGZF-split path (multiple byte-range partitions, no BAI seek). For CRAM this falls back to container header scanning (still multi-partition, but without seeking via CRAI). |
 | `referenceFile` | — | CRAM only. Path to FASTA reference (`.fai` must be co-located). |
 | `referenceMode` | `"file"` / `"none"` | CRAM only. Controls how the CRAM decoder resolves reference sequences. |
 
