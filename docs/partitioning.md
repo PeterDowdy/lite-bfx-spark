@@ -6,7 +6,7 @@ This document explains how lite-bfx-spark plans Spark partitions, uses genomics 
 
 ## Overview
 
-A Spark partition in this library is a `(filePath, byteRange, queryParams, hadoopConf)` tuple. Each executor opens the file at the given path, seeks to the byte range using the Hadoop `FileSystem`, and iterates records until the range is exhausted. The planning of these partitions — how many there are, which byte ranges they cover — is driven by the genomics index for each format.
+A Spark partition in this library is a `(filePath, byteRange, queryParams, hadoopConf)` tuple. Each executor opens the file at the given path, seeks to the byte range using the Hadoop `FileSystem`, and iterates records until the range is exhausted. When a genomics index is present it drives the plan — how many partitions there are and which byte ranges they cover. When no index is present, the file is still split for parallelism: by byte range (BAM, SAM, plain-text VCF/BED) or by a lightweight container-header scan (CRAM). An index-free split gives **read parallelism but no I/O reduction** — the whole file is read across the union of partitions.
 
 The core insight is that genomics index formats (BAI, CRAI, tabix) map genomic coordinates to **virtual file offsets (VFOs)** within the BGZF-compressed file. By reading the index on the driver, the scan planner can translate a genomic query into a set of byte ranges, one per Spark partition, without reading any alignment data.
 
@@ -40,15 +40,43 @@ When the query planner receives a filter like `referenceName = 'chr17' AND start
 
 VFO-based splitting is disabled when a region filter is active — there is no benefit to splitting across references when only one region is requested.
 
-### When no BAI is present
+### When no BAI is present (BGZF block-range splitting)
 
-A single partition covering `[0, Long.MAX_VALUE]` is created. The executor reads the entire BAM file sequentially.
+An unindexed BAM is no longer read in a single partition — it is split into fixed-size byte chunks of `bgzfSplitSize` (default 128 MiB), producing `ceil(fileSize / bgzfSplitSize)` partitions. This count is **not** capped by `numPartitions`. The same path is taken when `useIndex=false`.
+
+Chunk boundaries are computed arithmetically (`i × bgzfSplitSize`) rather than aligned to real BGZF block offsets. This is deliberate: enumerating block offsets would require the driver to scan the entire file sequentially — thousands of seeks on object storage — just to build the partition plan. Instead each executor orients itself locally. `BamPartitionReader` calls `findNextBgzfBlockStart`, which reads at most `MAX_COMPRESSED_BLOCK_SIZE + 4 ≈ 65 KB` (one HTTP Range request) to locate the next BGZF magic bytes, then probes the decompressed content for a valid BAM record-body length before iterating to the next chunk boundary.
+
+```
+unindexed sample.bam (600 MiB), bgzfSplitSize=128 MiB:
+  Partition 0: bytes [0, 128M)    → scan forward to first clean record ≥ 0
+  Partition 1: bytes [128M, 256M) → scan forward to first clean record ≥ 128M
+  …
+  Partition 4: bytes [512M, EOF)  → reads to end of file
+```
+
+A record straddling a chunk boundary is claimed by exactly one partition (the one whose range contains its start), so the split is lossless. Setting `bgzfSplitSize` below the maximum BGZF block size (~65 KB) is counterproductive — many chunks scan ~65 KB only to find no clean record start and yield zero rows. There is no correctness risk, but throughput degrades; the 128 MiB default suits typical WGS BAMs.
 
 ---
 
-## CRAM: CRAI-based splitting
+## CRAM: container-level splitting
 
-CRAI (CRAM index) files store per-container offset information. The splitting logic mirrors the BAI approach: the scan reads CRAI entries on the driver and maps them to `BamInputPartition` byte ranges. Executors use htsjdk's CRAM reader with the pre-computed VFOs to skip to the relevant containers.
+### When a CRAI is present
+
+CRAI (CRAM index) files store per-container offset information. The scan reads the CRAI on the driver (a small gzip-compressed text file), deduplicates the container byte offsets, and distributes them into at most `numPartitions` contiguous groups. Each partition carries a `[start, end]` container byte-span that the reader passes to htsjdk's `CRAMIterator`, so executors decode only the containers in their assigned span.
+
+### When a region filter is pushed
+
+A single partition is planned with the pushed region; the reader issues a CRAI-guided query for `(ref, start, end)`, mirroring the BAM region-pushdown path.
+
+### When no CRAI is present (container header scan)
+
+An unindexed CRAM is split by container without an index. The driver makes one lightweight pass over the file reading only container *headers* via htsjdk's `CramContainerHeaderIterator` (no record decoding), collecting each container's byte offset. Those offsets are distributed into at most `numPartitions` groups exactly as in the CRAI case. Unlike unindexed BAM, this requires a sequential header pass on the driver — cheap, since only headers are read — and yields balanced, container-aligned partitions. The same path is taken when `useIndex=false`.
+
+---
+
+## SAM: line-based byte-range splitting
+
+SAM is plain text with no BGZF framing and no index format, so blocks cannot be located by magic bytes. The file is divided into fixed-size chunks of `samSplitSize` (default 128 MiB), producing `ceil(fileSize / samSplitSize)` partitions (not capped by `numPartitions`). Each executor seeks to its chunk boundary, discards bytes up to the next newline to land on a clean line start, and parses SAM text lines (via `SAMLineParser`) until the next line would begin at or past its chunk end. Chunks containing no data lines produce zero rows. A pushed region filter cannot reduce I/O — there is no index — so Spark applies it as a post-filter over every partition's output.
 
 ---
 
@@ -166,7 +194,10 @@ This is why reads from `s3a://`, `abfss://`, or `gs://` paths work transparently
 
 ```
 BAM (with BAI):              min(numPartitions, numReferences) + 1 unmapped partition
-CRAM (with CRAI):            number of CRAI entries (not capped — each container is one partition)
+BAM (no BAI):                ceil(fileSize / bgzfSplitSize)        — not capped by numPartitions
+SAM:                         ceil(fileSize / samSplitSize)         — not capped by numPartitions
+CRAM (with CRAI):            min(numPartitions, numContainers)
+CRAM (no CRAI):              min(numPartitions, numContainers)     — offsets from header scan
 VCF .vcf.gz (tabix, no filter): min(numPartitions, numChroms)
 VCF .vcf.gz (tabix, filter): 1 per pushed region query
 VCF .vcf.gz (no index):      1 (full-file scan)
@@ -180,5 +211,7 @@ FASTQ (uncompressed):        min(numPartitions, ceil(fileSize / minSplitBytes))
 ```
 
 Setting `numPartitions` higher than the number of references in a BAM has no effect — you cannot have more partitions than references. Setting it lower groups references together, reducing parallelism but also reducing the number of BAI seeks and task overhead.
+
+`numPartitions` caps **index-guided** and container splits (BAM reference groups, CRAM container groups, tabix chromosome groups). It does **not** cap the byte-range splits of an unindexed BAM or a SAM file — those are governed solely by `bgzfSplitSize` / `samSplitSize`. To bound the partition count of a large unindexed BAM, raise `bgzfSplitSize`.
 
 For a cohort of many small BAM files, the total partition count is the sum across all files. A directory of 100 BAM files with 25 references each and `numPartitions=200` would produce up to 2,600 partitions (100 files × 26 partitions each).

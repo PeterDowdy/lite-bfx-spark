@@ -137,23 +137,26 @@ Format-specific fields are mapped to Spark types once per record; no intermediat
 
 ### BAM/CRAM — `BamScan.planInputPartitions()`
 
-The planner chooses among six partition modes in priority order:
+The planner chooses among several partition modes in priority order (`useIndex=false`
+simply forces `indexPath` to null, routing into the no-index branches below):
 
 ```
-indexPath found AND no pushed region
-    ├─ BAM/SAM  →  VFO-based per-reference partitions  (planVfoPartitions)
-    └─ CRAM     →  CRAI container-level partitions       (planCraiPartitions)
-                   or header-scan partitions if no CRAI  (planCramContainerSplitPartitions)
+SAM (any path)
+    └─ line-level byte-range splits                      (planSamSplitPartitions)
 
-indexPath found AND region pushed
-    └─ any      →  single forRegionQuery partition
+BAM, BAI found, no pushed region
+    └─ VFO-based per-reference partitions + unmapped     (planVfoPartitions)
 
-indexPath NOT found AND no pushed region
-    ├─ BAM      →  BGZF block-level byte-range splits    (planBgzfSplitPartitions)
-    └─ SAM      →  line-level byte-range splits           (planSamSplitPartitions)
+BAM, no BAI, no pushed region
+    └─ BGZF block-level byte-range splits                (planBgzfSplitPartitions)
 
-useIndex=false
-    └─ any      →  single forFullScan partition
+CRAM, no pushed region
+    ├─ CRAI found  →  CRAI container-level partitions     (planCraiPartitions)
+    └─ no CRAI     →  header-scan container partitions    (planCramContainerSplitPartitions)
+
+BAM/CRAM, region pushed
+    ├─ index found →  single forRegionQuery partition
+    └─ no index    →  single forFullScan partition
 ```
 
 **VFO-based splitting** (BAM + BAI, most common production case):

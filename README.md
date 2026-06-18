@@ -23,7 +23,7 @@ The library does **not** use Disq or hadoop-bam. Those add transitive dependenci
 | [VCF / BCF](docs/vcf.md) | Schema, tabix pushdown, INFO map, genotypes map, BCF auto-detection |
 | [FASTA](docs/fasta.md) | Schema, FAI-based per-contig partitioning, sequence access |
 | [BED](docs/bed.md) | Schema, BED3–BED12, tabix pushdown, coordinate system |
-| [Partitioning and indexes](docs/partitioning.md) | How VFO-based splitting works, predicate pushdown mechanics, column pruning, numPartitions |
+| [Partitioning and indexes](docs/partitioning.md) | Index-guided (VFO) splitting, index-free splitting of unindexed BAM/CRAM/SAM, predicate pushdown mechanics, column pruning, numPartitions |
 | [Cloud storage](docs/cloud-storage.md) | S3, ADLS Gen2, GCS, DBFS, Unity Catalog Volumes, credential propagation, range-request verification |
 | [Scala API](docs/scala-api.md) | DataFrameReaderOps, GenomicRegion, LiteBfxSpark object, common filter patterns |
 | [Architecture](ARCHITECTURE.md) | DataSource V2 layer diagram, module layout, index strategy, design decisions |
@@ -211,12 +211,13 @@ val df = LiteBfxSpark.readRegion(spark, "s3a://data/sample.bam",
 |---|---|---|---|
 | `indexPath` | — | BAM, CRAM, VCF, FASTA, BED | Explicit index path; single-file reads only |
 | `indexDir` | — | BAM, CRAM, VCF, BED | Directory of index files; resolved as `<dir>/<filename>.<ext>` |
-| `numPartitions` | `200` | BAM, CRAM, VCF, FASTQ | Max partitions per file for index-guided and byte-range splits |
-| `useIndex` | `true` | BAM, CRAM, VCF, BED | Set `false` to skip index lookup and force a single partition |
+| `numPartitions` | `200` | BAM, CRAM, VCF, FASTQ | Max partitions for index-guided splits (BAM reference groups, CRAM container groups, tabix chromosome groups). Does **not** cap byte-range splits of unindexed BAM/SAM |
+| `useIndex` | `true` | BAM, CRAM, VCF, BED | Set `false` to ignore any index. The file is then split by byte range (BAM/SAM) or a container-header scan (CRAM) — not read as a single partition |
 | `vcfSplitSize` | `134217728` | VCF | Byte-range chunk size (bytes) for plain-text VCF splits |
 | `bedSplitSize` | `134217728` | BED | Byte-range chunk size (bytes) for plain-text BED splits |
 | `minSplitBytes` | `67108864` | FASTQ | Minimum partition size (bytes) for uncompressed FASTQ byte-range splits |
-| `bgzfSplitSize` | `134217728` | FASTQ | Compressed-byte chunk size for BGZF `.gz` FASTQ splits |
+| `bgzfSplitSize` | `134217728` | FASTQ, BAM | Compressed-byte chunk size for BGZF splits: `.gz` FASTQ **and** unindexed BAM |
+| `samSplitSize` | `134217728` | SAM | Byte-range chunk size (bytes) for plain-text SAM splits |
 | `referenceFile` | — | CRAM | FASTA reference path; `.fai` must be co-located |
 | `referenceMode` | `file` | CRAM | `file`, `md5` (ENA/NCBI lookup), or `none` |
 
@@ -226,9 +227,11 @@ val df = LiteBfxSpark.readRegion(spark, "s3a://data/sample.bam",
 |---|---|---|
 | BAM | BAI present, no region filter | One per reference group (capped by `numPartitions`), plus unmapped |
 | BAM | BAI present, region filter pushed | Single (BAI-guided range query) |
-| BAM | No BAI | Single |
-| CRAM | CRAI present | One per CRAI entry (capped by `numPartitions`) |
-| CRAM | No CRAI | Single |
+| BAM | No BAI, or `useIndex=false` | BGZF block-range splits (128 MiB default; tune with `bgzfSplitSize`) — see below |
+| SAM | Always (no index format exists) | Line-based byte-range splits (128 MiB default; tune with `samSplitSize`) |
+| CRAM | CRAI present, no region filter | Container groups (capped by `numPartitions`) |
+| CRAM | CRAI present, region filter pushed | Single (CRAI-guided range query) |
+| CRAM | No CRAI, or `useIndex=false` | Container groups from a driver-side header scan (capped by `numPartitions`) — see below |
 | VCF (plain-text `.vcf`) | — | Byte-range splits (128 MiB default; tune with `vcfSplitSize`) |
 | VCF (bgzipped, tabix present, no region filter) | — | One per chromosome group (capped by `numPartitions`) |
 | VCF (bgzipped, tabix present, region filter pushed) | — | Single (tabix-guided range query) |
@@ -241,6 +244,16 @@ val df = LiteBfxSpark.readRegion(spark, "s3a://data/sample.bam",
 | FASTQ (uncompressed) | — | Byte-range splits (min 64 MiB; capped by `numPartitions`) |
 | FASTQ (BGZF `.gz`, file ≥ `bgzfSplitSize`) | — | Byte-range splits at BGZF block boundaries (128 MiB; capped by `numPartitions`) |
 | FASTQ (regular `.gz` or small BGZF) | — | Single (gzip is not seekable) |
+
+#### Splitting non-indexed BAM and CRAM
+
+An unindexed BAM or CRAM is no longer read in a single partition — it is split for parallelism even without an index, and the same path is taken when you set `useIndex=false`.
+
+**BAM without a BAI** is divided into fixed-size byte chunks of `bgzfSplitSize` (default 128 MB), producing `ceil(fileSize / bgzfSplitSize)` partitions. This count is **not** capped by `numPartitions`. Chunk boundaries are computed arithmetically (`i × bgzfSplitSize`) rather than aligned to real BGZF block offsets — deliberately, because enumerating block offsets would force the driver to scan the whole file (thousands of seeks on object storage) just to plan. Instead each executor orients itself locally: it reads at most ~65 KB (one HTTP `Range` request) from its chunk start to find the next BGZF block that begins a clean BAM record, then reads records until the next chunk boundary. A record straddling a boundary is claimed by exactly one partition, so the split is lossless.
+
+**CRAM without a CRAI** is split by container. The driver makes one lightweight pass over the file reading only container *headers* (via htsjdk's `CramContainerHeaderIterator` — no record decoding) to collect container byte offsets, then distributes those containers into at most `numPartitions` contiguous groups. Each executor decodes only the containers in its assigned byte span. This requires a sequential header pass on the driver (cheap — headers only), but yields balanced, container-aligned partitions.
+
+In both cases the entire file is still read across the union of partitions: an index-free split buys **read parallelism, not I/O reduction**. To prune I/O (read only the regions you ask for), supply a `.bai`/`.crai` and push a region filter. Setting `bgzfSplitSize` below the maximum BGZF block size (~65 KB) is counterproductive — many chunks scan ~65 KB only to find no clean record start and yield zero rows; the 128 MB default suits typical WGS BAMs.
 
 ---
 
@@ -478,8 +491,8 @@ spark.hadoop.fs.gs.auth.service.account.enable=true
 | Build | Maven + shade plugin | Bundles htsjdk; avoids classpath conflicts on Databricks |
 | Spark API | DataSource V2 | Proper partitioning, predicate pushdown, column pruning — not available in V1 |
 | Parsing | htsjdk 4.3.0 | Industry standard; single library covers BAM/SAM/CRAM/FASTQ/VCF/BCF/FASTA/BED |
-| BAM splitting | BAI → virtual file offsets | No extra dependencies; htsjdk `BAMFileSpan` chunks map directly to `InputPartition` ranges |
-| CRAM splitting | CRAI → `CRAIEntry` virtual offsets | Analogous to BAI; same `BamInputPartition` class with `isCram=true` |
+| BAM splitting | BAI → virtual file offsets (indexed); BGZF byte-range chunks (unindexed) | htsjdk `BAMFileSpan` chunks map directly to `InputPartition` ranges; unindexed files split into `bgzfSplitSize` chunks with executor-side block alignment |
+| CRAM splitting | CRAI → `CRAIEntry` virtual offsets (indexed); container-header scan (unindexed) | Analogous to BAI; container offsets grouped into `numPartitions` partitions; same `BamInputPartition` class with `isCram=true` |
 | VCF/BED splitting | Tabix (`.tbi` / `.csi`) | Same `TabixIndex` API for both formats |
 | FASTA splitting | FAI | One contig per partition; `IndexedFastaSequenceFile.getSequence()` for random access |
 | FASTQ splitting | Byte-range + `@` boundary scan | No standard seekable index; readers align to the next record header |
