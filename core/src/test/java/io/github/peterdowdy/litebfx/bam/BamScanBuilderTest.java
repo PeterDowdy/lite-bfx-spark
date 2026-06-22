@@ -40,6 +40,10 @@ class BamScanBuilderTest {
         return new CaseInsensitiveStringMap(Map.of("path", "test.bam"));
     }
 
+    private static CaseInsensitiveStringMap samOpts() {
+        return new CaseInsensitiveStringMap(Map.of("path", "test.bam", "columnNames", "sam"));
+    }
+
     private static Predicate eq(String col, String val) {
         return new Predicate("=", new Expression[]{
                 FieldReference.apply(col),
@@ -271,6 +275,30 @@ class BamScanBuilderTest {
                 .add("readName", DataTypes.StringType)
                 .add("start", DataTypes.IntegerType);
         b.pruneColumns(withoutAttrs);
+        assertNotNull(b.build());
+    }
+
+    // -------------------------------------------------------------------------
+    // pushPredicates — SAM column-name mode (columnNames=sam): pushdown on rname/pos
+    // -------------------------------------------------------------------------
+
+    @Test
+    void pushPredicates_samMode_rnamePlusPos_rnamePushedPosUnhandled() {
+        BamScanBuilder b = new BamScanBuilder(samOpts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("rname", "chr1"), gte("pos", 100L)});
+        assertEquals(1, unhandled.length, "pos range should be unhandled");
+        assertEquals(1, b.pushedPredicates().length, "rname equality should be pushed in SAM mode");
+        assertNotNull(b.build());
+    }
+
+    @Test
+    void pushPredicates_samMode_descriptiveNamesNotRecognized() {
+        // In SAM mode the DataFrame uses rname/pos, so the descriptive names are not the
+        // active alignment columns and must not be treated as pushable region predicates.
+        BamScanBuilder b = new BamScanBuilder(samOpts());
+        Predicate[] unhandled = b.pushPredicates(new Predicate[]{eq("referenceName", "chr1"), gte("start", 100L)});
+        assertEquals(2, unhandled.length, "descriptive names should be returned unhandled in SAM mode");
+        assertEquals(0, b.pushedPredicates().length);
         assertNotNull(b.build());
     }
 

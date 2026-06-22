@@ -28,9 +28,63 @@ BAM, SAM, and CRAM are the standard formats for storing aligned sequencing reads
 
 All fields except `flags` can be null for unmapped or partially-specified records.
 
+### Column naming
+
+The alignment columns use descriptive names by default. Set `columnNames` to `sam` to use the
+canonical SAM-spec field names instead — handy when porting queries that already speak SAM:
+
+```python
+df = spark.read.format("bam").option("columnNames", "sam").load("s3a://bucket/sample.bam")
+df.select("qname", "rname", "pos", "mapq").show(5)
+```
+
+| `descriptive` (default) | `sam` |
+|---|---|
+| `readName` | `qname` |
+| `flags` | `flag` |
+| `referenceName` | `rname` |
+| `start` | `pos` |
+| `mappingQuality` | `mapq` |
+| `cigar` | `cigar` |
+| `mateReferenceName` | `rnext` |
+| `mateStart` | `pnext` |
+| `insertSize` | `tlen` |
+| `sequence` | `seq` |
+| `baseQualities` | `qual` |
+| `attributes` | `attributes` *(no SAM-spec equivalent)* |
+| `start0` | `start0` *(no SAM-spec equivalent)* |
+
+Column order, types, and nullability are identical in both modes. Region-filter pushdown works
+with whichever name set is active — filter on `rname`/`pos` in `sam` mode, `referenceName`/`start`
+otherwise. The Scala `bamRegion`/`cramRegion` helpers always use the descriptive names.
+
 > **Coordinate system:** `start` and `mateStart` are **1-based** as defined by the SAM spec. BED `chromStart` is **0-based**. Joining BAM and BED DataFrames directly on `start = chromStart` produces off-by-one errors. Use `start0` (which equals `chromStart` for the same position) or apply `start - 1` explicitly.
 
-**`attributes` column:** Each SAM optional tag (`TAG:TYPE:VALUE`) is stored as a string key and string value, e.g. `NM → "3"`, `RG → "1"`. If you select columns without including `attributes`, the tag map construction is skipped entirely on the executor — useful when attributes are large and not needed.
+**`attributes` column:** Each SAM optional tag is stored under its two-character tag key, with the value encoded as the SAM `TYPE:VALUE` optional-field form so the type is preserved and downstream consumers can parse safely — e.g. `NM → "i:3"`, `RG → "Z:1"`, `mapping quality char → "A:P"`, `AS → "f:0.98"`, and integer arrays as `"B:i,1,2,3"`. To recover a typed value, split on the first `:` to get the SAM type code, then the remainder is the value (for `B` arrays the remainder is `subtype,v1,v2,…`). Integer subtypes (`c/C/s/S/i/I`) collapse to `i` and hex (`H`) tags are rendered as a `B` byte array, matching `samtools view` output. If you select columns without including `attributes`, the tag map construction is skipped entirely on the executor — useful when attributes are large and not needed.
+
+### File metadata (`_metadata`)
+
+A hidden `_metadata` struct column is available on every BAM/SAM/CRAM read, compatible with the
+[Spark/Databricks file-source metadata column](https://docs.databricks.com/en/ingestion/file-metadata-column.html).
+It is not part of the default schema (`SELECT *` excludes it) and must be referenced explicitly:
+
+```python
+df = spark.read.format("bam").load("s3a://bucket/sample.bam")
+df.select("readName", "_metadata.file_path", "_metadata.file_size").show(5, truncate=False)
+df.select("_metadata").printSchema()
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `file_path` | String | Full URI of the source file |
+| `file_name` | String | Final path component (e.g. `sample.bam`) |
+| `file_size` | Long | File length in bytes |
+| `file_modification_time` | Timestamp | Last-modified time of the file |
+
+These four fields use the same names and types as Spark's built-in `_metadata`, so existing
+queries referencing them port over unchanged. The `file_block_start`, `file_block_length`, and
+`row_index` sub-fields are not exposed: byte ranges and row indices have no stable meaning under
+genomic (per-reference / per-container) partitioning.
 
 ---
 
@@ -214,6 +268,7 @@ Region filters in the `WHERE` clause trigger the same BAI/CRAI-guided partition 
 | `bgzfSplitSize` | `134217728` (128 MB) | Byte size of each BGZF-split partition for unindexed BAM files. Has no effect when a BAI index is found or when `useIndex` is false. |
 | `samSplitSize` | `134217728` (128 MB) | Byte size of each line-split partition for SAM files. Has no effect for BAM or CRAM. |
 | `useIndex` | `true` | Set `false` to skip index resolution. For BAM this forces the BGZF-split path (multiple byte-range partitions, no BAI seek). For CRAM this falls back to container header scanning (still multi-partition, but without seeking via CRAI). |
+| `columnNames` | `"descriptive"` | Alignment column names. `"sam"` uses canonical SAM-spec field names (`qname`, `flag`, `rname`, `pos`, `mapq`, `rnext`, `pnext`, `tlen`, `seq`, `qual`); see [Column naming](#column-naming). |
 | `referenceFile` | — | CRAM only. Path to FASTA reference (`.fai` must be co-located). |
 | `referenceMode` | `"file"` / `"none"` | CRAM only. Controls how the CRAM decoder resolves reference sequences. |
 

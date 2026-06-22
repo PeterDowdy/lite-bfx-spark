@@ -86,6 +86,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
     private final int pushedEnd;
     private final boolean isCram;
     private final int pushedLimit;
+    private final boolean includeFileMetadata;
 
     private boolean headerRead = false;
     private boolean isCoordinateSorted = false;
@@ -111,8 +112,22 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
             int pushedEnd,
             boolean isCram,
             int pushedLimit) {
-        log.trace("BamScan(incAttr={}, ref={}, start={}, end={}, cram={}, limit={})",
-                includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit);
+        this(options, requiredSchema, includeAttributes, pushedReferenceName,
+             pushedStart, pushedEnd, isCram, pushedLimit, false);
+    }
+
+    BamScan(CaseInsensitiveStringMap options,
+            StructType requiredSchema,
+            boolean includeAttributes,
+            String pushedReferenceName,
+            int pushedStart,
+            int pushedEnd,
+            boolean isCram,
+            int pushedLimit,
+            boolean includeFileMetadata) {
+        log.trace("BamScan(incAttr={}, ref={}, start={}, end={}, cram={}, limit={}, fileMeta={})",
+                includeAttributes, pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit,
+                includeFileMetadata);
         this.options = options;
         this.requiredSchema = requiredSchema;
         this.includeAttributes = includeAttributes;
@@ -121,6 +136,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
         this.pushedEnd = pushedEnd;
         this.isCram = isCram;
         this.pushedLimit = pushedLimit;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     // -------------------------------------------------------------------------
@@ -135,7 +151,13 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
         // on top when the user selects a subset of columns.
         // The only row-level optimization driven by pruneColumns is skipping
         // attributes map construction when "attributes" is not in the required schema.
-        return BamSchema.SCHEMA;
+        StructType schema = BamSchema.fromOptions(options);
+        // Append the hidden _metadata column when it was referenced (see SupportsMetadataColumns);
+        // the reader produces its value positionally after the data columns.
+        if (includeFileMetadata) {
+            schema = schema.add(BamSchema.METADATA_COLUMN_NAME, BamSchema.FILE_METADATA_TYPE, false);
+        }
+        return schema;
     }
 
     @Override
@@ -608,7 +630,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
     @Override
     public PartitionReaderFactory createReaderFactory() {
         log.trace("createReaderFactory()");
-        return new BamPartitionReaderFactory(includeAttributes);
+        return new BamPartitionReaderFactory(includeAttributes, includeFileMetadata);
     }
 
     // -------------------------------------------------------------------------

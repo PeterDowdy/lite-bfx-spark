@@ -67,6 +67,86 @@ class BamDataSourceTest {
         assertEquals(BamSchema.SCHEMA, schema);
     }
 
+    @Test
+    void columnNamesSam_reportsSamSchemaAndReadsRows() {
+        Dataset<Row> df = spark.read().format("bam")
+                .option("columnNames", "sam")
+                .load(bamPath);
+        assertEquals(BamSchema.SAM_SCHEMA, df.schema());
+        // The SAM-named columns are queryable and the data is unchanged.
+        assertEquals(112L, df.count());
+        // Pick a known mapped read so rname/pos are populated.
+        Row r = df.select("qname", "rname", "pos")
+                .filter("rname = 'CHROMOSOME_I'")
+                .orderBy("pos")
+                .first();
+        assertNotNull(r.getString(0));
+        assertEquals("CHROMOSOME_I", r.getString(1));
+        assertTrue(r.getLong(2) > 0);
+    }
+
+    @Test
+    void columnNamesSam_regionFilterOnRnamePos_pushesDownAndCounts() {
+        // Region pushdown must recognize the SAM-spec column names.
+        long count = spark.read().format("bam")
+                .option("columnNames", "sam")
+                .load(bamPath)
+                .filter("rname = 'CHROMOSOME_I' AND pos >= 1000 AND pos <= 2000")
+                .count();
+        assertEquals(12L, count);
+
+        String plan = spark.read().format("bam")
+                .option("columnNames", "sam")
+                .load(bamPath)
+                .filter("rname = 'CHROMOSOME_I'")
+                .queryExecution().executedPlan().toString();
+        assertFalse(plan.contains("CHROMOSOME_I"),
+                "rname equality should be pushed (absent from physical plan) in SAM mode:\n" + plan);
+    }
+
+    // -------------------------------------------------------------------------
+    // _metadata column (Databricks/Spark file-source compatible)
+    // -------------------------------------------------------------------------
+
+    @Test
+    void metadata_notInDefaultSchema() {
+        StructType schema = spark.read().format("bam").load(bamPath).schema();
+        assertFalse(java.util.Arrays.asList(schema.fieldNames()).contains("_metadata"),
+                "_metadata is a hidden metadata column and must not appear in the default schema");
+    }
+
+    @Test
+    void metadata_filePathNameSizeSelectable() {
+        Row r = spark.read().format("bam").load(bamPath)
+                .selectExpr("_metadata.file_path AS p", "_metadata.file_name AS n",
+                            "_metadata.file_size AS s")
+                .first();
+        assertTrue(r.getString(0).endsWith("range.bam"), "file_path should end with the file name: " + r.getString(0));
+        assertEquals("range.bam", r.getString(1));
+        assertTrue(r.getLong(2) > 0, "file_size should be positive");
+    }
+
+    @Test
+    void metadata_wholeStructSelectable_andDataUnchanged() {
+        Dataset<Row> df = spark.read().format("bam").load(bamPath).select("_metadata");
+        assertEquals(1, df.schema().length());
+        assertEquals("_metadata", df.schema().apply(0).name());
+        StructType meta = (StructType) df.schema().apply(0).dataType();
+        assertEquals("file_path", meta.apply(0).name());
+        assertEquals("file_modification_time", meta.apply(3).name());
+        // Selecting only the metadata column does not change the row count.
+        assertEquals(112L, df.count());
+    }
+
+    @Test
+    void metadata_coexistsWithDataColumns() {
+        Row r = spark.read().format("bam").load(bamPath)
+                .selectExpr("readName", "_metadata.file_name AS n")
+                .first();
+        assertNotNull(r.getString(0));
+        assertEquals("range.bam", r.getString(1));
+    }
+
     // -------------------------------------------------------------------------
     // Full-file count
     // -------------------------------------------------------------------------

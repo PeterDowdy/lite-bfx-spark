@@ -15,15 +15,18 @@ public class BamPartitionReaderFactory implements PartitionReaderFactory {
     private static final Logger log = LoggerFactory.getLogger(BamPartitionReaderFactory.class);
 
     private final boolean includeAttributes;
+    private final boolean includeFileMetadata;
 
-    BamPartitionReaderFactory(boolean includeAttributes) {
-        log.trace("BamPartitionReaderFactory(includeAttributes={})", includeAttributes);
+    BamPartitionReaderFactory(boolean includeAttributes, boolean includeFileMetadata) {
+        log.trace("BamPartitionReaderFactory(includeAttributes={}, includeFileMetadata={})",
+                includeAttributes, includeFileMetadata);
         this.includeAttributes = includeAttributes;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new BamPartitionReader((BamInputPartition) partition, includeAttributes);
+        return new BamPartitionReader((BamInputPartition) partition, includeAttributes, includeFileMetadata);
     }
 }

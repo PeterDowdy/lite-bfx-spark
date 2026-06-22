@@ -30,7 +30,7 @@ public class BamDataSource implements TableProvider, DataSourceRegister {
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
         log.trace("inferSchema(options={})", options);
-        return BamSchema.SCHEMA;
+        return BamSchema.fromOptions(options);
     }
 
     @Override

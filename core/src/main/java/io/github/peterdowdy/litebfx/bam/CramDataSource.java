@@ -24,6 +24,7 @@ import java.util.Map;
  *   <li>{@code indexPath} — explicit path to the CRAI index file</li>
  *   <li>{@code indexDir} — directory to search for a co-located CRAI index</li>
  *   <li>{@code useIndex} — {@code "true"} (default) / {@code "false"}</li>
+ *   <li>{@code columnNames} — {@code "descriptive"} (default) / {@code "sam"} (SAM-spec field names)</li>
  * </ul>
  */
 public class CramDataSource implements TableProvider, DataSourceRegister {
@@ -39,7 +40,7 @@ public class CramDataSource implements TableProvider, DataSourceRegister {
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
         log.trace("inferSchema(options={})", options);
-        return BamSchema.SCHEMA;
+        return BamSchema.fromOptions(options);
     }
 
     @Override
