@@ -199,9 +199,14 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
         if (!isCoordinateSorted) {
             cachedOrdering = new SortOrder[0];
         } else {
+            // Use whichever column names the active schema exposes (descriptive vs. SAM-spec),
+            // otherwise the reported ordering references columns that do not exist in SAM mode.
+            boolean sam = BamSchema.isSamColumnNames(options);
+            String refCol = sam ? "rname" : "referenceName";
+            String startCol = sam ? "pos" : "start";
             cachedOrdering = new SortOrder[]{
-                SortValue.apply(FieldReference.apply("referenceName"), SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
-                SortValue.apply(FieldReference.apply("start"),         SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
+                SortValue.apply(FieldReference.apply(refCol),   SortDirection.ASCENDING, NullOrdering.NULLS_LAST),
+                SortValue.apply(FieldReference.apply(startCol), SortDirection.ASCENDING, NullOrdering.NULLS_LAST)
             };
         }
         return cachedOrdering;

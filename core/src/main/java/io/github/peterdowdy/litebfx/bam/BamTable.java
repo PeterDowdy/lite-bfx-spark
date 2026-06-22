@@ -73,9 +73,12 @@ public class BamTable implements Table, SupportsRead, SupportsMetadataColumns {
      * The hidden {@value BamSchema#METADATA_COLUMN_NAME} column, surfaced to Spark via
      * {@link SupportsMetadataColumns}. When referenced in a query, Spark passes it into
      * {@link BamScanBuilder#pruneColumns} and the partition reader appends its value.
+     *
+     * <p>A plain singleton rather than an enum: {@link MetadataColumn#name()} would clash with
+     * the final {@link Enum#name()}.
      */
-    private enum FileMetadataColumn implements MetadataColumn {
-        INSTANCE;
+    private static final class FileMetadataColumn implements MetadataColumn {
+        static final FileMetadataColumn INSTANCE = new FileMetadataColumn();
 
         @Override
         public String name() {
