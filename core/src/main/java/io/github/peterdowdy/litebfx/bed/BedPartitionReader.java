@@ -64,10 +64,18 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
     private String[] currentColumns;
     private boolean opened = false;
 
+    private boolean includeFileMetadata = false;
+    private InternalRow fileMetadataRow;
+
     public BedPartitionReader(BedInputPartition partition) {
         log.trace("BedPartitionReader(path={}, queryChrom={})",
                 partition.getPath(), partition.getQueryChrom());
         this.partition = partition;
+    }
+
+    public BedPartitionReader(BedInputPartition partition, boolean includeFileMetadata) {
+        this(partition);
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     // -------------------------------------------------------------------------
@@ -79,6 +87,12 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
         if (!opened) {
             open();
             opened = true;
+        }
+        if (includeFileMetadata && fileMetadataRow == null) {
+            // Tabix index is only used when a region query is active (queryChrom != null).
+            String idx = partition.getQueryChrom() != null ? partition.getIndexPath() : null;
+            fileMetadataRow = io.github.peterdowdy.litebfx.FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), idx);
         }
         if (rowsRead >= partition.getRowLimit()) return false;
         boolean hasNext = nextRecord();
@@ -150,7 +164,9 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
         values[11] = (n > 11 && !c[11].trim().isEmpty())
                 ? UTF8String.fromString(stripTrailingComma(c[11].trim())) : null;
 
-        return new GenericInternalRow(values);
+        InternalRow row = new GenericInternalRow(values);
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.appendTo(row, fileMetadataRow) : row;
     }
 
     @Override

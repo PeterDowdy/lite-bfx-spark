@@ -70,6 +70,41 @@ class BamPartitionReaderTest {
         assertEquals("start0",            schema.apply(12).name());
     }
 
+    @Test
+    void samSchema_usesCanonicalSamFieldNames() {
+        var sam = BamSchema.SAM_SCHEMA;
+        // Same order/types as the descriptive schema; only alignment field names differ.
+        assertEquals(BamSchema.SCHEMA.length(), sam.length());
+        assertEquals("qname",      sam.apply(0).name());
+        assertEquals("flag",       sam.apply(1).name());
+        assertEquals("rname",      sam.apply(2).name());
+        assertEquals("pos",        sam.apply(3).name());
+        assertEquals("mapq",       sam.apply(4).name());
+        assertEquals("cigar",      sam.apply(5).name());
+        assertEquals("rnext",      sam.apply(6).name());
+        assertEquals("pnext",      sam.apply(7).name());
+        assertEquals("tlen",       sam.apply(8).name());
+        assertEquals("seq",        sam.apply(9).name());
+        assertEquals("qual",       sam.apply(10).name());
+        // Extension columns have no SAM-spec equivalent and keep their names.
+        assertEquals("attributes", sam.apply(11).name());
+        assertEquals("start0",     sam.apply(12).name());
+        // Types/nullability must match the descriptive schema positionally.
+        for (int i = 0; i < sam.length(); i++) {
+            assertEquals(BamSchema.SCHEMA.apply(i).dataType(), sam.apply(i).dataType(), "type at " + i);
+            assertEquals(BamSchema.SCHEMA.apply(i).nullable(), sam.apply(i).nullable(), "nullable at " + i);
+        }
+    }
+
+    @Test
+    void forColumnNames_selectsSchemaCaseInsensitively() {
+        assertSame(BamSchema.SAM_SCHEMA, BamSchema.forColumnNames("sam"));
+        assertSame(BamSchema.SAM_SCHEMA, BamSchema.forColumnNames("SAM"));
+        assertSame(BamSchema.SCHEMA, BamSchema.forColumnNames("descriptive"));
+        assertSame(BamSchema.SCHEMA, BamSchema.forColumnNames(null));
+        assertSame(BamSchema.SCHEMA, BamSchema.forColumnNames("bogus"));
+    }
+
     // -------------------------------------------------------------------------
     // BAM reading
     // -------------------------------------------------------------------------
@@ -124,7 +159,8 @@ class BamPartitionReaderTest {
         MapData attrs = row.getMap(11);
         Map<String, String> map = toJavaMap(attrs);
         assertTrue(map.containsKey("NM"), "attributes should contain NM tag");
-        assertEquals("0", map.get("NM"));
+        // Values carry the SAM TYPE:VALUE form so downstream consumers can recover the type.
+        assertEquals("i:0", map.get("NM"));
     }
 
     @Test
@@ -132,6 +168,21 @@ class BamPartitionReaderTest {
         List<InternalRow> rows = readAll(fixtures.bam(), false);
         InternalRow row = rows.get(0);
         assertTrue(row.isNullAt(11), "attributes should be null when includeAttributes=false");
+    }
+
+    @Test
+    void bam_attributesPreserveSamTypeForEachType() throws IOException {
+        Path typedBam = TestBamGenerator.generateTypedTagsBam(tempDir);
+        List<InternalRow> rows = readAll(typedBam, true);
+        assertEquals(1, rows.size());
+
+        Map<String, String> attrs = toJavaMap(rows.get(0).getMap(11));
+        // Each value is the SAM TYPE:VALUE optional-field form, so consumers can recover the type.
+        assertEquals("Z:hello", attrs.get("ZZ"), "string tag");
+        assertEquals("A:P",     attrs.get("AA"), "character tag");
+        assertEquals("f:3.5",   attrs.get("ff"), "float tag");
+        assertEquals("i:42",    attrs.get("ii"), "integer tag");
+        assertEquals("B:i,1,2,3", attrs.get("BB"), "integer-array tag");
     }
 
     // -------------------------------------------------------------------------

@@ -78,10 +78,18 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
     private FastqRecord current;
     private long rowsRead = 0;
 
+    private boolean includeFileMetadata = false;
+    private InternalRow fileMetadataRow;
+
     public FastqPartitionReader(FastqInputPartition partition) {
         log.trace("FastqPartitionReader(path={}, startByte={}, endByte={}, bgzf={})",
                 partition.getPath(), partition.getStartByte(), partition.getEndByte(), partition.isBgzf());
         this.partition = partition;
+    }
+
+    public FastqPartitionReader(FastqInputPartition partition, boolean includeFileMetadata) {
+        this(partition);
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     // -------------------------------------------------------------------------
@@ -93,6 +101,11 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
         if (!opened) {
             open();
             opened = true;
+        }
+        if (includeFileMetadata && fileMetadataRow == null) {
+            // FASTQ has no index format, so index_path is always null.
+            fileMetadataRow = io.github.peterdowdy.litebfx.FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), null);
         }
         if (exhausted) return false;
         if (rowsRead >= partition.getRowLimit()) return false;
@@ -141,7 +154,9 @@ public class FastqPartitionReader implements PartitionReader<InternalRow> {
         values[2] = UTF8String.fromString(current.getBaseQualityString());
         values[3] = description != null ? UTF8String.fromString(description) : null;
         values[4] = partition.getReadNumber();
-        return new GenericInternalRow(values);
+        InternalRow row = new GenericInternalRow(values);
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.appendTo(row, fileMetadataRow) : row;
     }
 
     @Override

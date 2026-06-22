@@ -12,6 +12,7 @@ import htsjdk.samtools.SAMTextHeaderCodec;
 import htsjdk.samtools.SamInputResource;
 import htsjdk.samtools.SamReader;
 import htsjdk.samtools.SamReaderFactory;
+import htsjdk.samtools.TextTagCodec;
 import htsjdk.samtools.ValidationStringency;
 import htsjdk.samtools.CRAMIterator;
 import htsjdk.samtools.cram.ref.ReferenceSource;
@@ -20,6 +21,7 @@ import htsjdk.samtools.util.BlockCompressedFilePointerUtil;
 import htsjdk.samtools.util.BlockCompressedInputStream;
 import htsjdk.samtools.util.BlockCompressedStreamConstants;
 import htsjdk.samtools.util.StringLineReader;
+import io.github.peterdowdy.litebfx.FileMetadata;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -61,6 +63,16 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private final BamInputPartition partition;
     private final boolean includeAttributes;
+    private final boolean includeFileMetadata;
+
+    /**
+     * htsjdk codec used to render each tag value as its SAM {@code TYPE:VALUE} text form.
+     * Stateful and single-threaded, so it is owned per reader (each reader is driven by one task thread).
+     */
+    private final TextTagCodec tagCodec = new TextTagCodec();
+
+    /** Cached {@code _metadata} struct value (file_path, …); computed once in {@link #open()}. */
+    private InternalRow fileMetadataRow;
 
     /** Minimum plausible BAM record body length in bytes (8 fixed int fields + 2-byte name ".\0"). */
     private static final int MIN_BAM_RECORD_BODY = 36;
@@ -88,9 +100,16 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private long samEndByte;
 
     public BamPartitionReader(BamInputPartition partition, boolean includeAttributes) {
-        log.trace("BamPartitionReader(path={}, includeAttributes={})", partition.getPath(), includeAttributes);
+        this(partition, includeAttributes, false);
+    }
+
+    public BamPartitionReader(BamInputPartition partition, boolean includeAttributes,
+                              boolean includeFileMetadata) {
+        log.trace("BamPartitionReader(path={}, includeAttributes={}, includeFileMetadata={})",
+                partition.getPath(), includeAttributes, includeFileMetadata);
         this.partition = partition;
         this.includeAttributes = includeAttributes;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     // -------------------------------------------------------------------------
@@ -153,7 +172,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     @Override
     public InternalRow get() {
         log.trace("get() readName={}", current.getReadName());
-        Object[] values = new Object[13];
+        Object[] values = new Object[includeFileMetadata ? 14 : 13];
         values[0]  = toUTF8(current.getReadName());
         values[1]  = current.getFlags();
         values[2]  = toUTF8(current.getContig());
@@ -166,8 +185,9 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         values[8]  = current.getInferredInsertSize();
         values[9]  = toUTF8(current.getReadString());
         values[10] = toUTF8(current.getBaseQualityString());
-        values[11] = includeAttributes ? buildAttributesMap(current) : null;
+        values[11] = includeAttributes ? buildAttributesMap(current) : null; // map values are SAM TYPE:VALUE strings
         values[12] = startPos > 0 ? startPos - 1L : null;     // 0-based, null for unmapped
+        if (includeFileMetadata) values[13] = fileMetadataRow; // _metadata struct (see FileMetadata.TYPE)
         return new GenericInternalRow(values);
     }
 
@@ -195,6 +215,14 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
 
     private void open() throws IOException {
         log.trace("open() path={}", partition.getPath());
+
+        // Compute the _metadata struct once, before dispatching to a mode-specific opener
+        // (several of which return early). get() does not throw, so this stat must happen here.
+        if (includeFileMetadata) {
+            // partition.getIndexPath() is non-null only on index-driven partitions (VFO / region / unmapped).
+            fileMetadataRow = FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), partition.getIndexPath());
+        }
 
         // CRAM container-split mode: checked first since isCram partitions never use BGZF/SAM paths.
         if (partition.getCramContainerSpans() != null) {
@@ -717,7 +745,19 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         return seq == null ? null : seq.getSequenceName();
     }
 
-    private static ArrayBasedMapData buildAttributesMap(SAMRecord record) {
+    /**
+     * Builds the {@code attributes} map, encoding each tag value as a SAM {@code TYPE:VALUE}
+     * string (e.g. {@code i:0}, {@code Z:group1}, {@code A:P}, {@code f:3.14},
+     * {@code B:i,1,2,3}) so downstream consumers can recover the SAM type and parse safely
+     * rather than receiving a bare, type-erased value.
+     *
+     * <p>The encoding is produced by htsjdk's own {@link TextTagCodec}, which yields
+     * {@code TAG:TYPE:VALUE} (identical to a {@code samtools view} optional field); we strip the
+     * leading {@code TAG:} prefix. This inherits htsjdk's public-API behaviour: integer subtypes
+     * collapse to {@code i}, hex ({@code H}) is rendered as a {@code B} byte array, and the
+     * signed/unsigned array distinction is not preserved (lost by {@link SAMRecord#getAttributes()}).
+     */
+    private ArrayBasedMapData buildAttributesMap(SAMRecord record) {
         List<SAMRecord.SAMTagAndValue> attrs = record.getAttributes();
         int n = attrs.size();
         UTF8String[] keys   = new UTF8String[n];
@@ -725,7 +765,9 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         for (int i = 0; i < n; i++) {
             SAMRecord.SAMTagAndValue tv = attrs.get(i);
             keys[i]   = UTF8String.fromString(tv.tag);
-            values[i] = UTF8String.fromString(String.valueOf(tv.value));
+            // TextTagCodec.encode returns "TAG:TYPE:VALUE"; drop the 2-char tag plus its colon.
+            String encoded = tagCodec.encode(tv.tag, tv.value);
+            values[i] = UTF8String.fromString(encoded.substring(tv.tag.length() + 1));
         }
         return new ArrayBasedMapData(new GenericArrayData(keys), new GenericArrayData(values));
     }

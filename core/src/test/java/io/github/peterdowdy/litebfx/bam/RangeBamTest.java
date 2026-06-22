@@ -147,8 +147,9 @@ class RangeBamTest {
         InternalRow row = firstRow();
         assertFalse(row.isNullAt(11));
         Map<String, String> attrs = toJavaMap(row.getMap(11));
-        assertEquals("3", attrs.get("NM"), "NM tag");
-        assertEquals("1", attrs.get("RG"), "RG tag");
+        // Values are SAM TYPE:VALUE strings: NM is an integer ('i'), RG a string ('Z').
+        assertEquals("i:3", attrs.get("NM"), "NM tag");
+        assertEquals("Z:1", attrs.get("RG"), "RG tag");
     }
 
     // -------------------------------------------------------------------------

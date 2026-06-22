@@ -1,5 +1,8 @@
 package io.github.peterdowdy.litebfx.fasta;
 
+import io.github.peterdowdy.litebfx.FileMetadata;
+import org.apache.spark.sql.connector.catalog.MetadataColumn;
+import org.apache.spark.sql.connector.catalog.SupportsMetadataColumns;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -14,7 +17,7 @@ import java.util.Map;
 import java.util.Set;
 
 /** Represents a FASTA file (or glob of files) as a Spark table. */
-public class FastaTable implements Table, SupportsRead {
+public class FastaTable implements Table, SupportsRead, SupportsMetadataColumns {
 
     private static final Logger log = LoggerFactory.getLogger(FastaTable.class);
 
@@ -44,5 +47,10 @@ public class FastaTable implements Table, SupportsRead {
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
         log.trace("newScanBuilder(options={})", options);
         return new FastaScanBuilder(options);
+    }
+
+    @Override
+    public MetadataColumn[] metadataColumns() {
+        return FileMetadata.COLUMNS;
     }
 }

@@ -29,6 +29,10 @@ All fields beyond `chromEnd` are nullable. Which fields are populated depends on
 
 Column count is detected from the first record in each partition. Missing trailing columns produce nulls for all nullable fields.
 
+A hidden, Databricks-compatible `_metadata` struct column (`file_path`, `file_name`, `file_size`,
+`file_modification_time`, `index_path`) is also available; `index_path` is the tabix/CSI index for
+a region query, else null. See [BAM → File metadata](bam.md#file-metadata-_metadata).
+
 ---
 
 ## Reading BED files

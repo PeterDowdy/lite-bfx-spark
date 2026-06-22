@@ -58,10 +58,18 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
     private boolean done = false;
     private long rowsRead = 0;
 
+    private boolean includeFileMetadata = false;
+    private org.apache.spark.sql.catalyst.InternalRow fileMetadataRow;
+
     public FastaPartitionReader(FastaInputPartition partition) {
         log.trace("FastaPartitionReader(path={}, contigName={})",
                 partition.getPath(), partition.getContigName());
         this.partition = partition;
+    }
+
+    public FastaPartitionReader(FastaInputPartition partition, boolean includeFileMetadata) {
+        this(partition);
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     /** Package-private for testing the Hadoop full-scan path without a real FS. */
@@ -82,6 +90,11 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
     @Override
     public boolean next() throws IOException {
         if (rowsRead >= partition.getRowLimit()) return false;
+        if (includeFileMetadata && fileMetadataRow == null) {
+            // getFaiPath() is non-null only for indexed (per-contig) partitions, null for full scans.
+            fileMetadataRow = io.github.peterdowdy.litebfx.FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), partition.getFaiPath());
+        }
         boolean hasNext = nextRecord();
         if (hasNext) rowsRead++;
         return hasNext;
@@ -125,7 +138,9 @@ public class FastaPartitionReader implements PartitionReader<InternalRow> {
         values[0] = UTF8String.fromString(current.getName());
         values[1] = UTF8String.fromBytes(bases);
         values[2] = (long) bases.length;
-        return new GenericInternalRow(values);
+        InternalRow row = new GenericInternalRow(values);
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.appendTo(row, fileMetadataRow) : row;
     }
 
     @Override

@@ -16,6 +16,10 @@ Supported extensions: `.fastq`, `.fq`, `.fastq.gz`, `.fq.gz`.
 | `description` | String | Second header token (text after the first space on the `@` line); null when absent |
 | `readNumber` | Integer | `1` for R1 (forward), `2` for R2 (reverse), null when the read number cannot be determined from the filename |
 
+A hidden, Databricks-compatible `_metadata` struct column (`file_path`, `file_name`, `file_size`,
+`file_modification_time`, `index_path`) is also available. FASTQ has no index format, so
+`index_path` is always null. See [BAM → File metadata](bam.md#file-metadata-_metadata).
+
 ---
 
 ## Reading FASTQ files

@@ -37,8 +37,16 @@ public class BamScanBuilder
     private final CaseInsensitiveStringMap options;
     private final boolean isCram;
 
-    private StructType requiredSchema = BamSchema.SCHEMA;
+    /**
+     * Active alignment region-filter column names, driven by the {@code columnNames} option:
+     * {@code referenceName}/{@code start} (descriptive) or {@code rname}/{@code pos} (SAM-spec).
+     */
+    private final String refColumn;
+    private final String startColumn;
+
+    private StructType requiredSchema;
     private boolean includeAttributes = true;
+    private boolean includeFileMetadata = false;
 
     // Extracted region (null referenceName means "no region filter")
     private String pushedReferenceName = null;
@@ -55,6 +63,11 @@ public class BamScanBuilder
         log.trace("BamScanBuilder(isCram={})", isCram);
         this.options = options;
         this.isCram = isCram;
+        boolean samColumnNames = BamSchema.isSamColumnNames(options);
+        this.requiredSchema = samColumnNames ? BamSchema.SAM_SCHEMA : BamSchema.SCHEMA;
+        // Predicate pushdown must match whichever name set the caller's DataFrame uses.
+        this.refColumn = samColumnNames ? "rname" : "referenceName";
+        this.startColumn = samColumnNames ? "pos" : "start";
     }
 
     // -------------------------------------------------------------------------
@@ -70,7 +83,7 @@ public class BamScanBuilder
         String refName = null;
         Predicate refPredicate = null;
         for (Predicate p : flat) {
-            if (FastaScanBuilder.isColumnEqualityIgnoreCase(p, "referenceName")) {
+            if (FastaScanBuilder.isColumnEqualityIgnoreCase(p, refColumn)) {
                 refName = String.valueOf(FastaScanBuilder.literalValue(p));
                 refPredicate = p;
                 break;
@@ -90,7 +103,7 @@ public class BamScanBuilder
             for (Predicate p : flat) {
                 if (p == refPredicate) continue;
                 if (FastaScanBuilder.isRangeComparison(p)
-                        && "start".equalsIgnoreCase(FastaScanBuilder.columnName(p))) {
+                        && startColumn.equalsIgnoreCase(FastaScanBuilder.columnName(p))) {
                     String op = p.name();
                     int val = ((Number) FastaScanBuilder.literalValue(p)).intValue();
                     if (">=".equals(op)) rangeStart = val;
@@ -141,14 +154,15 @@ public class BamScanBuilder
         log.trace("pruneColumns(requiredSchema={})", requiredSchema);
         this.requiredSchema = requiredSchema;
         boolean found = false;
+        boolean metadata = false;
         for (StructField f : requiredSchema.fields()) {
-            if ("attributes".equals(f.name())) {
-                found = true;
-                break;
-            }
+            if ("attributes".equals(f.name())) found = true;
+            // Spark appends declared metadata columns to the required schema when referenced.
+            else if (io.github.peterdowdy.litebfx.FileMetadata.COLUMN_NAME.equals(f.name())) metadata = true;
         }
         this.includeAttributes = found;
-        log.trace("pruneColumns() includeAttributes={}", includeAttributes);
+        this.includeFileMetadata = metadata;
+        log.trace("pruneColumns() includeAttributes={} includeFileMetadata={}", includeAttributes, includeFileMetadata);
     }
 
     // -------------------------------------------------------------------------
@@ -159,6 +173,7 @@ public class BamScanBuilder
     public Scan build() {
         log.trace("build()");
         return new BamScan(options, requiredSchema, includeAttributes,
-                           pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit);
+                           pushedReferenceName, pushedStart, pushedEnd, isCram, pushedLimit,
+                           includeFileMetadata);
     }
 }

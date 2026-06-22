@@ -1,5 +1,8 @@
 package io.github.peterdowdy.litebfx.bam;
 
+import io.github.peterdowdy.litebfx.FileMetadata;
+import org.apache.spark.sql.connector.catalog.MetadataColumn;
+import org.apache.spark.sql.connector.catalog.SupportsMetadataColumns;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -18,7 +21,7 @@ import java.util.Set;
  *
  * <p>Capabilities: {@code BATCH_READ} only.
  */
-public class BamTable implements Table, SupportsRead {
+public class BamTable implements Table, SupportsRead, SupportsMetadataColumns {
 
     private static final Logger log = LoggerFactory.getLogger(BamTable.class);
 
@@ -45,7 +48,7 @@ public class BamTable implements Table, SupportsRead {
     @Override
     public StructType schema() {
         log.trace("schema()");
-        return BamSchema.SCHEMA;
+        return BamSchema.fromOptions(properties);
     }
 
     @Override
@@ -58,5 +61,11 @@ public class BamTable implements Table, SupportsRead {
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
         log.trace("newScanBuilder(options={})", options);
         return new BamScanBuilder(options, isCram);
+    }
+
+    @Override
+    public MetadataColumn[] metadataColumns() {
+        log.trace("metadataColumns()");
+        return FileMetadata.COLUMNS;
     }
 }

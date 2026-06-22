@@ -151,6 +151,47 @@ public class TestBamGenerator {
         return bamPath;
     }
 
+    /**
+     * Generates a single-record BAM whose read carries one optional tag of each SAM type,
+     * for verifying that the reader preserves type information in the {@code attributes} map:
+     * <ul>
+     *   <li>{@code ZZ} → {@code Z} (string)</li>
+     *   <li>{@code AA} → {@code A} (character)</li>
+     *   <li>{@code ff} → {@code f} (float)</li>
+     *   <li>{@code ii} → {@code i} (signed 32-bit integer)</li>
+     *   <li>{@code BB} → {@code B,i} (signed integer array)</li>
+     * </ul>
+     */
+    public static Path generateTypedTagsBam(Path dir) throws IOException {
+        SAMFileHeader header = buildHeader();
+        Path bamPath = dir.resolve("typed_tags.bam");
+
+        SAMRecord r = new SAMRecord(header);
+        r.setReadName("typedread");
+        r.setFlags(0);
+        r.setReferenceIndex(0);
+        r.setAlignmentStart(100);
+        r.setMappingQuality(MAPPING_QUALITY);
+        r.setCigarString(CIGAR);
+        r.setReadString(SEQUENCE);
+        r.setBaseQualityString(BASE_QUALITIES);
+        r.setMateReferenceIndex(SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX);
+        r.setMateAlignmentStart(0);
+        r.setInferredInsertSize(0);
+        r.setAttribute("ZZ", "hello");
+        r.setAttribute("AA", 'P');
+        r.setAttribute("ff", 3.5f);
+        r.setAttribute("ii", 42);
+        r.setAttribute("BB", new int[] {1, 2, 3});
+
+        try (SAMFileWriter writer = new SAMFileWriterFactory()
+                .setCreateIndex(false)
+                .makeBAMWriter(header, true, bamPath.toFile())) {
+            writer.addAlignment(r);
+        }
+        return bamPath;
+    }
+
     private static SAMRecord[] buildRecords(SAMFileHeader header) {
         SAMRecord[] records = new SAMRecord[RECORD_COUNT];
         for (int i = 0; i < RECORD_COUNT; i++) {

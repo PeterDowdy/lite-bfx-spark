@@ -79,7 +79,9 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public StructType readSchema() {
-        return BedSchema.SCHEMA;
+        return io.github.peterdowdy.litebfx.FileMetadata.isRequested(requiredSchema)
+                ? io.github.peterdowdy.litebfx.FileMetadata.withMetadata(BedSchema.SCHEMA)
+                : BedSchema.SCHEMA;
     }
 
     @Override
@@ -201,7 +203,8 @@ public class BedScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new BedPartitionReaderFactory();
+        return new BedPartitionReaderFactory(
+                io.github.peterdowdy.litebfx.FileMetadata.isRequested(requiredSchema));
     }
 
     @Override

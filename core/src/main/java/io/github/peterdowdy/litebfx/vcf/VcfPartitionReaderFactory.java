@@ -16,15 +16,18 @@ public class VcfPartitionReaderFactory implements PartitionReaderFactory {
 
     private final boolean includeInfo;
     private final boolean includeGenotypes;
+    private final boolean includeFileMetadata;
 
-    VcfPartitionReaderFactory(boolean includeInfo, boolean includeGenotypes) {
-        this.includeInfo      = includeInfo;
-        this.includeGenotypes = includeGenotypes;
+    VcfPartitionReaderFactory(boolean includeInfo, boolean includeGenotypes, boolean includeFileMetadata) {
+        this.includeInfo         = includeInfo;
+        this.includeGenotypes    = includeGenotypes;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new VcfPartitionReader((VcfInputPartition) partition, includeInfo, includeGenotypes);
+        return new VcfPartitionReader((VcfInputPartition) partition, includeInfo, includeGenotypes,
+                includeFileMetadata);
     }
 }
