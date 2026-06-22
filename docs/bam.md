@@ -80,11 +80,17 @@ df.select("_metadata").printSchema()
 | `file_name` | String | Final path component (e.g. `sample.bam`) |
 | `file_size` | Long | File length in bytes |
 | `file_modification_time` | Timestamp | Last-modified time of the file |
+| `index_path` | String (nullable) | Index file (BAI/CRAI) used to locate this partition's data, or null when no index was used (BGZF/SAM splits, `useIndex=false`) |
 
-These four fields use the same names and types as Spark's built-in `_metadata`, so existing
-queries referencing them port over unchanged. The `file_block_start`, `file_block_length`, and
-`row_index` sub-fields are not exposed: byte ranges and row indices have no stable meaning under
-genomic (per-reference / per-container) partitioning.
+The first four fields use the same names and types as Spark's built-in `_metadata`, so existing
+queries referencing them port over unchanged; `index_path` is an added, lite-bfx-spark-specific
+field. The `file_block_start`, `file_block_length`, and `row_index` sub-fields of Spark's built-in
+column are not exposed: byte ranges and row indices have no stable meaning under genomic
+(per-reference / per-container) partitioning.
+
+The `_metadata` column is available on **every** lite-bfx-spark format (BAM/SAM/CRAM, FASTA,
+FASTQ, BED, VCF/BCF) with the same shape. `index_path` reflects the format's index: BAI/CRAI for
+BAM/CRAM, FAI for FASTA, tabix/CSI for BED/VCF, and always null for FASTQ (which has no index).
 
 ---
 

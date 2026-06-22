@@ -47,21 +47,6 @@ public class BamSchema {
     /** Schema with canonical SAM-spec field names ({@code qname}, {@code flag}, …). */
     public static final StructType SAM_SCHEMA = buildSchema(true);
 
-    /** Name of the hidden, Databricks/Spark-compatible file metadata column. */
-    public static final String METADATA_COLUMN_NAME = "_metadata";
-
-    /**
-     * Struct type of the {@value #METADATA_COLUMN_NAME} column. A subset of Spark's built-in
-     * file-source metadata column, using identical field names and types so queries written
-     * against {@code _metadata.file_path} (etc.) port over unchanged. Block-offset and row-index
-     * fields are intentionally omitted: they have no stable meaning under genomic partitioning.
-     */
-    public static final StructType FILE_METADATA_TYPE = new StructType()
-        .add("file_path",              DataTypes.StringType,    false)
-        .add("file_name",              DataTypes.StringType,    false)
-        .add("file_size",              DataTypes.LongType,      false)
-        .add("file_modification_time", DataTypes.TimestampType, false);
-
     private static StructType buildSchema(boolean sam) {
         return new StructType()
             .add(sam ? "qname" : "readName",          DataTypes.StringType,  true)

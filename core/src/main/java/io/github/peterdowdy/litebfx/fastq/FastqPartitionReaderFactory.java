@@ -12,9 +12,15 @@ public class FastqPartitionReaderFactory implements PartitionReaderFactory {
 
     private static final Logger log = LoggerFactory.getLogger(FastqPartitionReaderFactory.class);
 
+    private final boolean includeFileMetadata;
+
+    FastqPartitionReaderFactory(boolean includeFileMetadata) {
+        this.includeFileMetadata = includeFileMetadata;
+    }
+
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new FastqPartitionReader((FastqInputPartition) partition);
+        return new FastqPartitionReader((FastqInputPartition) partition, includeFileMetadata);
     }
 }

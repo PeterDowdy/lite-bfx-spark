@@ -65,6 +65,28 @@ class BedDataSourceTest {
     void schema_matchesBedSchema() {
         Dataset<Row> df = spark.read().format("bed").load(exampleBedGzPath);
         assertEquals(BedSchema.SCHEMA, df.schema());
+        assertFalse(java.util.Arrays.asList(df.schema().fieldNames()).contains("_metadata"));
+    }
+
+    @Test
+    void metadata_fullScan_nullIndexPath() {
+        // example.bed.gz has no tabix index → full scan → index_path null.
+        Row r = spark.read().format("bed").load(exampleBedGzPath)
+                .selectExpr("_metadata.file_name AS n", "_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0));
+        assertTrue(r.isNullAt(1), "index_path must be null for a full-file scan");
+    }
+
+    @Test
+    void metadata_tabixRegionQuery_populatesIndexPath() throws Exception {
+        BedTestGenerator.Fixtures fx = BedTestGenerator.generate(tempDir);
+        Row r = spark.read().format("bed").load(fx.bed6Bgzf().toString())
+                .filter("chrom = 'chr1'")
+                .selectExpr("_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0), "index_path should be set for a tabix region query");
+        assertTrue(r.getString(0).endsWith(".tbi"), "index_path: " + r.getString(0));
     }
 
     // -------------------------------------------------------------------------

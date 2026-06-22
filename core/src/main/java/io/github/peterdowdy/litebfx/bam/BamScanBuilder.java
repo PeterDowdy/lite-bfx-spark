@@ -158,7 +158,7 @@ public class BamScanBuilder
         for (StructField f : requiredSchema.fields()) {
             if ("attributes".equals(f.name())) found = true;
             // Spark appends declared metadata columns to the required schema when referenced.
-            else if (BamSchema.METADATA_COLUMN_NAME.equals(f.name())) metadata = true;
+            else if (io.github.peterdowdy.litebfx.FileMetadata.COLUMN_NAME.equals(f.name())) metadata = true;
         }
         this.includeAttributes = found;
         this.includeFileMetadata = metadata;

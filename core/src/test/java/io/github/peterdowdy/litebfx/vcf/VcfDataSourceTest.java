@@ -59,6 +59,27 @@ class VcfDataSourceTest {
         VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
         Dataset<Row> df = spark.read().format("vcf").load(fx.plainVcf().toString());
         assertEquals(VcfSchema.SCHEMA, df.schema());
+        assertFalse(java.util.Arrays.asList(df.schema().fieldNames()).contains("_metadata"));
+    }
+
+    @Test
+    void metadata_fullScan_nullIndexPath() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Row r = spark.read().format("vcf").load(fx.plainVcf().toString())
+                .selectExpr("_metadata.file_name AS n", "_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0));
+        assertTrue(r.isNullAt(1), "index_path must be null for a full-file scan");
+    }
+
+    @Test
+    void metadata_tabixRegionQuery_populatesIndexPath() throws Exception {
+        VcfTestGenerator.Fixtures fx = VcfTestGenerator.generate(tempDir);
+        Row r = spark.read().format("vcf").load(fx.bgzVcf().toString())
+                .filter("chrom = 'chr1'")
+                .selectExpr("_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0), "index_path should be set for a tabix region query");
     }
 
     // -------------------------------------------------------------------------

@@ -21,9 +21,9 @@ import htsjdk.samtools.util.BlockCompressedFilePointerUtil;
 import htsjdk.samtools.util.BlockCompressedInputStream;
 import htsjdk.samtools.util.BlockCompressedStreamConstants;
 import htsjdk.samtools.util.StringLineReader;
+import io.github.peterdowdy.litebfx.FileMetadata;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
-import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -187,7 +187,7 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         values[10] = toUTF8(current.getBaseQualityString());
         values[11] = includeAttributes ? buildAttributesMap(current) : null; // map values are SAM TYPE:VALUE strings
         values[12] = startPos > 0 ? startPos - 1L : null;     // 0-based, null for unmapped
-        if (includeFileMetadata) values[13] = fileMetadataRow; // _metadata struct (see BamSchema.FILE_METADATA_TYPE)
+        if (includeFileMetadata) values[13] = fileMetadataRow; // _metadata struct (see FileMetadata.TYPE)
         return new GenericInternalRow(values);
     }
 
@@ -219,7 +219,9 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         // Compute the _metadata struct once, before dispatching to a mode-specific opener
         // (several of which return early). get() does not throw, so this stat must happen here.
         if (includeFileMetadata) {
-            fileMetadataRow = buildFileMetadata();
+            // partition.getIndexPath() is non-null only on index-driven partitions (VFO / region / unmapped).
+            fileMetadataRow = FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), partition.getIndexPath());
         }
 
         // CRAM container-split mode: checked first since isCram partitions never use BGZF/SAM paths.
@@ -724,24 +726,6 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         long baiLen = baiFs.getFileStatus(baiHadoopPath).getLen();
         baiInputStream = baiFs.open(baiHadoopPath);
         return new HadoopSeekableStream(baiInputStream, baiLen, partition.getIndexPath());
-    }
-
-    /**
-     * Builds the {@code _metadata} struct value ({@link BamSchema#FILE_METADATA_TYPE}) for this
-     * partition's file. Field order must match the struct type: file_path, file_name, file_size,
-     * file_modification_time. The modification time is stored as microseconds since the epoch,
-     * the internal representation of Spark {@code TimestampType}.
-     */
-    private InternalRow buildFileMetadata() throws IOException {
-        Path path = new Path(partition.getPath());
-        FileSystem fs = path.getFileSystem(partition.getHadoopConf());
-        FileStatus status = fs.getFileStatus(path);
-        return new GenericInternalRow(new Object[]{
-            UTF8String.fromString(partition.getPath()),
-            UTF8String.fromString(path.getName()),
-            status.getLen(),
-            status.getModificationTime() * 1000L,
-        });
     }
 
     /** Returns a UTF8String for non-null input, or null for null (maps to Spark null). */

@@ -80,6 +80,25 @@ class FastqDataSourceTest {
         assertEquals("readNumber",    schema.apply(4).name());
     }
 
+    @Test
+    void metadata_notInDefaultSchema() {
+        StructType schema = spark.read().format("fastq")
+                .load(fixtures.plainFastq().toString()).schema();
+        assertFalse(java.util.Arrays.asList(schema.fieldNames()).contains("_metadata"));
+    }
+
+    @Test
+    void metadata_presentWithNullIndexPath() {
+        // FASTQ has no index format, so index_path is always null.
+        Row r = spark.read().format("fastq").load(fixtures.plainFastq().toString())
+                .selectExpr("_metadata.file_name AS n", "_metadata.file_size AS s",
+                            "_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0));
+        assertTrue(r.getLong(1) > 0);
+        assertTrue(r.isNullAt(2), "index_path must be null for FASTQ");
+    }
+
     // -------------------------------------------------------------------------
     // Counts
     // -------------------------------------------------------------------------

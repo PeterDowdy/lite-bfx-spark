@@ -79,6 +79,8 @@ public class VcfScan implements Scan, Batch, SupportsReportStatistics, SupportsR
     private final boolean includeInfo;
     /** True when the {@code genotypes} or {@code format} column appears in the required schema. */
     private final boolean includeGenotypes;
+    /** True when the hidden {@code _metadata} column appears in the required schema. */
+    private final boolean includeFileMetadata;
 
     private Statistics cachedStatistics = null;
     private SortOrder[] cachedOrdering = null;
@@ -110,11 +112,14 @@ public class VcfScan implements Scan, Batch, SupportsReportStatistics, SupportsR
         }
         this.includeInfo      = foundInfo;
         this.includeGenotypes = foundGenotypes;
+        this.includeFileMetadata = io.github.peterdowdy.litebfx.FileMetadata.isRequested(requiredSchema);
     }
 
     @Override
     public StructType readSchema() {
-        return VcfSchema.SCHEMA;
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.withMetadata(VcfSchema.SCHEMA)
+                : VcfSchema.SCHEMA;
     }
 
     @Override
@@ -205,7 +210,7 @@ public class VcfScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new VcfPartitionReaderFactory(includeInfo, includeGenotypes);
+        return new VcfPartitionReaderFactory(includeInfo, includeGenotypes, includeFileMetadata);
     }
 
     @Override

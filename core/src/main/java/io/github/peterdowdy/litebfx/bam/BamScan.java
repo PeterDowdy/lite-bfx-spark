@@ -155,7 +155,7 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
         // Append the hidden _metadata column when it was referenced (see SupportsMetadataColumns);
         // the reader produces its value positionally after the data columns.
         if (includeFileMetadata) {
-            schema = schema.add(BamSchema.METADATA_COLUMN_NAME, BamSchema.FILE_METADATA_TYPE, false);
+            schema = io.github.peterdowdy.litebfx.FileMetadata.withMetadata(schema);
         }
         return schema;
     }

@@ -49,21 +49,29 @@ public class FastqScan implements Scan, Batch, SupportsReportStatistics {
 
     private final CaseInsensitiveStringMap options;
     private final int pushedLimit;
+    private final boolean includeFileMetadata;
     private Statistics cachedStatistics = null;
 
     FastqScan(CaseInsensitiveStringMap options) {
-        this(options, Integer.MAX_VALUE);
+        this(options, Integer.MAX_VALUE, false);
     }
 
     FastqScan(CaseInsensitiveStringMap options, int pushedLimit) {
-        log.trace("FastqScan(options={}, pushedLimit={})", options, pushedLimit);
+        this(options, pushedLimit, false);
+    }
+
+    FastqScan(CaseInsensitiveStringMap options, int pushedLimit, boolean includeFileMetadata) {
+        log.trace("FastqScan(options={}, pushedLimit={}, fileMeta={})", options, pushedLimit, includeFileMetadata);
         this.options = options;
         this.pushedLimit = pushedLimit;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     @Override
     public StructType readSchema() {
-        return FastqSchema.SCHEMA;
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.withMetadata(FastqSchema.SCHEMA)
+                : FastqSchema.SCHEMA;
     }
 
     @Override
@@ -174,7 +182,7 @@ public class FastqScan implements Scan, Batch, SupportsReportStatistics {
     @Override
     public PartitionReaderFactory createReaderFactory() {
         log.trace("createReaderFactory()");
-        return new FastqPartitionReaderFactory();
+        return new FastqPartitionReaderFactory(includeFileMetadata);
     }
 
     // -------------------------------------------------------------------------

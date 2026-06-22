@@ -16,6 +16,10 @@ Supported extensions: `.fa`, `.fasta`. The Spark format name is always `"fasta"`
 
 Each row represents one complete contig. For a whole-genome reference, expect one row per chromosome.
 
+A hidden, Databricks-compatible `_metadata` struct column (`file_path`, `file_name`, `file_size`,
+`file_modification_time`, `index_path`) is also available; `index_path` is the FAI index when the
+read is index-driven, else null. See [BAM → File metadata](bam.md#file-metadata-_metadata).
+
 ---
 
 ## Reading FASTA files

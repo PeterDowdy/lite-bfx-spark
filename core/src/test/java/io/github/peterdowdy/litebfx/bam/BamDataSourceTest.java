@@ -134,6 +134,7 @@ class BamDataSourceTest {
         StructType meta = (StructType) df.schema().apply(0).dataType();
         assertEquals("file_path", meta.apply(0).name());
         assertEquals("file_modification_time", meta.apply(3).name());
+        assertEquals("index_path", meta.apply(4).name());
         // Selecting only the metadata column does not change the row count.
         assertEquals(112L, df.count());
     }
@@ -145,6 +146,27 @@ class BamDataSourceTest {
                 .first();
         assertNotNull(r.getString(0));
         assertEquals("range.bam", r.getString(1));
+    }
+
+    @Test
+    void metadata_indexPath_populatedWhenBaiUsed() {
+        // With a co-located .bai, reads are planned via the index, so index_path is set.
+        Row r = spark.read().format("bam").load(bamPath)
+                .filter("referenceName = 'CHROMOSOME_I'")
+                .selectExpr("_metadata.index_path AS idx")
+                .first();
+        assertNotNull(r.getString(0), "index_path should be set when the BAI index is used");
+        assertTrue(r.getString(0).endsWith(".bai"), "index_path: " + r.getString(0));
+    }
+
+    @Test
+    void metadata_indexPath_nullWhenUseIndexFalse() {
+        Row r = spark.read().format("bam")
+                .option("useIndex", "false")
+                .load(bamPath)
+                .selectExpr("_metadata.index_path AS idx")
+                .first();
+        assertTrue(r.isNullAt(0), "index_path must be null when useIndex=false");
     }
 
     // -------------------------------------------------------------------------

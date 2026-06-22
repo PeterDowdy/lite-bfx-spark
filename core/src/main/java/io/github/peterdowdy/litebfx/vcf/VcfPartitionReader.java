@@ -67,6 +67,8 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     private final VcfInputPartition partition;
     private final boolean includeInfo;
     private final boolean includeGenotypes;
+    private boolean includeFileMetadata = false;
+    private InternalRow fileMetadataRow;
     private boolean opened = false;
     private long rowsRead = 0;
 
@@ -108,11 +110,17 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
     }
 
     VcfPartitionReader(VcfInputPartition partition, boolean includeInfo, boolean includeGenotypes) {
-        log.trace("VcfPartitionReader(path={}, queryChrom={}, includeInfo={}, includeGenotypes={})",
-                partition.getPath(), partition.getQueryChrom(), includeInfo, includeGenotypes);
+        this(partition, includeInfo, includeGenotypes, false);
+    }
+
+    VcfPartitionReader(VcfInputPartition partition, boolean includeInfo, boolean includeGenotypes,
+                       boolean includeFileMetadata) {
+        log.trace("VcfPartitionReader(path={}, queryChrom={}, includeInfo={}, includeGenotypes={}, fileMeta={})",
+                partition.getPath(), partition.getQueryChrom(), includeInfo, includeGenotypes, includeFileMetadata);
         this.partition        = partition;
         this.includeInfo      = includeInfo;
         this.includeGenotypes = includeGenotypes;
+        this.includeFileMetadata = includeFileMetadata;
     }
 
     // -------------------------------------------------------------------------
@@ -124,6 +132,13 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
         if (!opened) {
             open();
             opened = true;
+        }
+        if (includeFileMetadata && fileMetadataRow == null) {
+            // Tabix/CSI index is used only for region queries (single or multi-chrom).
+            boolean usedIndex = partition.getQueryChrom() != null || partition.getQueryChroms() != null;
+            String idx = usedIndex ? partition.getIndexPath() : null;
+            fileMetadataRow = io.github.peterdowdy.litebfx.FileMetadata.row(
+                    partition.getHadoopConf(), partition.getPath(), idx);
         }
         if (rowsRead >= partition.getRowLimit()) return false;
         boolean hasNext = nextRecord();
@@ -142,8 +157,9 @@ public class VcfPartitionReader implements PartitionReader<InternalRow> {
 
     @Override
     public InternalRow get() {
-        if (isVcfSplitMode || isVcfBgzfMode) return getSplitMode();
-        return getFromVariantContext(current);
+        InternalRow row = (isVcfSplitMode || isVcfBgzfMode) ? getSplitMode() : getFromVariantContext(current);
+        return includeFileMetadata
+                ? io.github.peterdowdy.litebfx.FileMetadata.appendTo(row, fileMetadataRow) : row;
     }
 
     @Override

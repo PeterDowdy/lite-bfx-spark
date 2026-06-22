@@ -74,7 +74,9 @@ public class FastaScan implements Scan, Batch, SupportsReportStatistics {
 
     @Override
     public StructType readSchema() {
-        return FastaSchema.SCHEMA;
+        return io.github.peterdowdy.litebfx.FileMetadata.isRequested(requiredSchema)
+                ? io.github.peterdowdy.litebfx.FileMetadata.withMetadata(FastaSchema.SCHEMA)
+                : FastaSchema.SCHEMA;
     }
 
     @Override
@@ -141,7 +143,8 @@ public class FastaScan implements Scan, Batch, SupportsReportStatistics {
     @Override
     public PartitionReaderFactory createReaderFactory() {
         log.trace("createReaderFactory()");
-        return new FastaPartitionReaderFactory();
+        return new FastaPartitionReaderFactory(
+                io.github.peterdowdy.litebfx.FileMetadata.isRequested(requiredSchema));
     }
 
     @Override

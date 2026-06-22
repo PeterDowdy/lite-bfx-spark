@@ -14,9 +14,15 @@ public class BedPartitionReaderFactory implements PartitionReaderFactory {
 
     private static final Logger log = LoggerFactory.getLogger(BedPartitionReaderFactory.class);
 
+    private final boolean includeFileMetadata;
+
+    BedPartitionReaderFactory(boolean includeFileMetadata) {
+        this.includeFileMetadata = includeFileMetadata;
+    }
+
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new BedPartitionReader((BedInputPartition) partition);
+        return new BedPartitionReader((BedInputPartition) partition, includeFileMetadata);
     }
 }

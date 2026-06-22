@@ -23,6 +23,10 @@ For bgzipped (`.vcf.gz`) and BCF files, format detection is automatic: `VCFFileR
 | `format` | String | Colon-joined FORMAT keys (e.g. `"GT:DP:GQ"`); null when no samples |
 | `genotypes` | Map(String, String) | Sample name → colon-joined FORMAT values (e.g. `"sample1" → "0/1:32:99"`); null when no samples |
 
+A hidden, Databricks-compatible `_metadata` struct column (`file_path`, `file_name`, `file_size`,
+`file_modification_time`, `index_path`) is also available; `index_path` is the tabix/CSI index for
+a region query, else null. See [BAM → File metadata](bam.md#file-metadata-_metadata).
+
 ---
 
 ## Reading VCF files

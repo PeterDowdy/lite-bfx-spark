@@ -1,12 +1,12 @@
 package io.github.peterdowdy.litebfx.bam;
 
+import io.github.peterdowdy.litebfx.FileMetadata;
 import org.apache.spark.sql.connector.catalog.MetadataColumn;
 import org.apache.spark.sql.connector.catalog.SupportsMetadataColumns;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
-import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.slf4j.Logger;
@@ -66,38 +66,6 @@ public class BamTable implements Table, SupportsRead, SupportsMetadataColumns {
     @Override
     public MetadataColumn[] metadataColumns() {
         log.trace("metadataColumns()");
-        return new MetadataColumn[]{FileMetadataColumn.INSTANCE};
-    }
-
-    /**
-     * The hidden {@value BamSchema#METADATA_COLUMN_NAME} column, surfaced to Spark via
-     * {@link SupportsMetadataColumns}. When referenced in a query, Spark passes it into
-     * {@link BamScanBuilder#pruneColumns} and the partition reader appends its value.
-     *
-     * <p>A plain singleton rather than an enum: {@link MetadataColumn#name()} would clash with
-     * the final {@link Enum#name()}.
-     */
-    private static final class FileMetadataColumn implements MetadataColumn {
-        static final FileMetadataColumn INSTANCE = new FileMetadataColumn();
-
-        @Override
-        public String name() {
-            return BamSchema.METADATA_COLUMN_NAME;
-        }
-
-        @Override
-        public DataType dataType() {
-            return BamSchema.FILE_METADATA_TYPE;
-        }
-
-        @Override
-        public boolean isNullable() {
-            return false;
-        }
-
-        @Override
-        public String comment() {
-            return "File metadata: file_path, file_name, file_size, file_modification_time";
-        }
+        return FileMetadata.COLUMNS;
     }
 }

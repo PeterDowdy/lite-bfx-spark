@@ -70,7 +70,7 @@ For testing infrastructure, see [TESTING.md](TESTING.md).
 
 > **Column naming:** Set `.option("columnNames", "sam")` to use canonical SAM-spec field names (`qname`, `flag`, `rname`, `pos`, `mapq`, `cigar`, `rnext`, `pnext`, `tlen`, `seq`, `qual`) instead of the descriptive defaults. See [docs/bam.md](docs/bam.md#column-naming).
 
-> **File metadata:** A hidden, Databricks-compatible `_metadata` struct (`file_path`, `file_name`, `file_size`, `file_modification_time`) is available on every read — e.g. `df.select("_metadata.file_path")`. See [docs/bam.md](docs/bam.md#file-metadata-_metadata).
+> **File metadata:** A hidden, Databricks-compatible `_metadata` struct (`file_path`, `file_name`, `file_size`, `file_modification_time`, plus a `index_path` that is set when the read used an index) is available on **every** format — e.g. `df.select("_metadata.file_path", "_metadata.index_path")`. See [docs/bam.md](docs/bam.md#file-metadata-_metadata).
 
 ### FASTQ
 

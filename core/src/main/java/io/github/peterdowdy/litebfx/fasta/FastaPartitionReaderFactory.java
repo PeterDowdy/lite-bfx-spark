@@ -12,9 +12,15 @@ public class FastaPartitionReaderFactory implements PartitionReaderFactory {
 
     private static final Logger log = LoggerFactory.getLogger(FastaPartitionReaderFactory.class);
 
+    private final boolean includeFileMetadata;
+
+    FastaPartitionReaderFactory(boolean includeFileMetadata) {
+        this.includeFileMetadata = includeFileMetadata;
+    }
+
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         log.trace("createReader(partition={})", partition);
-        return new FastaPartitionReader((FastaInputPartition) partition);
+        return new FastaPartitionReader((FastaInputPartition) partition, includeFileMetadata);
     }
 }

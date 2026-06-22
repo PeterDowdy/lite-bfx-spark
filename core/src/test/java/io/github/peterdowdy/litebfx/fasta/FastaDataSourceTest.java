@@ -76,6 +76,26 @@ class FastaDataSourceTest {
         assertEquals("length",   schema.apply(2).name());
     }
 
+    @Test
+    void metadata_notInDefaultSchema() {
+        StructType schema = spark.read().format("fasta").load(fastaPath).schema();
+        assertFalse(java.util.Arrays.asList(schema.fieldNames()).contains("_metadata"));
+    }
+
+    @Test
+    void metadata_populatedWithFaiIndexPath() {
+        // realn01.fa has a co-located .fai, so the read is index-driven and index_path is set.
+        Row r = spark.read().format("fasta").load(fastaPath)
+                .selectExpr("_metadata.file_path AS p", "_metadata.file_name AS n",
+                            "_metadata.file_size AS s", "_metadata.index_path AS idx")
+                .first();
+        assertTrue(r.getString(0).endsWith("realn01.fa"), "file_path: " + r.getString(0));
+        assertEquals("realn01.fa", r.getString(1));
+        assertTrue(r.getLong(2) > 0);
+        assertNotNull(r.getString(3), "index_path should be populated for FAI-indexed read");
+        assertTrue(r.getString(3).endsWith(".fai"), "index_path: " + r.getString(3));
+    }
+
     // -------------------------------------------------------------------------
     // Contig count (FAI-based: one partition per contig)
     // -------------------------------------------------------------------------
