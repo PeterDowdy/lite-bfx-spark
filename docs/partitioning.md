@@ -16,45 +16,44 @@ The core insight is that genomics index formats (BAI, CRAI, tabix) map genomic c
 
 BAI (BAM index) files store, for each reference sequence, the set of BGZF block offsets that contain alignments on that reference. The htsjdk `BAMFileSpan` API exposes these as virtual file offset (VFO) chunks.
 
-### When a BAI is present and no region filter is pushed
+### When a BAI is present and no region filter is pushed (hybrid splitting)
 
-The scan reads the BAM header on the driver to enumerate all reference sequences. It then groups references into partitions (up to `numPartitions`, defaulting to 200) and creates one partition per group plus one partition for unmapped reads.
+The scan reads the BAM header and the BAI on the driver. Each reference becomes one partition — but a reference whose compressed data span exceeds `indexedSplitSize` (default 128 MiB) is **sub-split** into several partitions, so one huge reference (e.g. chr1 in a WGS BAM) no longer dominates. One partition for unmapped reads is appended.
 
-Each per-reference partition receives a `QueryInterval[]` covering its assigned reference sequences. When the executor opens the partition, htsjdk uses the BAI to seek directly to the BGZF blocks that contain those references' reads — no full-file scan occurs.
+Split boundaries are **record-start virtual file offsets** read straight from the BAI (chunk starts plus linear-index entries, harvested across the reference's coordinate range and grouped into bins of ~`indexedSplitSize` compressed bytes). Because every boundary is an exact record start, the executor seeks directly there with no block-boundary guessing, and consecutive splits of a reference are disjoint at record granularity — **no records dropped or duplicated**. A small per-partition reference filter drops any neighbouring-reference reads that share a boundary BGZF block.
 
 ```
-BAM file: chr1 chr2 chr3 chr4 … chr22 chrX chrY chrM
-numPartitions=5:
-  Partition 0: [chr1, chr2, chr3, chr4, chr5]  → BAI VFO seek for all 5 refs
-  Partition 1: [chr6, chr7, …, chr10]
-  Partition 2: [chr11, …, chr15]
-  Partition 3: [chr16, …, chr22, chrX, chrY, chrM]
-  Partition 4: [unmapped reads]                 → samReader.queryUnmapped()
+WGS sample.bam, indexedSplitSize=128 MiB:
+  chr1 (2.1 GiB of reads) → 17 VFO splits  [vfo0,vfo1) [vfo1,vfo2) … (each ~128 MiB)
+  chr2 (2.0 GiB)          → 16 VFO splits
+  …
+  chrM (small)            → 1 partition
+  unmapped                → samReader.queryUnmapped()
 ```
 
-Total records across all partitions = all records in the file.
+Total records across all partitions = all records in the file, each exactly once. When a file has more references than `numPartitions`, the scan instead falls back to reference-grouped VFO partitions (one `QueryInterval[]` per group) to keep the partition count capped.
 
 ### When a region filter is pushed
 
-When the query planner receives a filter like `referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370`, the scan produces **one partition** containing a BAI-guided region query. The executor calls `samReader.query(ref, start, end, false)` which uses the BAI to seek directly to the relevant BGZF blocks.
-
-VFO-based splitting is disabled when a region filter is active — there is no benefit to splitting across references when only one region is requested.
+When the planner receives a filter like `referenceName = 'chr17' AND start >= 43044295 AND start <= 43125370`, the scan takes the BAI span overlapping that region and divides it the same way — into `~ceil(spanBytes / indexedSplitSize)` VFO splits (a single partition for a small region). This both skips bytes outside the region *and* parallelises a large region read across partitions. Spark post-filters the exact coordinate range; the reader guarantees the reference and the exact, duplicate-free union.
 
 ### When no BAI is present (BGZF block-range splitting)
 
 An unindexed BAM is no longer read in a single partition — it is split into fixed-size byte chunks of `bgzfSplitSize` (default 128 MiB), producing `ceil(fileSize / bgzfSplitSize)` partitions. This count is **not** capped by `numPartitions`. The same path is taken when `useIndex=false`.
 
-Chunk boundaries are computed arithmetically (`i × bgzfSplitSize`) rather than aligned to real BGZF block offsets. This is deliberate: enumerating block offsets would require the driver to scan the entire file sequentially — thousands of seeks on object storage — just to build the partition plan. Instead each executor orients itself locally. `BamPartitionReader` calls `findNextBgzfBlockStart`, which reads at most `MAX_COMPRESSED_BLOCK_SIZE + 4 ≈ 65 KB` (one HTTP Range request) to locate the next BGZF magic bytes, then probes the decompressed content for a valid BAM record-body length before iterating to the next chunk boundary.
+Chunk boundaries are computed arithmetically (`i × bgzfSplitSize`) rather than aligned to real BGZF block offsets. This is deliberate: enumerating block offsets would require the driver to scan the entire file sequentially — thousands of seeks on object storage — just to build the partition plan. Instead each executor orients itself locally.
 
 ```
 unindexed sample.bam (600 MiB), bgzfSplitSize=128 MiB:
-  Partition 0: bytes [0, 128M)    → scan forward to first clean record ≥ 0
-  Partition 1: bytes [128M, 256M) → scan forward to first clean record ≥ 128M
+  Partition 0: bytes [0, 128M)    → first record ≥ byte 0
+  Partition 1: bytes [128M, 256M) → first record ≥ byte 128M
   …
   Partition 4: bytes [512M, EOF)  → reads to end of file
 ```
 
-A record straddling a chunk boundary is claimed by exactly one partition (the one whose range contains its start), so the split is lossless. Setting `bgzfSplitSize` below the maximum BGZF block size (~65 KB) is counterproductive — many chunks scan ~65 KB only to find no clean record start and yield zero rows. There is no correctness risk, but throughput degrades; the 128 MiB default suits typical WGS BAMs.
+A record's owning partition is the one whose byte range contains the start of the BGZF block holding the record's first byte, so each record is claimed exactly once. To begin, a partition must locate its first record start — which usually lies **inside** a BGZF block, because the writer flushes 64 KB blocks mid-record, so most blocks open with the tail of a straddling record. `BamPartitionReader.guessFirstRecordVfo` handles this: it walks the contiguous BGZF blocks from the chunk boundary (reading each block's header to get its compressed and uncompressed sizes, no full decode) and, within the first block, tries each uncompressed offset as a candidate record start. A candidate is accepted only when it and the following few records all parse as self-consistent BAM records (in-range `refID`/`pos`/`next_refID`/`next_pos` and a `block_size` consistent with the name/cigar/seq/qual lengths) — a run check that makes a coincidental mid-record match effectively impossible. The result is the exact record-start virtual file offset, so the split is lossless even when every block starts mid-record.
+
+Setting `bgzfSplitSize` below the maximum BGZF block size (~65 KB) is counterproductive (many partitions then cover less than a block and yield zero rows), but it is not a correctness risk. The 128 MiB default suits typical WGS BAMs. For lower latency on large files, an indexed read (a co-located `.bai`) is still preferable — it seeks via exact BAI offsets instead of scanning for record starts.
 
 ---
 

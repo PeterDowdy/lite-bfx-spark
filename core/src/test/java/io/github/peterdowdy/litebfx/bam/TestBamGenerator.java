@@ -132,6 +132,49 @@ public class TestBamGenerator {
     }
 
     /**
+     * Generates a coordinate-sorted BAM (with a co-located BAI) of {@code numReads} 50 bp reads,
+     * all on the single reference {@value #REF_NAME}, with strictly increasing positions. Used to
+     * exercise hybrid indexed splitting: a few thousand reads exceed the 64 KB uncompressed BGZF
+     * block size, so the one reference's data spans multiple BGZF blocks and can be byte-split.
+     *
+     * @return the BAM path; the index is written alongside as {@code many_<numReads>.bam.bai}
+     */
+    public static Path generateManyReadsBam(Path dir, int numReads) throws IOException {
+        SAMFileHeader header = buildHeader();
+        Path bamPath = dir.resolve("many_" + numReads + ".bam");
+        Path baiPath = dir.resolve("many_" + numReads + ".bam.bai");
+
+        int step = Math.max(1, (REF_LENGTH - 1) / numReads);
+        try (SAMFileWriter writer = new SAMFileWriterFactory()
+                .setCreateIndex(true)
+                .makeBAMWriter(header, true, bamPath.toFile())) {
+            for (int i = 0; i < numReads; i++) {
+                SAMRecord r = new SAMRecord(header);
+                r.setReadName("read" + i);
+                r.setFlags(0);
+                r.setReferenceIndex(0);
+                r.setAlignmentStart(1 + i * step);
+                r.setMappingQuality(MAPPING_QUALITY);
+                r.setCigarString(CIGAR);
+                r.setReadString(SEQUENCE);
+                r.setBaseQualityString(BASE_QUALITIES);
+                r.setMateReferenceIndex(SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX);
+                r.setMateAlignmentStart(0);
+                r.setInferredInsertSize(0);
+                r.setAttribute("NM", 0);
+                writer.addAlignment(r);
+            }
+        }
+
+        // htsjdk may name the index many_N.bai instead of many_N.bam.bai; normalise.
+        Path altBaiPath = dir.resolve("many_" + numReads + ".bai");
+        if (!baiPath.toFile().exists() && altBaiPath.toFile().exists()) {
+            Files.move(altBaiPath, baiPath);
+        }
+        return bamPath;
+    }
+
+    /**
      * Generates a queryname-sorted BAM (no BAI) with {@value #RECORD_COUNT} records.
      * Used to verify that {@code BamScan.outputOrdering()} returns empty for non-coordinate sort.
      */
