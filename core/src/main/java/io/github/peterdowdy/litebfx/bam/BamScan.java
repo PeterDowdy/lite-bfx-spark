@@ -256,14 +256,25 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                 String fileUri = filePath.toUri().toString();
                 String indexPath = useIndex ? resolveIndexPath(filePath, hadoopConf) : null;
                 boolean isSam = fileUri.toLowerCase().endsWith(".sam");
-                log.trace("planInputPartitions() fileUri={} indexPath={} isSam={}", fileUri, indexPath, isSam);
+                // Hybrid VFO splitting reads the BAI on the driver to compute split offsets — only
+                // worthwhile when the file is larger than one split. For smaller files no reference
+                // or region can exceed indexedSplitSize, so use the cheaper index-guided paths that
+                // don't touch the BAI on the driver.
+                boolean hybridSplittable = fileStatus.getLen() > indexedSplitSize;
+                log.trace("planInputPartitions() fileUri={} indexPath={} isSam={} hybridSplittable={}",
+                        fileUri, indexPath, isSam, hybridSplittable);
 
-                if (!isCram && !isSam && indexPath != null && pushedReferenceName == null) {
+                if (!isCram && !isSam && indexPath != null && pushedReferenceName == null
+                        && hybridSplittable) {
                     // Hybrid per-reference splitting: one partition per reference, but any
                     // reference whose BAI byte span exceeds indexedSplitSize is further divided
-                    // into balanced BGZF byte-range partitions. Plus one unmapped partition.
+                    // into balanced VFO partitions. Plus one unmapped partition.
                     planIndexedSplitPartitions(fileUri, filePath, indexPath, hadoopConf,
                             referenceFile, referenceMode, maxPartitions, indexedSplitSize, partitions);
+                } else if (!isCram && !isSam && indexPath != null && pushedReferenceName == null) {
+                    // Indexed BAM that fits in one split: per-reference VFO partitions (no driver BAI read).
+                    planVfoPartitions(fileUri, filePath, indexPath, hadoopConf,
+                            referenceFile, referenceMode, maxPartitions, partitions);
                 } else if (!isCram && !isSam && indexPath == null && pushedReferenceName == null) {
                     // Unindexed BAM: BGZF block-level splitting into fixed-size chunks.
                     planBgzfSplitPartitions(fileUri, filePath, hadoopConf,
@@ -290,14 +301,15 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                     int queryEnd   = querySequence != null ? pushedEnd   : Integer.MAX_VALUE;
                     log.trace("planInputPartitions() region querySequence={} queryStart={} queryEnd={}",
                             querySequence, queryStart, queryEnd);
-                    if (querySequence != null && !isCram) {
+                    if (querySequence != null && !isCram && hybridSplittable) {
                         // Hybrid: split the pushed region's BAI byte span into balanced partitions
                         // (skips bytes outside the region and parallelises a large region read).
                         planIndexedRegionSplitPartitions(fileUri, filePath, indexPath, hadoopConf,
                                 referenceFile, referenceMode, querySequence, queryStart, queryEnd,
                                 indexedSplitSize, partitions);
                     } else if (querySequence != null) {
-                        // CRAM region push-down stays a single CRAI-guided partition.
+                        // Small file or CRAM: a single index-guided region-query partition
+                        // (no driver-side BAI read).
                         partitions.add(BamInputPartition.forRegionQuery(
                                 fileUri, hadoopConf, indexPath, isCram,
                                 referenceFile, referenceMode,
