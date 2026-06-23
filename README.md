@@ -1,5 +1,12 @@
 # lite-bfx-spark
 
+[![CI](https://github.com/PeterDowdy/lite-bfx-spark/actions/workflows/ci.yml/badge.svg)](https://github.com/PeterDowdy/lite-bfx-spark/actions/workflows/ci.yml)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.peterdowdy/lite-bfx-spark?label=Maven%20Central)](https://central.sonatype.com/artifact/io.github.peterdowdy/lite-bfx-spark)
+[![Documentation](https://readthedocs.org/projects/lite-bfx-spark/badge/?version=latest)](https://lite-bfx-spark.readthedocs.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Java 17](https://img.shields.io/badge/Java-17-007396.svg?logo=openjdk&logoColor=white)](https://adoptium.net/)
+[![Apache Spark 4.x](https://img.shields.io/badge/Apache%20Spark-4.x-E25A1C.svg?logo=apachespark&logoColor=white)](https://spark.apache.org/)
+
 Native Apache Spark 4.x DataSource V2 readers for genomics file formats — BAM, SAM, CRAM, FASTQ, VCF, BCF, FASTA, and BED.
 
 ## Rationale
