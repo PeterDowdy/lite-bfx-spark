@@ -432,16 +432,115 @@ class BamDataSourceTest {
         assertEquals(112L, count, "count must be correct regardless of numPartitions");
     }
 
+    /**
+     * Asserts that a hybrid-split read returns every record exactly once: the row count equals
+     * {@code expected} (no records dropped) and the number of distinct read names also equals
+     * {@code expected} (no records duplicated). The generated fixtures use unique read names
+     * ({@code read0..read(N-1)}), so distinct-name count is an exact de-dup check.
+     */
+    private static void assertNoDropNoDuplicate(Dataset<Row> df, long expected) {
+        assertEquals(expected, df.count(), "record count must be exact (no records dropped)");
+        assertEquals(expected, df.select("readName").distinct().count(),
+                "distinct read names must equal record count (no records duplicated)");
+    }
+
     @Test
-    void vfoSplitting_regionQueryDisablesSplitting_singlePartition() {
-        // When a region is pushed, we fall back to the single-partition region-query path.
+    void hybrid_regionQuery_defaultSplitSize_singlePartitionForTinyFile() {
+        // At the 128 MB default, tiny range.bam's CHROMOSOME_I fits in one partition.
         int numParts = spark.read().format("bam")
                 .option("indexPath", baiPath)
                 .load(bamPath)
                 .filter("referenceName = 'CHROMOSOME_I'")
                 .rdd().getNumPartitions();
-        assertEquals(1, numParts,
-            "region push-down should produce a single partition regardless of BAI");
+        assertEquals(1, numParts, "tiny region fits a single partition at the default split size");
+    }
+
+    @Test
+    void hybrid_noFilter_multiBlockReference_splitsWithNoRecordsDropped() throws Exception {
+        // Realistic case: a reference whose data spans many BGZF blocks (records straddle block
+        // boundaries). With a small indexedSplitSize it must divide into many partitions yet return
+        // every record exactly once — this is the case byte-offset splitting silently dropped.
+        java.nio.file.Path manyBam = TestBamGenerator.generateManyReadsBam(tempDir, 10000);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .load(manyBam.toUri().toString());
+        assertTrue(df.rdd().getNumPartitions() > 2,
+                "multi-block reference must over-split; got " + df.rdd().getNumPartitions());
+        assertNoDropNoDuplicate(df, 10000L);
+    }
+
+    @Test
+    void hybrid_regionQuery_multiBlockReference_splitsWithNoRecordsDropped() throws Exception {
+        // Same fixture, but with a pushed referenceName filter (region path). The split must be
+        // exact: no dropped and no duplicated records across partitions.
+        java.nio.file.Path manyBam = TestBamGenerator.generateManyReadsBam(tempDir, 10000);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .load(manyBam.toUri().toString())
+                .filter("referenceName = '" + TestBamGenerator.REF_NAME + "'");
+        assertTrue(df.rdd().getNumPartitions() > 1,
+                "a large pushed region must split into multiple partitions; got " + df.rdd().getNumPartitions());
+        assertNoDropNoDuplicate(df, 10000L);
+    }
+
+    @Test
+    void hybrid_regionQuery_withStartRange_splits_countExact() throws Exception {
+        // A coordinate sub-range on a large reference: the count matches an unsplit reference scan
+        // filtered to the same range (Spark post-filters the coordinate range; the reader guarantees
+        // the reference and the exact union).
+        java.nio.file.Path manyBam = TestBamGenerator.generateManyReadsBam(tempDir, 10000);
+        String rangePred = "referenceName = '" + TestBamGenerator.REF_NAME
+                + "' AND start >= 400000 AND start <= 600000";
+        long expected = spark.read().format("bam")
+                .option("indexedSplitSize", "134217728")  // unsplit reference scan as ground truth
+                .load(manyBam.toUri().toString())
+                .filter(rangePred).count();
+        assertTrue(expected > 0, "fixture should have reads in the queried range");
+        Dataset<Row> ranged = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .load(manyBam.toUri().toString())
+                .filter(rangePred);
+        assertNoDropNoDuplicate(ranged, expected);
+    }
+
+    @Test
+    void hybrid_perChromosomeCounts_exactUnderSplitting() {
+        // Per-reference correctness for a real multi-reference BAM under the region path.
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexPath", baiPath)
+                .load(bamPath);
+        assertEquals(18L, df.filter("referenceName = 'CHROMOSOME_I'").count());
+        assertEquals(34L, df.filter("referenceName = 'CHROMOSOME_II'").count());
+        assertEquals(41L, df.filter("referenceName = 'CHROMOSOME_III'").count());
+        assertEquals(19L, df.filter("referenceName = 'CHROMOSOME_IV'").count());
+    }
+
+    @Test
+    void unindexed_multiBlockReference_splitsWithNoRecordsDropped() throws Exception {
+        // Unindexed (useIndex=false) BGZF byte-range split over a reference spanning many BGZF
+        // blocks where records straddle block boundaries. The split guesser must locate the first
+        // record start *within* a block so every partition orients — no records dropped or duplicated.
+        java.nio.file.Path manyBam = TestBamGenerator.generateManyReadsBam(tempDir, 10000);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("useIndex", "false")
+                .option("bgzfSplitSize", "4096")
+                .load(manyBam.toUri().toString());
+        assertTrue(df.rdd().getNumPartitions() > 2,
+                "small bgzfSplitSize must produce many partitions; got " + df.rdd().getNumPartitions());
+        assertNoDropNoDuplicate(df, 10000L);
+    }
+
+    @Test
+    void hybrid_noFilter_wholeFileCount_exactWithDefaultAndSmallSplit() throws Exception {
+        // Whole-file count is identical whether the reference is read as one partition (default) or
+        // split into many (small indexedSplitSize) — the split changes parallelism, not results.
+        java.nio.file.Path manyBam = TestBamGenerator.generateManyReadsBam(tempDir, 10000);
+        long deflt = spark.read().format("bam").load(manyBam.toUri().toString()).count();
+        long split = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .load(manyBam.toUri().toString()).count();
+        assertEquals(10000L, deflt);
+        assertEquals(deflt, split, "splitting must not change the record count");
     }
 
     // -------------------------------------------------------------------------

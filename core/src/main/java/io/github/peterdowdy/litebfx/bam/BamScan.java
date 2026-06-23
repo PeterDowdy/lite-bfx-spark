@@ -1,5 +1,8 @@
 package io.github.peterdowdy.litebfx.bam;
 
+import htsjdk.samtools.BAMFileSpan;
+import htsjdk.samtools.BAMIndex;
+import htsjdk.samtools.Chunk;
 import htsjdk.samtools.SAMFileHeader;
 import htsjdk.samtools.SAMSequenceRecord;
 import htsjdk.samtools.SamInputResource;
@@ -59,20 +62,23 @@ import java.util.zip.GZIPInputStream;
  *   <li>None → full-file scan, no region query</li>
  * </ol>
  *
- * <h3>VFO-based splitting (BAM + BAI, no pushed region)</h3>
- * When a BAI is available and no genomic region was pushed down by the query planner,
- * this scan creates one partition per reference sequence (or group of references when
- * {@code numPartitions} &lt; number of references), plus one partition for unplaced
- * unmapped reads.  Each per-reference reader calls {@code samReader.query()} with a
- * {@code QueryInterval[]}, causing htsjdk to use the BAI's virtual file offsets (VFOs)
- * to seek directly to each reference's data — no full-file scans.
+ * <h3>Hybrid indexed splitting (BAM + BAI, no pushed region)</h3>
+ * When a BAI is available and no genomic region was pushed down, this scan creates one partition
+ * per reference, but any reference whose data span exceeds {@code indexedSplitSize} (default 128 MB)
+ * is further divided into multiple partitions. Split boundaries are <b>record-start virtual file
+ * offsets</b> taken from the BAI (chunk starts and linear-index entries), so each partition seeks
+ * straight to a real record boundary and the per-reference union is exact — no records dropped or
+ * duplicated. One partition for unplaced unmapped reads is appended. When the file has more
+ * references than {@code numPartitions}, falls back to reference-grouped VFO partitions
+ * ({@link #planVfoPartitions}).
  *
  * <h3>Region push-down (BAM + BAI + pushed region)</h3>
- * A single partition is planned with the pushed region; the reader calls
- * {@code samReader.query(ref, start, end, false)}.
+ * The pushed region's BAI span is likewise divided into {@code indexedSplitSize}-sized VFO splits,
+ * so a large region read is parallelised across partitions while still skipping bytes outside it.
  *
  * <h3>Fallback</h3>
- * SAM files and BAM files without a BAI always get a single full-scan partition.
+ * SAM files and BAM files without a BAI always get a single full-scan partition. CRAM uses its own
+ * CRAI/container splitting.
  */
 public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsReportOrdering {
 
@@ -227,6 +233,13 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
         boolean useIndex = Boolean.parseBoolean(options.getOrDefault("useIndex", "true"));
         int maxPartitions = Integer.parseInt(options.getOrDefault("numPartitions", "200"));
+        // Hybrid indexed splitting: a single reference (or pushed region) whose BAI byte span
+        // exceeds this size is divided into multiple BGZF byte-range partitions. Default 128 MB.
+        long indexedSplitSize = Long.parseLong(options.getOrDefault("indexedSplitSize", "134217728"));
+        if (indexedSplitSize <= 0) {
+            throw new IllegalArgumentException(
+                    "indexedSplitSize must be a positive integer, got: " + indexedSplitSize);
+        }
         String referenceFile = options.get("referenceFile");
         String referenceMode = options.getOrDefault("referenceMode", referenceFile != null ? "file" : "none");
         log.trace("planInputPartitions() useIndex={} maxPartitions={} isCram={} referenceMode={}",
@@ -243,11 +256,23 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                 String fileUri = filePath.toUri().toString();
                 String indexPath = useIndex ? resolveIndexPath(filePath, hadoopConf) : null;
                 boolean isSam = fileUri.toLowerCase().endsWith(".sam");
-                log.trace("planInputPartitions() fileUri={} indexPath={} isSam={}", fileUri, indexPath, isSam);
+                // Hybrid VFO splitting reads the BAI on the driver to compute split offsets — only
+                // worthwhile when the file is larger than one split. For smaller files no reference
+                // or region can exceed indexedSplitSize, so use the cheaper index-guided paths that
+                // don't touch the BAI on the driver.
+                boolean hybridSplittable = fileStatus.getLen() > indexedSplitSize;
+                log.trace("planInputPartitions() fileUri={} indexPath={} isSam={} hybridSplittable={}",
+                        fileUri, indexPath, isSam, hybridSplittable);
 
-                if (!isCram && !isSam && indexPath != null && pushedReferenceName == null) {
-                    // VFO-based per-reference splitting: one partition group per reference,
-                    // plus one unmapped partition. htsjdk uses BAI VFOs internally.
+                if (!isCram && !isSam && indexPath != null && pushedReferenceName == null
+                        && hybridSplittable) {
+                    // Hybrid per-reference splitting: one partition per reference, but any
+                    // reference whose BAI byte span exceeds indexedSplitSize is further divided
+                    // into balanced VFO partitions. Plus one unmapped partition.
+                    planIndexedSplitPartitions(fileUri, filePath, indexPath, hadoopConf,
+                            referenceFile, referenceMode, maxPartitions, indexedSplitSize, partitions);
+                } else if (!isCram && !isSam && indexPath != null && pushedReferenceName == null) {
+                    // Indexed BAM that fits in one split: per-reference VFO partitions (no driver BAI read).
                     planVfoPartitions(fileUri, filePath, indexPath, hadoopConf,
                             referenceFile, referenceMode, maxPartitions, partitions);
                 } else if (!isCram && !isSam && indexPath == null && pushedReferenceName == null) {
@@ -269,14 +294,22 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                                 referenceFile, referenceMode, maxPartitions, partitions);
                     }
                 } else {
-                    // Single partition: region push-down with BAI/CRAI.
+                    // Region push-down with BAI/CRAI.
                     String querySequence = (pushedReferenceName != null && indexPath != null)
                             ? pushedReferenceName : null;
                     int queryStart = querySequence != null ? pushedStart : 1;
                     int queryEnd   = querySequence != null ? pushedEnd   : Integer.MAX_VALUE;
-                    log.trace("planInputPartitions() single partition querySequence={} queryStart={} queryEnd={}",
+                    log.trace("planInputPartitions() region querySequence={} queryStart={} queryEnd={}",
                             querySequence, queryStart, queryEnd);
-                    if (querySequence != null) {
+                    if (querySequence != null && !isCram && hybridSplittable) {
+                        // Hybrid: split the pushed region's BAI byte span into balanced partitions
+                        // (skips bytes outside the region and parallelises a large region read).
+                        planIndexedRegionSplitPartitions(fileUri, filePath, indexPath, hadoopConf,
+                                referenceFile, referenceMode, querySequence, queryStart, queryEnd,
+                                indexedSplitSize, partitions);
+                    } else if (querySequence != null) {
+                        // Small file or CRAM: a single index-guided region-query partition
+                        // (no driver-side BAI read).
                         partitions.add(BamInputPartition.forRegionQuery(
                                 fileUri, hadoopConf, indexPath, isCram,
                                 referenceFile, referenceMode,
@@ -348,12 +381,208 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
     }
 
     /**
+     * Hybrid per-reference splitting for an indexed BAM with no region filter.
+     *
+     * <p>Opens the BAM+BAI once to read the header and {@link BAMIndex}. Each reference becomes
+     * one partition, except references whose BAI byte span exceeds {@code splitSize}, which are
+     * divided into multiple balanced VFO-split partitions (see {@link #addReferenceVfoSplits}).
+     * One unmapped partition is appended. When the file has more references than
+     * {@code maxPartitions} (so the count must be capped by grouping), falls back to the
+     * reference-grouped {@link #planVfoPartitions}.
+     */
+    private void planIndexedSplitPartitions(String fileUri,
+                                            Path filePath,
+                                            String indexPath,
+                                            Configuration conf,
+                                            String referenceFile,
+                                            String referenceMode,
+                                            int maxPartitions,
+                                            long splitSize,
+                                            List<BamInputPartition> out) throws IOException {
+        List<String> refs = readReferenceNames(filePath, new Path(indexPath), conf);
+        if (refs.size() > maxPartitions) {
+            log.trace("planIndexedSplitPartitions() {} refs > maxPartitions {} — falling back to VFO grouping",
+                    refs.size(), maxPartitions);
+            planVfoPartitions(fileUri, filePath, indexPath, conf,
+                    referenceFile, referenceMode, maxPartitions, out);
+            return;
+        }
+
+        withBamIndex(filePath, new Path(indexPath), conf, (header, index) -> {
+            for (int refIdx = 0; refIdx < refs.size(); refIdx++) {
+                int seqLen = header.getSequence(refIdx).getSequenceLength();
+                addReferenceVfoSplits(index, header, refIdx, refs.get(refIdx),
+                        1, seqLen, splitSize,
+                        fileUri, conf, indexPath, referenceFile, referenceMode, out);
+            }
+        });
+
+        log.trace("planIndexedSplitPartitions() adding unmapped partition");
+        out.add(BamInputPartition.forUnmapped(fileUri, conf, indexPath, referenceFile, referenceMode));
+    }
+
+    /**
+     * Hybrid splitting for a pushed-down region query. Divides the BAI byte span overlapping
+     * {@code [queryStart, queryEnd]} on {@code refName} into balanced BGZF byte-range partitions,
+     * skipping bytes outside the region. Falls back to a single region-query partition when the
+     * reference is absent or has no indexed data.
+     */
+    private void planIndexedRegionSplitPartitions(String fileUri,
+                                                  Path filePath,
+                                                  String indexPath,
+                                                  Configuration conf,
+                                                  String referenceFile,
+                                                  String referenceMode,
+                                                  String refName,
+                                                  int queryStart,
+                                                  int queryEnd,
+                                                  long splitSize,
+                                                  List<BamInputPartition> out) throws IOException {
+        int before = out.size();
+        withBamIndex(filePath, new Path(indexPath), conf, (header, index) -> {
+            int refIdx = header.getSequenceIndex(refName);
+            if (refIdx < 0) return; // reference not in this file — leave empty, handled below
+            addReferenceVfoSplits(index, header, refIdx, refName,
+                    queryStart, queryEnd, splitSize,
+                    fileUri, conf, indexPath, referenceFile, referenceMode, out);
+        });
+        if (out.size() == before) {
+            // Reference absent or no indexed data: a single region query yields the correct
+            // (possibly empty) result.
+            out.add(BamInputPartition.forRegionQuery(fileUri, conf, indexPath, false,
+                    referenceFile, referenceMode, refName, queryStart, queryEnd));
+        }
+    }
+
+    /**
+     * Appends BAI-guided VFO-split partitions covering one reference's data in
+     * {@code [queryStart, queryEnd]}. Split boundaries are <b>record-start virtual file offsets</b>
+     * taken from the BAI (chunk starts and linear-index entries), so each partition seeks straight
+     * to a real record boundary — no byte-offset/block-boundary guessing, and the union across
+     * splits is exact. The reference's data span is divided into bins of roughly {@code splitSize}
+     * compressed bytes; a reference (or region) that fits in one bin yields a single partition.
+     * References with no indexed data in the range contribute nothing.
+     */
+    private void addReferenceVfoSplits(BAMIndex index,
+                                       SAMFileHeader header,
+                                       int refIdx,
+                                       String refName,
+                                       int queryStart,
+                                       int queryEnd,
+                                       long splitSize,
+                                       String fileUri,
+                                       Configuration conf,
+                                       String indexPath,
+                                       String referenceFile,
+                                       String referenceMode,
+                                       List<BamInputPartition> out) {
+        // Clamp the query interval to the reference length: getSpanOverlapping expects a 1-based
+        // inclusive end, and an unbounded pushed end (Integer.MAX_VALUE) yields a truncated span.
+        int seqLen = header.getSequence(refIdx).getSequenceLength();
+        int effStart = Math.max(1, queryStart);
+        int effEnd = (queryEnd <= 0 || queryEnd > seqLen) ? seqLen : queryEnd;
+
+        BAMFileSpan whole = index.getSpanOverlapping(refIdx, effStart, effEnd);
+        // getSpanOverlapping returns null (not an empty span) for a reference with no overlapping reads.
+        List<Chunk> chunks = whole == null ? java.util.Collections.emptyList() : whole.getChunks();
+        if (chunks.isEmpty()) {
+            log.trace("addReferenceVfoSplits() ref={} no indexed data in [{},{}]", refName, effStart, effEnd);
+            return;
+        }
+        long startVfo = chunks.get(0).getChunkStart();
+        long endVfo   = chunks.get(chunks.size() - 1).getChunkEnd();
+        long spanBytes = Math.max(1, (endVfo >> 16) - (startVfo >> 16));
+
+        if (spanBytes <= splitSize) {
+            out.add(BamInputPartition.forIndexedVfoSplit(fileUri, conf, indexPath, startVfo, endVfo,
+                    refName, queryStart, queryEnd, referenceFile, referenceMode));
+            return;
+        }
+
+        int targetSplits = (int) Math.min(Integer.MAX_VALUE, (spanBytes + splitSize - 1) / splitSize);
+        // Harvest candidate record-start VFOs across the queried coordinate range. The BAI linear
+        // index resolves a coordinate to the VFO of the first record overlapping it (<=16 kbp
+        // granularity); oversampling 4x relative to targetSplits yields enough cut points to balance
+        // bins by compressed bytes.
+        TreeSet<Long> cutVfos = new TreeSet<>();
+        cutVfos.add(startVfo);
+        long coordStep = Math.max(1L, (long) (effEnd - effStart) / ((long) targetSplits * 4L));
+        for (long c = effStart; c <= effEnd; c += coordStep) {
+            int cc = (int) Math.min(Integer.MAX_VALUE, c);
+            BAMFileSpan s = index.getSpanOverlapping(refIdx, cc, cc);
+            if (s != null && !s.getChunks().isEmpty()) {
+                cutVfos.add(s.getChunks().get(0).getChunkStart());
+            }
+        }
+
+        // Group consecutive cut VFOs into bins of ~splitSize compressed bytes; the final bin runs to
+        // the reference's end VFO. Boundaries are exact record starts, so bins tile [startVfo, endVfo)
+        // with no gaps or overlaps.
+        long binStartVfo = startVfo;
+        int emitted = 0;
+        for (long cut : cutVfos) {
+            if (cut <= binStartVfo || cut >= endVfo) continue;
+            if (((cut >> 16) - (binStartVfo >> 16)) >= splitSize) {
+                out.add(BamInputPartition.forIndexedVfoSplit(fileUri, conf, indexPath, binStartVfo, cut,
+                        refName, queryStart, queryEnd, referenceFile, referenceMode));
+                binStartVfo = cut;
+                emitted++;
+            }
+        }
+        out.add(BamInputPartition.forIndexedVfoSplit(fileUri, conf, indexPath, binStartVfo, endVfo,
+                refName, queryStart, queryEnd, referenceFile, referenceMode));
+        log.trace("addReferenceVfoSplits() ref={} span={}B -> {} partition(s)", refName, spanBytes, emitted + 1);
+    }
+
+    /** Functional callback over an opened {@link SAMFileHeader} + {@link BAMIndex}. */
+    @FunctionalInterface
+    private interface IndexAction {
+        void apply(SAMFileHeader header, BAMIndex index) throws IOException;
+    }
+
+    /**
+     * Opens the BAM together with its BAI (sharing the {@link #readReferenceNames} open pattern),
+     * exposes the header and {@link BAMIndex} to {@code action}, and closes everything afterward.
+     */
+    private void withBamIndex(Path bamPath, Path baiPath, Configuration conf, IndexAction action)
+            throws IOException {
+        FileSystem bamFs = bamPath.getFileSystem(conf);
+        long bamLen = bamFs.getFileStatus(bamPath).getLen();
+        FSDataInputStream bamStream = null;
+        FSDataInputStream baiStream = null;
+        try {
+            bamStream = bamFs.open(bamPath);
+            HadoopSeekableStream bamSeekable = new HadoopSeekableStream(
+                    bamStream, bamLen, bamPath.toUri().toString());
+
+            FileSystem baiFs = baiPath.getFileSystem(conf);
+            long baiLen = baiFs.getFileStatus(baiPath).getLen();
+            baiStream = baiFs.open(baiPath);
+            HadoopSeekableStream baiSeekable = new HadoopSeekableStream(
+                    baiStream, baiLen, baiPath.toUri().toString());
+
+            SamReaderFactory factory = SamReaderFactory.makeDefault()
+                    .validationStringency(ValidationStringency.LENIENT);
+            try (SamReader reader = factory.open(
+                    SamInputResource.of(bamSeekable).index(baiSeekable))) {
+                action.apply(reader.getFileHeader(), reader.indexing().getIndex());
+            }
+        } finally {
+            if (bamStream != null) try { bamStream.close(); } catch (IOException e) {
+                log.debug("suppressed exception closing BAM stream", e);
+            }
+            if (baiStream != null) try { baiStream.close(); } catch (IOException e) {
+                log.debug("suppressed exception closing BAI stream", e);
+            }
+        }
+    }
+
+    /**
      * Plans fixed-size byte-range partitions for an unindexed BAM file.
      *
-     * <p>Each executor will seek to its chunk boundary, scan forward for the first BGZF
-     * block whose decompressed content starts at a clean BAM record boundary, and read
-     * records from there until it reaches the next chunk boundary. Chunks that contain
-     * no clean record start produce zero rows (safe — Spark unions all partitions).
+     * <p>Each executor seeks to its chunk boundary, locates the first BAM record that starts at or
+     * after it, and reads records until it reaches the next chunk boundary. Chunks that contain no
+     * record start produce zero rows (safe — Spark unions all partitions).
      *
      * <h3>Why splits are not BGZF-block-aligned</h3>
      * <p>Split boundaries are computed arithmetically ({@code i × splitSize}) rather than
@@ -361,13 +590,12 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
      * boundaries would require the driver to scan the entire file sequentially — thousands
      * of seeks on cloud storage (S3, GCS, ADLS) — just to build a partition plan.
      *
-     * <p>Instead, each executor orients itself locally: {@link BamPartitionReader} calls
-     * {@code findNextBgzfBlockStart}, which reads at most one buffer of
-     * {@code MAX_COMPRESSED_BLOCK_SIZE + 4 ≈ 65 KB} (one HTTP Range request on object
-     * storage) to locate the next BGZF magic bytes, then probes the decompressed content
-     * for a valid BAM record-body length. This work is bounded, parallelised across
-     * executors, and negligible relative to the data each partition actually reads at the
-     * default 128 MB split size.
+     * <p>Instead, each executor orients itself locally: {@link BamPartitionReader#guessFirstRecordVfo}
+     * walks the contiguous BGZF blocks from the chunk boundary and finds the first record start —
+     * which usually lies <em>within</em> a block, since the writer flushes blocks mid-record. A
+     * candidate is accepted only when it and the following few records all parse as self-consistent
+     * BAM records, so the split is lossless even when every block begins mid-record. This work is
+     * bounded and negligible relative to the data each partition reads at the default 128 MB split.
      *
      * <h3>Degenerate split sizes</h3>
      * <p>Setting {@code bgzfSplitSize} smaller than {@code MAX_COMPRESSED_BLOCK_SIZE}

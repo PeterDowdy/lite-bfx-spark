@@ -51,6 +51,8 @@ public class BamInputPartition implements HasPartitionStatistics {
 
     // ---- split-mode flags ----
     private final boolean samSplit;
+    /** True when {@link #startByte}/{@link #endByte} carry BAI virtual file offsets, not byte offsets. */
+    private final boolean indexedVfoSplit;
 
     // ---- CRAM container-split ----
     private final long[] cramContainerSpans;
@@ -153,6 +155,35 @@ public class BamInputPartition implements HasPartitionStatistics {
     }
 
     /**
+     * BAI-guided <b>virtual file offset</b> split of a single reference's data (hybrid indexed
+     * splitting). {@code startVfo} and {@code endVfo} are BGZF virtual file offsets taken from the
+     * BAI — guaranteed record-start boundaries — so the reader seeks straight to {@code startVfo}
+     * (no block-boundary guessing) and reads until its file pointer reaches {@code endVfo}, emitting
+     * only records whose reference matches {@code querySequence}.
+     *
+     * <p>Because the boundaries are exact record-start VFOs, consecutive splits of one reference are
+     * disjoint at record granularity (no duplicates, no gaps). The reference filter additionally
+     * drops any neighbouring-reference records that share a boundary block. The coordinate range
+     * {@code [queryStart, queryEnd]} is carried for reference but enforced by Spark's post-scan
+     * filter, not the reader.
+     */
+    public static BamInputPartition forIndexedVfoSplit(String path,
+                                                       Configuration conf,
+                                                       String indexPath,
+                                                       long startVfo,
+                                                       long endVfo,
+                                                       String querySequence,
+                                                       int queryStart,
+                                                       int queryEnd,
+                                                       String referenceFile,
+                                                       String referenceMode) {
+        return new BamInputPartition(path, conf, indexPath, false, referenceFile, referenceMode,
+                startVfo, endVfo,
+                querySequence, queryStart, queryEnd,
+                null, false, false, null, true, Integer.MAX_VALUE);
+    }
+
+    /**
      * SAM text line-range split.
      * The reader seeks to {@code startByte}, discards bytes up to the next newline, and reads
      * SAM text lines until the line-start position reaches {@code endByte}.
@@ -206,7 +237,7 @@ public class BamInputPartition implements HasPartitionStatistics {
                               long[] cramContainerSpans) {
         this(path, conf, indexPath, isCram, referenceFile, referenceMode,
              startByte, endByte, querySequence, queryStart, queryEnd,
-             querySequences, queryUnmapped, samSplit, cramContainerSpans, Integer.MAX_VALUE);
+             querySequences, queryUnmapped, samSplit, cramContainerSpans, false, Integer.MAX_VALUE);
     }
 
     private BamInputPartition(String path,
@@ -224,6 +255,7 @@ public class BamInputPartition implements HasPartitionStatistics {
                               boolean queryUnmapped,
                               boolean samSplit,
                               long[] cramContainerSpans,
+                              boolean indexedVfoSplit,
                               int rowLimit) {
         this.path              = path;
         this.hadoopConf        = new SerializableConfiguration(conf);
@@ -240,6 +272,7 @@ public class BamInputPartition implements HasPartitionStatistics {
         this.queryUnmapped     = queryUnmapped;
         this.samSplit          = samSplit;
         this.cramContainerSpans = cramContainerSpans;
+        this.indexedVfoSplit   = indexedVfoSplit;
         this.rowLimit          = rowLimit;
     }
 
@@ -248,7 +281,7 @@ public class BamInputPartition implements HasPartitionStatistics {
         return new BamInputPartition(path, hadoopConf.get(), indexPath, isCram,
                 referenceFile, referenceMode, startByte, endByte,
                 querySequence, queryStart, queryEnd, querySequences,
-                queryUnmapped, samSplit, cramContainerSpans, limit);
+                queryUnmapped, samSplit, cramContainerSpans, indexedVfoSplit, limit);
     }
 
     // -------------------------------------------------------------------------
@@ -273,6 +306,11 @@ public class BamInputPartition implements HasPartitionStatistics {
     /** Returns true if this partition uses SAM line-based splitting. */
     public boolean isSamSplit()          { return samSplit; }
     /**
+     * Returns true if this partition is a BAI-guided VFO split: {@link #getStartByte()} and
+     * {@link #getEndByte()} carry virtual file offsets (record-start boundaries), not byte offsets.
+     */
+    public boolean isIndexedVfoSplit()   { return indexedVfoSplit; }
+    /**
      * Returns the alternating {@code [start, end]} container byte-offset spans for CRAM
      * container-split mode, or {@code null} for all other partition modes.
      */
@@ -286,6 +324,12 @@ public class BamInputPartition implements HasPartitionStatistics {
 
     @Override
     public OptionalLong sizeInBytes() {
+        // Indexed VFO split: startByte/endByte are virtual file offsets; the compressed byte span is
+        // the difference of their block addresses (upper 48 bits).
+        if (indexedVfoSplit) {
+            long rawBytes = (endByte >> 16) - (startByte >> 16);
+            return rawBytes > 0 ? OptionalLong.of(rawBytes) : OptionalLong.empty();
+        }
         // Byte-range splits (BGZF and SAM): exact compressed byte span.
         if ((endByte != Long.MAX_VALUE) && cramContainerSpans == null) {
             return OptionalLong.of(endByte - startByte);

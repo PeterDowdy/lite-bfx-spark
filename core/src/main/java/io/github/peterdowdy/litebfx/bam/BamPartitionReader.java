@@ -94,6 +94,19 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     private BAMRecordCodec bamRecordCodec;
     private FSDataInputStream bgzfFsInputStream;
 
+    /** Sentinel: BGZF split with no reference filter (plain unindexed split). */
+    private static final int NO_REF_FILTER = Integer.MIN_VALUE;
+    /**
+     * Reference index this BGZF-split partition is restricted to (hybrid indexed split), or
+     * {@link #NO_REF_FILTER}. Set when opening from {@code partition.getQuerySequence()}.
+     */
+    private int bgzfRefFilterIndex = NO_REF_FILTER;
+
+    // Indexed VFO-split mode — the reader seeks straight to a BAI record-start VFO and stops when
+    // its file pointer reaches endVfo (exact, index-guided; no block-boundary guessing).
+    private boolean indexedVfoMode = false;
+    private long indexedEndVfo;
+
     // SAM line-split mode — active when partition.isSamSplit()
     private boolean isSamSplitMode = false;
     private SAMLineParser samLineParser;  // null → empty partition
@@ -145,22 +158,35 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             }
         }
 
-        // BGZF split mode: use BAMRecordCodec with block-address stop condition.
+        // BGZF/VFO split mode: use BAMRecordCodec with an end-boundary stop condition. The stop is
+        // checked before each decode, so a record that begins before the boundary is read in full
+        // (the codec transparently reads into the next block to finish a straddling record).
         if (bcis != null) {
             if (bamRecordCodec == null) return false; // empty partition (no clean record start found)
             long endByte = partition.getEndByte();
-            if (endByte != Long.MAX_VALUE) {
-                long blockAddr = BlockCompressedFilePointerUtil.getBlockAddress(bcis.getFilePointer());
-                if (blockAddr >= endByte) {
-                    log.trace("nextRecord() BGZF split: reached end boundary blockAddr={} endByte={}", blockAddr, endByte);
-                    return false;
+            while (true) {
+                if (indexedVfoMode) {
+                    // Exact VFO stop: read records whose start VFO is < endVfo.
+                    if (bcis.getFilePointer() >= indexedEndVfo) return false;
+                } else if (endByte != Long.MAX_VALUE) {
+                    long blockAddr = BlockCompressedFilePointerUtil.getBlockAddress(bcis.getFilePointer());
+                    if (blockAddr >= endByte) {
+                        log.trace("nextRecord() BGZF split: reached end boundary blockAddr={} endByte={}", blockAddr, endByte);
+                        return false;
+                    }
                 }
+                SAMRecord r = (SAMRecord) bamRecordCodec.decode();
+                if (r == null) return false;
+                // Indexed BGZF split (hybrid): keep only records of the partition's reference.
+                // Byte ranges of adjacent references overlap at a shared boundary block, so the
+                // reference filter is what makes the per-reference union exact (no dup, no miss).
+                if (bgzfRefFilterIndex != NO_REF_FILTER && r.getReferenceIndex() != bgzfRefFilterIndex) {
+                    continue;
+                }
+                current = r;
+                log.trace("nextRecord() BGZF split -> readName={}", current.getReadName());
+                return true;
             }
-            SAMRecord r = (SAMRecord) bamRecordCodec.decode();
-            if (r == null) return false;
-            current = r;
-            log.trace("nextRecord() BGZF split -> readName={}", current.getReadName());
-            return true;
         }
 
         if (iterator == null || !iterator.hasNext()) return false;
@@ -229,6 +255,15 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
             log.trace("open() CRAM container-split mode spans.length={}",
                     partition.getCramContainerSpans().length);
             openCramContainerSplit();
+            return;
+        }
+
+        // Indexed VFO-split mode: startByte/endByte carry virtual file offsets (record-start
+        // boundaries from the BAI). Checked before BGZF byte-split since both set startByte/endByte.
+        if (partition.isIndexedVfoSplit()) {
+            log.trace("open() indexed VFO split startVfo={} endVfo={}",
+                    partition.getStartByte(), partition.getEndByte());
+            openIndexedVfoSplit();
             return;
         }
 
@@ -408,27 +443,22 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
     }
 
     /**
-     * Opens the partition in BGZF split mode.
-     *
-     * <p>Reads the BAM header from byte 0 using a temporary stream, then opens a second
-     * stream positioned at the first BGZF block in this partition's byte range whose
-     * decompressed content begins at a clean BAM record boundary. Partitions where no
-     * such block exists are marked empty ({@link #bamRecordCodec} remains null).
-     *
-     * <p>For cross-block records (e.g. PacBio/Nanopore reads > ~65 KB uncompressed),
-     * the record is owned entirely by the partition that holds the block where it starts.
-     * Subsequent partitions skip the tail block(s) by rejecting blocks whose first 4
-     * decompressed bytes do not form a plausible BAM record-body length.
+     * Parsed BAM header plus the virtual file offset of the first alignment record.
      */
-    private void openBgzfSplit() throws IOException {
-        Configuration conf = partition.getHadoopConf();
-        Path bamPath = new Path(partition.getPath());
-        FileSystem fs = bamPath.getFileSystem(conf);
-        long fileLength = fs.getFileStatus(bamPath).getLen();
+    private static final class BamHeaderInfo {
+        final SAMFileHeader header;
+        final long firstDataVfo;
+        BamHeaderInfo(SAMFileHeader header, long firstDataVfo) {
+            this.header = header;
+            this.firstDataVfo = firstDataVfo;
+        }
+    }
 
-        // ── Step A: parse BAM header from byte 0 to get SAMFileHeader + firstDataVFO ──
-        SAMFileHeader header;
-        long firstDataVFO;
+    /**
+     * Parses the BAM header from byte 0 via a temporary BGZF stream, returning the
+     * {@link SAMFileHeader} and the virtual file offset where the first alignment record begins.
+     */
+    private BamHeaderInfo parseBgzfHeader(FileSystem fs, Path bamPath, long fileLength) throws IOException {
         FSDataInputStream hdrStream = fs.open(bamPath);
         try {
             BlockCompressedInputStream hdrBcis = new BlockCompressedInputStream(
@@ -455,18 +485,82 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                     rem -= sk;
                 }
             }
-            firstDataVFO = hdrBcis.getFilePointer();
-            log.trace("openBgzfSplit() firstDataVFO={}", firstDataVFO);
+            long firstDataVFO = hdrBcis.getFilePointer();
 
             SAMTextHeaderCodec headerCodec = new SAMTextHeaderCodec();
             headerCodec.setValidationStringency(ValidationStringency.LENIENT);
-            header = headerCodec.decode(
+            SAMFileHeader header = headerCodec.decode(
                     new StringLineReader(new String(headerText, java.nio.charset.StandardCharsets.US_ASCII)),
                     partition.getPath());
             hdrBcis.close();
+            return new BamHeaderInfo(header, firstDataVFO);
         } finally {
             hdrStream.close();
         }
+    }
+
+    /**
+     * Opens the partition in indexed VFO-split mode: seeks straight to {@code startByte} (a BAI
+     * record-start virtual file offset) and reads records until the file pointer reaches
+     * {@code endByte} (also a VFO), keeping only records of {@code querySequence}. Because both
+     * boundaries are exact record-start VFOs from the index, no block-boundary guessing is needed
+     * and the per-reference union across splits is exact.
+     */
+    private void openIndexedVfoSplit() throws IOException {
+        Configuration conf = partition.getHadoopConf();
+        Path bamPath = new Path(partition.getPath());
+        FileSystem fs = bamPath.getFileSystem(conf);
+        long fileLength = fs.getFileStatus(bamPath).getLen();
+
+        SAMFileHeader header = parseBgzfHeader(fs, bamPath, fileLength).header;
+        bgzfRefFilterIndex = partition.getQuerySequence() != null
+                ? header.getSequenceIndex(partition.getQuerySequence()) : NO_REF_FILTER;
+        indexedVfoMode = true;
+        indexedEndVfo = partition.getEndByte();
+
+        bgzfFsInputStream = fs.open(bamPath);
+        boolean success = false;
+        try {
+            bcis = new BlockCompressedInputStream(
+                    new HadoopSeekableStream(bgzfFsInputStream, fileLength, partition.getPath()));
+            bcis.seek(partition.getStartByte()); // startByte carries the start VFO (a record boundary)
+            bamRecordCodec = new BAMRecordCodec(header);
+            bamRecordCodec.setInputStream(bcis, partition.getPath());
+            success = true;
+        } finally {
+            if (!success) {
+                if (bcis != null) {
+                    try { bcis.close(); } catch (IOException e) { log.debug("suppressed bcis close", e); }
+                } else {
+                    bgzfFsInputStream.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens the partition in BGZF split mode.
+     *
+     * <p>Reads the BAM header from byte 0 using a temporary stream, then opens a second stream
+     * positioned at the first BAM record that starts at or after this partition's {@code startByte},
+     * located by {@link #guessFirstRecordVfo} (which finds record starts <em>within</em> a BGZF
+     * block, not only at block boundaries). Partitions where no record start exists in range are
+     * marked empty ({@link #bamRecordCodec} remains null).
+     *
+     * <p>A record is owned by exactly one partition — the one whose byte range contains the start of
+     * the BGZF block holding the record's first byte — so the split is lossless even when records
+     * straddle every block boundary.
+     */
+    private void openBgzfSplit() throws IOException {
+        Configuration conf = partition.getHadoopConf();
+        Path bamPath = new Path(partition.getPath());
+        FileSystem fs = bamPath.getFileSystem(conf);
+        long fileLength = fs.getFileStatus(bamPath).getLen();
+
+        // ── Step A: parse BAM header from byte 0 to get SAMFileHeader + firstDataVFO ──
+        BamHeaderInfo hdr = parseBgzfHeader(fs, bamPath, fileLength);
+        SAMFileHeader header = hdr.header;
+        long firstDataVFO = hdr.firstDataVfo;
 
         // ── Step B: open data stream, seek to first clean record start in our range ──
         bgzfFsInputStream = fs.open(bamPath);
@@ -481,18 +575,18 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
                 startVFO = firstDataVFO;
                 log.trace("openBgzfSplit() partition 0: startVFO={}", startVFO);
             } else {
-                long cleanBlockByte = findCleanRecordStart(
-                        bgzfFsInputStream, bcis,
+                startVFO = guessFirstRecordVfo(
+                        bgzfFsInputStream, bcis, fileLength,
                         partition.getStartByte(),
-                        partition.getEndByte());
-                if (cleanBlockByte < 0) {
-                    log.trace("openBgzfSplit() no clean record start found — empty partition");
+                        partition.getEndByte(),
+                        header.getSequenceDictionary().size());
+                if (startVFO < 0) {
+                    log.trace("openBgzfSplit() no record start found in range — empty partition");
                     bamRecordCodec = null;
                     success = true;
                     return;
                 }
-                startVFO = BlockCompressedFilePointerUtil.makeFilePointer(cleanBlockByte);
-                log.trace("openBgzfSplit() clean block at byte={} vfo={}", cleanBlockByte, startVFO);
+                log.trace("openBgzfSplit() first record vfo={}", startVFO);
             }
 
             bcis.seek(startVFO);
@@ -656,35 +750,164 @@ public class BamPartitionReader implements PartitionReader<InternalRow> {
         return readLineFrom(fsInputStream);
     }
 
-    /**
-     * Scans BGZF blocks starting at {@code searchFrom} for the first block whose
-     * decompressed content begins at a clean BAM record boundary (first 4 bytes form a
-     * plausible record-body length). Blocks that start mid-record are skipped.
-     *
-     * @return raw file offset of the qualifying block, or -1 if none found in range
-     */
-    private static long findCleanRecordStart(FSDataInputStream rawStream,
-                                              BlockCompressedInputStream bcis,
-                                              long searchFrom,
-                                              long endByte) throws IOException {
-        long candidate = findNextBgzfBlockStart(rawStream, searchFrom);
-        while (candidate >= 0) {
-            if (endByte != Long.MAX_VALUE && candidate >= endByte) return -1L;
+    /** Number of consecutive self-consistent records required to accept a candidate record start. */
+    private static final int GUESS_VALIDATE_RECORDS = 3;
+    /** Fixed BAM record header bytes parsed for validation: block_size(4) + the 32-byte fixed block. */
+    private static final int BAM_RECORD_FIXED = 36;
 
-            bcis.seek(BlockCompressedFilePointerUtil.makeFilePointer(candidate));
-            byte[] probe = new byte[4];
-            int n = bcis.read(probe, 0, 4);
-            if (n == 4) {
-                int bodyLen = ((probe[3] & 0xff) << 24) | ((probe[2] & 0xff) << 16)
-                            | ((probe[1] & 0xff) << 8)  |  (probe[0] & 0xff);
-                if (bodyLen >= MIN_BAM_RECORD_BODY && bodyLen <= MAX_BAM_RECORD_BODY) {
-                    return candidate;
+    /**
+     * Finds the virtual file offset of the first BAM record that begins at or after
+     * {@code searchFrom} (in the compressed file), for an unindexed BGZF split. Unlike a
+     * block-boundary search, the record start may lie <em>within</em> a BGZF block — which is the
+     * normal case, because the writer flushes 64 KB blocks mid-record, so most blocks begin with the
+     * tail of a straddling record. Without locating these in-block starts, every partition after the
+     * first would fail to orient and silently drop its records.
+     *
+     * <p>For each contiguous BGZF block at or after {@code searchFrom}, every uncompressed offset in
+     * the block is tried as a candidate record start and accepted only if it and the following
+     * {@value #GUESS_VALIDATE_RECORDS} records all parse as self-consistent BAM records (in-range
+     * {@code refID}/{@code pos}/{@code next_refID}/{@code next_pos} and a {@code block_size}
+     * consistent with the name/cigar/seq/qual lengths), or fewer at a clean end of file. Requiring a
+     * run of valid records makes a coincidental mid-record match effectively impossible.
+     *
+     * @return the record-start virtual file offset, or -1 if none is found before {@code endByte}
+     */
+    private long guessFirstRecordVfo(FSDataInputStream rawStream,
+                                     BlockCompressedInputStream bcis,
+                                     long fileLength,
+                                     long searchFrom,
+                                     long endByte,
+                                     int numRefs) throws IOException {
+        long cp = findNextBgzfBlockStart(rawStream, searchFrom);
+        while (cp >= 0 && cp < fileLength && (endByte == Long.MAX_VALUE || cp < endByte)) {
+            long[] block = parseBgzfBlock(rawStream, cp, fileLength); // {compressedSize, uncompressedSize}
+            if (block == null) {
+                // Not a real block boundary (e.g. magic bytes inside compressed data); keep scanning.
+                cp = findNextBgzfBlockStart(rawStream, cp + 1);
+                continue;
+            }
+            int uncompressed = (int) block[1];
+            for (int u = 0; u < uncompressed; u++) {
+                long vfo = BlockCompressedFilePointerUtil.makeFilePointer(cp, u);
+                if (isRecordStart(bcis, vfo, numRefs)) {
+                    return vfo;
                 }
             }
-            // Block starts mid-record; advance past it to try the next one.
-            candidate = findNextBgzfBlockStart(rawStream, candidate + 1);
+            cp += block[0]; // contiguous next block
         }
         return -1L;
+    }
+
+    /**
+     * Parses the BGZF block header (and gzip footer) at raw offset {@code cp} without decompressing,
+     * returning {@code {compressedBlockSize, uncompressedSize}}, or null if {@code cp} is not a valid
+     * BGZF block start.
+     */
+    private static long[] parseBgzfBlock(FSDataInputStream stream, long cp, long fileLength) throws IOException {
+        if (cp + 18 > fileLength) return null;
+        stream.seek(cp);
+        byte[] head = new byte[12];
+        if (readFully(stream, head) < 12) return null;
+        if (head[0] != BGZF_MAGIC[0] || head[1] != BGZF_MAGIC[1]
+                || head[2] != BGZF_MAGIC[2] || head[3] != BGZF_MAGIC[3]) return null;
+        int xlen = (head[10] & 0xff) | ((head[11] & 0xff) << 8);
+        byte[] extra = new byte[xlen];
+        if (readFully(stream, extra) < xlen) return null;
+        int bsize = -1;
+        for (int i = 0; i + 4 <= xlen; ) {
+            int si1 = extra[i] & 0xff;
+            int si2 = extra[i + 1] & 0xff;
+            int slen = (extra[i + 2] & 0xff) | ((extra[i + 3] & 0xff) << 8);
+            if (si1 == 66 && si2 == 67 && slen == 2 && i + 6 <= xlen) {
+                bsize = (extra[i + 4] & 0xff) | ((extra[i + 5] & 0xff) << 8);
+                break;
+            }
+            i += 4 + slen;
+        }
+        if (bsize < 0) return null;
+        long compressedSize = bsize + 1L;          // BGZF: total block size is BSIZE + 1
+        if (cp + compressedSize > fileLength) return null;
+        stream.seek(cp + compressedSize - 4);       // ISIZE = last 4 bytes (uncompressed length)
+        byte[] isize = new byte[4];
+        if (readFully(stream, isize) < 4) return null;
+        long uncompressedSize = le32(isize, 0) & 0xffffffffL;
+        return new long[]{compressedSize, uncompressedSize};
+    }
+
+    /**
+     * Returns true if a run of {@value #GUESS_VALIDATE_RECORDS} self-consistent BAM records begins at
+     * {@code vfo} (or fewer, ending at a clean end of file). Used by {@link #guessFirstRecordVfo}.
+     */
+    private static boolean isRecordStart(BlockCompressedInputStream bcis, long vfo, int numRefs)
+            throws IOException {
+        bcis.seek(vfo);
+        byte[] h = new byte[BAM_RECORD_FIXED];
+        for (int i = 0; i < GUESS_VALIDATE_RECORDS; i++) {
+            int n = readFully(bcis, h);
+            if (n == 0) return i >= 1;            // clean EOF at a record boundary after >=1 record
+            if (n < BAM_RECORD_FIXED) return false; // truncated header → not a valid start here
+            int blockSize = le32(h, 0);
+            int refId     = le32(h, 4);
+            int pos       = le32(h, 8);
+            int lReadName = h[12] & 0xff;
+            int nCigar    = (h[16] & 0xff) | ((h[17] & 0xff) << 8);
+            int lSeq      = le32(h, 20);
+            int nextRefId = le32(h, 24);
+            int nextPos   = le32(h, 28);
+            if (!(blockSize >= MIN_BAM_RECORD_BODY && blockSize <= MAX_BAM_RECORD_BODY
+                    && refId >= -1 && refId < numRefs
+                    && nextRefId >= -1 && nextRefId < numRefs
+                    && pos >= -1 && nextPos >= -1
+                    && lReadName >= 1 && lSeq >= 0 && nCigar >= 0)) {
+                return false;
+            }
+            // block_size must be at least the fixed 32 bytes after it + name + cigar + seq + qual.
+            long minBytes = 32L + lReadName + 4L * nCigar + (lSeq + 1) / 2 + lSeq;
+            if (blockSize < minBytes) return false;
+            // Advance to the next record: block_size counts bytes after the length field; 32 read here.
+            if (!skipFully(bcis, blockSize - 32L)) return false; // claimed length runs past EOF → invalid
+        }
+        return true;
+    }
+
+    /** Skips exactly {@code n} bytes from {@code bcis} by reading and discarding; false if EOF first. */
+    private static boolean skipFully(BlockCompressedInputStream bcis, long n) throws IOException {
+        byte[] discard = new byte[(int) Math.min(n, 8192L)];
+        long remaining = n;
+        while (remaining > 0) {
+            int r = bcis.read(discard, 0, (int) Math.min(discard.length, remaining));
+            if (r < 0) return false;
+            remaining -= r;
+        }
+        return true;
+    }
+
+    /** Reads up to {@code buf.length} bytes, returning the count actually read (handles short reads). */
+    private static int readFully(BlockCompressedInputStream bcis, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int r = bcis.read(buf, total, buf.length - total);
+            if (r < 0) break;
+            total += r;
+        }
+        return total;
+    }
+
+    /** Reads up to {@code buf.length} bytes from a raw stream, returning the count actually read. */
+    private static int readFully(FSDataInputStream stream, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int r = stream.read(buf, total, buf.length - total);
+            if (r < 0) break;
+            total += r;
+        }
+        return total;
+    }
+
+    /** Little-endian int32 decode at {@code off}. */
+    private static int le32(byte[] b, int off) {
+        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8)
+                | ((b[off + 2] & 0xff) << 16) | ((b[off + 3] & 0xff) << 24);
     }
 
     /**
