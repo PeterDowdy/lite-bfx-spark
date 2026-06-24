@@ -5,6 +5,7 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.SortOrder;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
@@ -541,6 +542,85 @@ class BamDataSourceTest {
                 .load(manyBam.toUri().toString()).count();
         assertEquals(10000L, deflt);
         assertEquals(deflt, split, "splitting must not change the record count");
+    }
+
+    // -------------------------------------------------------------------------
+    // Skew-aware fallback: more references than numPartitions
+    // -------------------------------------------------------------------------
+
+    // 12 references (heavy chrBig + 11 small) but only numPartitions=4, with a small
+    // indexedSplitSize so the heavy reference's data exceeds one split. This is the path
+    // (refs > numPartitions) that previously fell back to equal-count reference grouping,
+    // bundling the heavy reference into one straggler partition.
+    private static final int SKEW_SMALL_REFS = 11;
+    private static final int SKEW_HEAVY_READS = 6000;
+    private static final int SKEW_SMALL_READS = 5;
+    private static final long SKEW_TOTAL = SKEW_HEAVY_READS + (long) SKEW_SMALL_REFS * SKEW_SMALL_READS;
+
+    @Test
+    void skewAwareFallback_heavyReferenceSubSplitAcrossPartitions() throws Exception {
+        // With refs (12) > numPartitions (4), the heavy reference must STILL be byte-split rather
+        // than packed whole into a single group — so its reads span multiple input partitions.
+        // spark_partition_id() (no shuffle in this plan) reports the originating input partition.
+        java.nio.file.Path skewBam = TestBamGenerator.generateSkewedMultiRefBam(
+                tempDir, SKEW_SMALL_REFS, SKEW_HEAVY_READS, SKEW_SMALL_READS);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .option("numPartitions", "4")
+                .load(skewBam.toUri().toString());
+
+        long heavyPartitions = df.filter("referenceName = 'chrBig'")
+                .select(functions.spark_partition_id().alias("pid"))
+                .distinct().count();
+        assertTrue(heavyPartitions >= 2,
+                "heavy reference must be sub-split across partitions even when refs > numPartitions; got "
+                        + heavyPartitions);
+    }
+
+    @Test
+    void skewAwareFallback_allRecordsPreservedNoDropNoDuplicate() throws Exception {
+        java.nio.file.Path skewBam = TestBamGenerator.generateSkewedMultiRefBam(
+                tempDir, SKEW_SMALL_REFS, SKEW_HEAVY_READS, SKEW_SMALL_READS);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .option("numPartitions", "4")
+                .load(skewBam.toUri().toString());
+        assertNoDropNoDuplicate(df, SKEW_TOTAL);
+    }
+
+    @Test
+    void skewAwareFallback_perReferenceCountsExact() throws Exception {
+        // Every reference's reads survive the byte-balanced grouping — the heavy one and all 11
+        // small ones — at their exact counts.
+        java.nio.file.Path skewBam = TestBamGenerator.generateSkewedMultiRefBam(
+                tempDir, SKEW_SMALL_REFS, SKEW_HEAVY_READS, SKEW_SMALL_READS);
+        Dataset<Row> df = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .option("numPartitions", "4")
+                .load(skewBam.toUri().toString());
+        assertEquals(SKEW_HEAVY_READS, df.filter("referenceName = 'chrBig'").count());
+        for (int s = 1; s <= SKEW_SMALL_REFS; s++) {
+            String ref = String.format("chr%02d", s);
+            assertEquals(SKEW_SMALL_READS, df.filter("referenceName = '" + ref + "'").count(),
+                    "small reference " + ref + " must keep all its reads");
+        }
+    }
+
+    @Test
+    void skewAwareFallback_wholeFileCountMatchesUnsplit() throws Exception {
+        // The skew-aware fallback changes parallelism, not results: the count equals a single-
+        // partition ground-truth read (large numPartitions, default split = one partition per ref).
+        java.nio.file.Path skewBam = TestBamGenerator.generateSkewedMultiRefBam(
+                tempDir, SKEW_SMALL_REFS, SKEW_HEAVY_READS, SKEW_SMALL_READS);
+        long groundTruth = spark.read().format("bam")
+                .option("numPartitions", "500")
+                .load(skewBam.toUri().toString()).count();
+        long fallback = spark.read().format("bam")
+                .option("indexedSplitSize", "4096")
+                .option("numPartitions", "4")
+                .load(skewBam.toUri().toString()).count();
+        assertEquals(SKEW_TOTAL, groundTruth);
+        assertEquals(groundTruth, fallback, "skew-aware grouping must not change the record count");
     }
 
     // -------------------------------------------------------------------------

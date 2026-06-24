@@ -175,6 +175,65 @@ public class TestBamGenerator {
     }
 
     /**
+     * Generates a coordinate-sorted, skewed multi-reference BAM (with a co-located BAI): one
+     * "heavy" reference ({@code chrBig}, reference 0) carrying {@code heavyReads} reads — enough to
+     * span many BGZF blocks — followed by {@code numSmallRefs} small references ({@code chr01},
+     * {@code chr02}, …) carrying {@code smallReads} reads each. Used to exercise the skew-aware
+     * fallback that triggers when the reference count exceeds {@code numPartitions}: the heavy
+     * reference must still be byte-split while the small ones are bin-packed.
+     *
+     * <p>Read names are globally unique ({@code r<refIdx>_<i>}) so a distinct-name count is an exact
+     * de-duplication check. Total records = {@code heavyReads + numSmallRefs * smallReads}.
+     *
+     * @return the BAM path; the index is written alongside as {@code skewed.bam.bai}
+     */
+    public static Path generateSkewedMultiRefBam(Path dir, int numSmallRefs, int heavyReads,
+                                                 int smallReads) throws IOException {
+        SAMFileHeader header = new SAMFileHeader();
+        header.setSortOrder(SAMFileHeader.SortOrder.coordinate);
+        header.addSequence(new SAMSequenceRecord("chrBig", REF_LENGTH));
+        for (int s = 0; s < numSmallRefs; s++) {
+            header.addSequence(new SAMSequenceRecord(String.format("chr%02d", s + 1), REF_LENGTH));
+        }
+
+        Path bamPath = dir.resolve("skewed.bam");
+        Path baiPath = dir.resolve("skewed.bam.bai");
+        try (SAMFileWriter writer = new SAMFileWriterFactory()
+                .setCreateIndex(true)
+                .makeBAMWriter(header, true, bamPath.toFile())) {
+            // References are written in dictionary order (heavy first), reads within each in
+            // increasing position — the order htsjdk's presorted=true writer requires.
+            for (int refIdx = 0; refIdx <= numSmallRefs; refIdx++) {
+                int reads = (refIdx == 0) ? heavyReads : smallReads;
+                int step = Math.max(1, (REF_LENGTH - 1) / reads);
+                for (int i = 0; i < reads; i++) {
+                    SAMRecord r = new SAMRecord(header);
+                    r.setReadName("r" + refIdx + "_" + i);
+                    r.setFlags(0);
+                    r.setReferenceIndex(refIdx);
+                    r.setAlignmentStart(1 + i * step);
+                    r.setMappingQuality(MAPPING_QUALITY);
+                    r.setCigarString(CIGAR);
+                    r.setReadString(SEQUENCE);
+                    r.setBaseQualityString(BASE_QUALITIES);
+                    r.setMateReferenceIndex(SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX);
+                    r.setMateAlignmentStart(0);
+                    r.setInferredInsertSize(0);
+                    r.setAttribute("NM", 0);
+                    writer.addAlignment(r);
+                }
+            }
+        }
+
+        // htsjdk may name the index skewed.bai instead of skewed.bam.bai; normalise.
+        Path altBaiPath = dir.resolve("skewed.bai");
+        if (!baiPath.toFile().exists() && altBaiPath.toFile().exists()) {
+            Files.move(altBaiPath, baiPath);
+        }
+        return bamPath;
+    }
+
+    /**
      * Generates a queryname-sorted BAM (no BAI) with {@value #RECORD_COUNT} records.
      * Used to verify that {@code BamScan.outputOrdering()} returns empty for non-coordinate sort.
      */
