@@ -31,7 +31,25 @@ WGS sample.bam, indexedSplitSize=128 MiB:
   unmapped                → samReader.queryUnmapped()
 ```
 
-Total records across all partitions = all records in the file, each exactly once. When a file has more references than `numPartitions`, the scan instead falls back to reference-grouped VFO partitions (one `QueryInterval[]` per group) to keep the partition count capped.
+Total records across all partitions = all records in the file, each exactly once.
+
+#### Many references (skew-aware fallback)
+
+When a file has more references than `numPartitions`, one-partition-per-reference would blow the cap, so the scan groups references instead. The grouping is **skew-aware**: it still reads the BAI on the driver and measures each reference's compressed byte span, then
+
+- any single reference whose span exceeds `indexedSplitSize` is **sub-split** into VFO partitions exactly as above (so one heavy reference among thousands still gets its own size-based splits), and
+- the remaining references are **bin-packed by byte span** (greedy longest-processing-time) into the leftover partition budget — one `QueryInterval[]` per group.
+
+References with no indexed reads contribute nothing and are dropped; one unmapped partition is appended. Because groups are balanced by bytes rather than by reference count, a hot reference can no longer be bundled with arbitrary neighbours into a single straggler task.
+
+```
+panel.bam, 5000 references, numPartitions=200, indexedSplitSize=128 MiB:
+  chrBig (900 MiB of reads)        → 7 VFO splits          (exceeds split size)
+  4999 small refs (≤128 MiB each)  → bin-packed into 193 byte-balanced groups
+  unmapped                         → samReader.queryUnmapped()
+  ≈ 7 + 193 + 1 = 201 partitions, each ~equal compressed bytes
+```
+
 
 ### When a region filter is pushed
 
@@ -192,7 +210,8 @@ This is why reads from `s3a://`, `abfss://`, or `gs://` paths work transparently
 `numPartitions` controls the maximum number of partitions per file (excluding the unmapped partition for BAM). The actual count is:
 
 ```
-BAM (with BAI):              min(numPartitions, numReferences) + 1 unmapped partition
+BAM (with BAI), refs ≤ numPartitions: one partition per reference (heavy refs sub-split by indexedSplitSize) + 1 unmapped
+BAM (with BAI), refs > numPartitions: skew-aware — heavy refs sub-split, the rest bin-packed by byte span into the remaining budget + 1 unmapped
 BAM (no BAI):                ceil(fileSize / bgzfSplitSize)        — not capped by numPartitions
 SAM:                         ceil(fileSize / samSplitSize)         — not capped by numPartitions
 CRAM (with CRAI):            min(numPartitions, numContainers)
@@ -209,7 +228,7 @@ FASTQ (plain-gzip):          1 (not splittable)
 FASTQ (uncompressed):        min(numPartitions, ceil(fileSize / minSplitBytes))
 ```
 
-Setting `numPartitions` higher than the number of references in a BAM has no effect — you cannot have more partitions than references. Setting it lower groups references together, reducing parallelism but also reducing the number of BAI seeks and task overhead.
+Because a heavy reference is sub-split by `indexedSplitSize`, the actual BAM partition count can exceed `numPartitions` — the cap governs how references are *grouped*, not a hard ceiling once byte-sized splitting kicks in. Setting `numPartitions` higher than the number of references gives each reference its own partition (and sub-splits the heavy ones). Setting it lower than the reference count triggers the skew-aware grouping above: references are bin-packed by byte span rather than chopped into equal-count slices, so a hot reference is not merged with neighbours into a straggler.
 
 `numPartitions` caps **index-guided** and container splits (BAM reference groups, CRAM container groups, tabix chromosome groups). It does **not** cap the byte-range splits of an unindexed BAM or a SAM file — those are governed solely by `bgzfSplitSize` / `samSplitSize`. To bound the partition count of a large unindexed BAM, raise `bgzfSplitSize`.
 

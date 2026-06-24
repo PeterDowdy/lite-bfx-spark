@@ -41,8 +41,10 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.OptionalLong;
+import java.util.PriorityQueue;
 import java.util.TreeSet;
 import java.util.zip.GZIPInputStream;
 
@@ -69,8 +71,10 @@ import java.util.zip.GZIPInputStream;
  * offsets</b> taken from the BAI (chunk starts and linear-index entries), so each partition seeks
  * straight to a real record boundary and the per-reference union is exact — no records dropped or
  * duplicated. One partition for unplaced unmapped reads is appended. When the file has more
- * references than {@code numPartitions}, falls back to reference-grouped VFO partitions
- * ({@link #planVfoPartitions}).
+ * references than {@code numPartitions}, falls back to skew-aware grouping
+ * ({@link #planSkewAwareVfoPartitions}): references are split or bin-packed by their BAI byte span
+ * so a single heavy reference still gets its own size-based splits rather than being bundled with
+ * neighbours into a straggler partition.
  *
  * <h3>Region push-down (BAM + BAI + pushed region)</h3>
  * The pushed region's BAI span is likewise divided into {@code indexedSplitSize}-sized VFO splits,
@@ -401,10 +405,10 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
                                             List<BamInputPartition> out) throws IOException {
         List<String> refs = readReferenceNames(filePath, new Path(indexPath), conf);
         if (refs.size() > maxPartitions) {
-            log.trace("planIndexedSplitPartitions() {} refs > maxPartitions {} — falling back to VFO grouping",
+            log.trace("planIndexedSplitPartitions() {} refs > maxPartitions {} — skew-aware byte grouping",
                     refs.size(), maxPartitions);
-            planVfoPartitions(fileUri, filePath, indexPath, conf,
-                    referenceFile, referenceMode, maxPartitions, out);
+            planSkewAwareVfoPartitions(fileUri, filePath, indexPath, conf,
+                    referenceFile, referenceMode, maxPartitions, splitSize, out);
             return;
         }
 
@@ -419,6 +423,134 @@ public class BamScan implements Scan, Batch, SupportsReportStatistics, SupportsR
 
         log.trace("planIndexedSplitPartitions() adding unmapped partition");
         out.add(BamInputPartition.forUnmapped(fileUri, conf, indexPath, referenceFile, referenceMode));
+    }
+
+    /**
+     * Skew-aware fallback for an indexed BAM whose reference count exceeds {@code maxPartitions}.
+     *
+     * <p>Reads the BAI once on the driver and measures each reference's BAI byte span. References
+     * are then placed by <b>compressed byte span</b>, not by count:
+     * <ul>
+     *   <li>any reference whose span alone exceeds {@code splitSize} is divided into balanced
+     *       VFO-split partitions (see {@link #addReferenceVfoSplits}), exactly as the
+     *       per-reference hybrid path does;</li>
+     *   <li>the remaining references are bin-packed by byte span (greedy longest-processing-time)
+     *       into the leftover partition budget, so one heavy reference can no longer be bundled
+     *       with arbitrary neighbours into a single straggler task.</li>
+     * </ul>
+     * References with no indexed data contribute no reads and are dropped. One unmapped partition
+     * is appended.
+     *
+     * <p>This trades one extra driver-side BAI read (already paid by the per-reference hybrid path)
+     * for skew-balanced partitions — worthwhile precisely because reaching this path means the file
+     * is large and has thousands of references.
+     */
+    private void planSkewAwareVfoPartitions(String fileUri,
+                                            Path filePath,
+                                            String indexPath,
+                                            Configuration conf,
+                                            String referenceFile,
+                                            String referenceMode,
+                                            int maxPartitions,
+                                            long splitSize,
+                                            List<BamInputPartition> out) throws IOException {
+        withBamIndex(filePath, new Path(indexPath), conf, (header, index) -> {
+            int numRefs = header.getSequenceDictionary().size();
+            List<String> smallNames = new ArrayList<>();
+            List<Long> smallBytes = new ArrayList<>();
+            int largeRefs = 0;
+            for (int refIdx = 0; refIdx < numRefs; refIdx++) {
+                long span = referenceSpanBytes(index, header, refIdx);
+                if (span < 0) {
+                    continue; // no indexed reads on this reference — nothing to read
+                }
+                String refName = header.getSequence(refIdx).getSequenceName();
+                if (span > splitSize) {
+                    int seqLen = header.getSequence(refIdx).getSequenceLength();
+                    addReferenceVfoSplits(index, header, refIdx, refName,
+                            1, seqLen, splitSize,
+                            fileUri, conf, indexPath, referenceFile, referenceMode, out);
+                    largeRefs++;
+                } else {
+                    smallNames.add(refName);
+                    // Clamp to 1 so a reference whose reads all fall in one BGZF block (span 0)
+                    // still carries weight in the bin-packing.
+                    smallBytes.add(Math.max(1L, span));
+                }
+            }
+
+            // Whatever budget the large references' splits did not consume goes to the small ones.
+            int largeSplits = out.size();
+            int remaining = Math.max(1, maxPartitions - largeSplits);
+            int numGroups = Math.min(remaining, smallNames.size());
+            log.trace("planSkewAwareVfoPartitions() {} large ref(s) -> {} split(s); "
+                            + "{} small ref(s) -> {} group(s)",
+                    largeRefs, largeSplits, smallNames.size(), numGroups);
+            for (List<String> group : binPackRefsByBytes(smallNames, smallBytes, numGroups)) {
+                out.add(BamInputPartition.forVfoPartitions(
+                        fileUri, conf, indexPath, referenceFile, referenceMode,
+                        group.toArray(new String[0])));
+            }
+        });
+
+        log.trace("planSkewAwareVfoPartitions() adding unmapped partition");
+        out.add(BamInputPartition.forUnmapped(fileUri, conf, indexPath, referenceFile, referenceMode));
+    }
+
+    /**
+     * Compressed BAI byte span of one reference: the distance between the first record's chunk-start
+     * BGZF block offset and the last record's chunk-end block offset. Returns {@code -1} when the
+     * reference has no indexed reads (so callers can distinguish "no data" from a reference whose
+     * reads all fall within a single BGZF block, which has a legitimate span of 0).
+     */
+    private static long referenceSpanBytes(BAMIndex index, SAMFileHeader header, int refIdx) {
+        int seqLen = header.getSequence(refIdx).getSequenceLength();
+        BAMFileSpan span = index.getSpanOverlapping(refIdx, 1, seqLen);
+        if (span == null) {
+            return -1L;
+        }
+        List<Chunk> chunks = span.getChunks();
+        if (chunks.isEmpty()) {
+            return -1L;
+        }
+        long startVfo = chunks.get(0).getChunkStart();
+        long endVfo = chunks.get(chunks.size() - 1).getChunkEnd();
+        return Math.max(0L, (endVfo >> 16) - (startVfo >> 16));
+    }
+
+    /**
+     * Greedily bin-packs references into {@code numGroups} groups balanced by byte span
+     * (longest-processing-time: heaviest reference first, always onto the lightest group).
+     * Empty groups are dropped, so the result has at most {@code numGroups} non-empty groups.
+     * {@code names} and {@code bytes} are parallel lists.
+     */
+    private static List<List<String>> binPackRefsByBytes(List<String> names, List<Long> bytes,
+                                                         int numGroups) {
+        if (names.isEmpty() || numGroups <= 0) {
+            return java.util.Collections.emptyList();
+        }
+        // Reference indices sorted by descending byte span.
+        Integer[] order = new Integer[names.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, Comparator.comparingLong((Integer i) -> bytes.get(i)).reversed());
+
+        List<List<String>> groups = new ArrayList<>(numGroups);
+        // Min-heap of groups keyed by current load; entry = {load, groupIndex}.
+        PriorityQueue<long[]> heap = new PriorityQueue<>(Comparator.comparingLong(g -> g[0]));
+        for (int g = 0; g < numGroups; g++) {
+            groups.add(new ArrayList<>());
+            heap.add(new long[]{0L, g});
+        }
+        for (int i : order) {
+            long[] lightest = heap.poll();
+            groups.get((int) lightest[1]).add(names.get(i));
+            lightest[0] += bytes.get(i);
+            heap.add(lightest);
+        }
+        groups.removeIf(List::isEmpty);
+        return groups;
     }
 
     /**
