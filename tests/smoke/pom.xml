@@ -39,6 +39,24 @@
       <version>${spark.version}</version>
       <scope>test</scope>
     </dependency>
+    <!--
+      The shaded fat JAR under test. htsjdk is EXCLUDED so FatJarReaderTest can only
+      succeed if the relocated htsjdk classes are present inside the JAR itself — this
+      is what proves the artifact is self-contained after shade exclusions / minimizeJar.
+      Requires `mvn -pl core -am install` to have published lite-bfx-spark to the local repo.
+    -->
+    <dependency>
+      <groupId>io.github.peterdowdy</groupId>
+      <artifactId>lite-bfx-spark</artifactId>
+      <version>1.0-SNAPSHOT</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>com.github.samtools</groupId>
+          <artifactId>htsjdk</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
@@ -54,6 +72,10 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
+          <systemPropertyVariables>
+            <!-- core module's checked-in reader fixtures (range.bam, realn02-r.sam, etc.) -->
+            <fixtures.dir>${project.basedir}/../../core/src/test/resources</fixtures.dir>
+          </systemPropertyVariables>
           <argLine>
             --add-opens=java.base/java.lang=ALL-UNNAMED
             --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
