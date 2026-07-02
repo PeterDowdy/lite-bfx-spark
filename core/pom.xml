@@ -262,16 +262,31 @@
                   <pattern>htsjdk</pattern>
                   <shadedPattern>io.github.peterdowdy.litebfx.shaded.htsjdk</shadedPattern>
                 </relocation>
-                <relocation>
-                  <pattern>com.google.common</pattern>
-                  <shadedPattern>io.github.peterdowdy.litebfx.shaded.guava</shadedPattern>
-                </relocation>
               </relocations>
               <artifactSet>
                 <excludes>
+                  <!-- Provided by the Spark/Hadoop runtime; never bundle. -->
                   <exclude>org.apache.spark:*</exclude>
                   <exclude>org.apache.hadoop:*</exclude>
                   <exclude>org.scala-lang:*</exclude>
+                  <!--
+                    htsjdk transitive dependencies the readers never exercise, or that the
+                    Spark/Hadoop runtime already provides. Excluding them shrinks the fat jar
+                    dramatically (snappy alone ships ~6 MB of per-platform native libraries).
+                    The FatJarReaderTest smoke test (tests/smoke) reads every format from the
+                    packaged jar with htsjdk removed from its classpath, guarding against a
+                    codec path that actually needs one of these.
+                  -->
+                  <exclude>org.xerial.snappy:snappy-java</exclude>   <!-- native libs; Spark provides it -->
+                  <exclude>org.openjdk.nashorn:nashorn-core</exclude> <!-- JS-based VCF filtering only -->
+                  <exclude>org.ow2.asm:*</exclude>                    <!-- nashorn's dependency -->
+                  <exclude>gov.nih.nlm.ncbi:ngs-java</exclude>        <!-- SRA/NGS input only -->
+                  <exclude>org.apache.commons:commons-compress</exclude> <!-- Spark/Hadoop provide it -->
+                  <exclude>org.tukaani:xz</exclude>                   <!-- Spark provides it (via commons-compress) -->
+                  <exclude>org.apache.commons:commons-jexl</exclude>  <!-- JEXL expression filtering only -->
+                  <exclude>commons-logging:commons-logging</exclude> <!-- pulled in by commons-jexl -->
+                  <exclude>commons-codec:commons-codec</exclude>     <!-- Spark/Hadoop provide it -->
+                  <exclude>org.json:json</exclude>
                 </excludes>
               </artifactSet>
               <filters>
