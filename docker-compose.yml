@@ -62,6 +62,17 @@ services:
     command: mvn test -Pspark402
 
   # ---------------------------------------------------------------------------
+  # python-test: pure-Python Data Source (pysam) test suite on JDK 17 + PySpark 4.0
+  # ---------------------------------------------------------------------------
+  python-test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    command: bash -c "pip install -e . --no-deps -q && python -m pytest -q"
+
+  # ---------------------------------------------------------------------------
   # spark402: Apache Spark 4.0.2 runtime
   # ---------------------------------------------------------------------------
   spark402:

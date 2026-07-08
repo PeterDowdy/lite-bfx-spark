@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lite-bfx-spark"
+dynamic = ["version"]
+description = "Pure-Python Spark 4 Data Source readers for genomics formats (BAM/SAM/CRAM, VCF/BCF, FASTA, FASTQ, BED)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Peter Dowdy" }]
+keywords = ["spark", "pyspark", "genomics", "bioinformatics", "bam", "cram", "vcf", "fasta", "fastq", "bed", "pysam", "htslib"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# pysam parses the files; pyarrow is required by Spark's Python Data Source machinery to
+# transfer rows from the Python worker (needed even when read() yields tuples). pyspark is
+# *provided* by the Spark runtime (cluster/serverless) — like the JAR's `provided`-scope
+# Spark dependency — so it is an extra, not a pin, to avoid clashing with the cluster's version.
+dependencies = ["pysam>=0.22", "pyarrow>=4"]
+
+[project.optional-dependencies]
+spark = ["pyspark>=4.0"]
+test = ["pytest>=7.0", "pyspark>=4.0"]
+
+[project.urls]
+Homepage = "https://github.com/PeterDowdy/lite-bfx-spark"
+Documentation = "https://lite-bfx-spark.readthedocs.io/"
+Repository = "https://github.com/PeterDowdy/lite-bfx-spark"
+
+[tool.hatch.version]
+path = "src/litebfx/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/litebfx"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/litebfx", "README.md"]
+
+[tool.pytest.ini_options]
+markers = [
+    "spark: test needs a JVM-backed SparkSession (skipped where no compatible JDK is present)",
+]
+testpaths = ["tests"]

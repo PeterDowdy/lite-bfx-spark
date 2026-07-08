@@ -86,7 +86,8 @@ For testing infrastructure, see [TESTING.md](TESTING.md).
 | `readName` | String | Without leading `@` |
 | `sequence` | String | |
 | `baseQualities` | String | ASCII Phred+33 |
-| `description` | String | Second header line; null when absent |
+| `description` | String | Header text after the first space; null when absent |
+| `readNumber` | Integer | `1` for R1, `2` for R2 (from the filename); null when undetermined |
 
 ### VCF / BCF
 
@@ -135,6 +136,11 @@ Fields beyond BED3 are nullable; missing columns in BED3/4/5/6/9 files produce n
 ## Usage
 
 ### Python / Java (core JAR)
+
+> **Pure-Python alternative (no JAR):** `pip install lite-bfx-spark` provides the same
+> readers via the Spark 4 Python Data Source API, using pysam instead of htsjdk — see
+> [python/README.md](python/README.md). It registers the same `format()` names and matches
+> these schemas; the examples below use the JAR.
 
 ```python
 # BAM — full file

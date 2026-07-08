@@ -1,0 +1,96 @@
+name: Python CI
+
+# Tests the pure-Python `litebfx` package (python/), and on pushes to main publishes a
+# staging build to TestPyPI — mirroring the Java library, where ci.yml's staging-publish
+# job uploads a per-commit staging artifact and publish.yml releases on tags.
+#
+# Staging uses PyPI Trusted Publishing (OIDC) — no API token or secret. One-time setup on
+# TestPyPI (https://test.pypi.org/manage/account/publishing/): add a trusted publisher for
+#   owner: PeterDowdy   repository: lite-bfx-spark   workflow: python-ci.yml
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['python/**', 'docker/Dockerfile.python', '.github/workflows/python-ci.yml']
+  push:
+    branches: [main]
+    paths: ['python/**', 'docker/Dockerfile.python', '.github/workflows/python-ci.yml']
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: Test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true            # BAM/CRAM/FASTQ/BED fixtures are Git LFS
+
+      # JDK 17: Spark 4 + Arrow's off-heap allocator fails to init on JDK 24+.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]' 'pyspark>=4.0,<4.1' ruff
+
+      - name: Lint (pyflakes-level errors)
+        working-directory: python
+        run: ruff check --select E9,F63,F7,F82 src tests spikes
+
+      - name: Test
+        working-directory: python
+        run: python -m pytest -q
+
+  staging-publish:
+    name: Publish staging to TestPyPI
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write          # mint the OIDC token for TestPyPI Trusted Publishing
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Per-commit staging version (PEP 440, monotonic so TestPyPI accepts each upload),
+      # the Python analog of the JAR's 0.0.0-main-<sha> staging version.
+      - name: Set staging version
+        working-directory: python
+        run: sed -i 's/^__version__ = .*/__version__ = "0.0.0.dev${{ github.run_number }}"/' src/litebfx/__init__.py
+
+      - name: Build sdist + wheel
+        working-directory: python
+        run: |
+          pip install build
+          python -m build
+
+      - name: Upload to TestPyPI       # OIDC Trusted Publishing (no password input)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
