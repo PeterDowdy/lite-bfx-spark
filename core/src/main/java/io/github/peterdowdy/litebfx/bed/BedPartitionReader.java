@@ -339,9 +339,10 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
         s = s.trim();
         if (s.isEmpty()) return null;
         try {
-            // BED scores can be decimal strings like "818.0" — truncate
-            int dot = s.indexOf('.');
-            return Integer.parseInt(dot >= 0 ? s.substring(0, dot) : s);
+            // Strict: a decimal like "818.0" is not an integer -> null. samtools never
+            // truncates BED numeric columns (it does not interpret them at all), so neither
+            // do we — see python/README.md "BED number handling".
+            return Integer.parseInt(s);
         } catch (NumberFormatException e) {
             return null;
         }
@@ -352,8 +353,7 @@ public class BedPartitionReader implements PartitionReader<InternalRow> {
         s = s.trim();
         if (s.isEmpty()) return null;
         try {
-            int dot = s.indexOf('.');
-            return Long.parseLong(dot >= 0 ? s.substring(0, dot) : s);
+            return Long.parseLong(s);      // strict: decimals -> null (no truncation)
         } catch (NumberFormatException e) {
             return null;
         }

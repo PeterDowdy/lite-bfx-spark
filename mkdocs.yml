@@ -42,6 +42,8 @@ nav:
     - Cloud Storage: cloud-storage.md
     - Partitioning & Indexes: partitioning.md
     - Scala API: scala-api.md
+  - Proposals:
+    - Python Data Source: proposals/python-data-source.md
 
 markdown_extensions:
   - admonition

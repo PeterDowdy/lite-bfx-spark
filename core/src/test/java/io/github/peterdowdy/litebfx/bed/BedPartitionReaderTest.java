@@ -214,15 +214,15 @@ class BedPartitionReaderTest {
     }
 
     @Test
-    void get_scoreDecimal_truncatesToInt() throws Exception {
-        // BED scores can be decimal strings like "818.0" — truncated at the dot
+    void get_scoreDecimal_isNull() throws Exception {
+        // A decimal score like "818.0" is not an integer -> null (samtools never truncates
+        // BED numeric columns; it does not interpret them at all).
         Path bed = tempDir.resolve("decscore.bed");
         Files.writeString(bed, "chr1\t0\t100\tname\t818.0\n", StandardCharsets.UTF_8);
 
         List<InternalRow> rows = readAll(new BedInputPartition(bed.toString(), null, conf()));
         assertEquals(1, rows.size());
-        assertFalse(rows.get(0).isNullAt(4));
-        assertEquals(818, (int) rows.get(0).getInt(4));
+        assertTrue(rows.get(0).isNullAt(4), "decimal score should be null (no truncation)");
     }
 
     @Test
@@ -580,19 +580,18 @@ class BedPartitionReaderTest {
     }
 
     // -------------------------------------------------------------------------
-    // Field parsing — parseLongOrNull with decimal format (e.g. "200.5" → 200)
+    // Field parsing — parseLongOrNull rejects decimals (e.g. "200.5" → null)
     // -------------------------------------------------------------------------
 
     @Test
-    void get_thickStartDecimal_parsedCorrectly() throws Exception {
-        // thickStart = "200.5" — decimal truncation path in parseLongOrNull.
+    void get_thickStartDecimal_isNull() throws Exception {
+        // thickStart = "200.5" is not a long -> null (no truncation; matches samtools).
         Path bed = tempDir.resolve("thickdec.bed");
         Files.writeString(bed, "chr1\t0\t1000\tname\t0\t+\t200.5\t800\n", StandardCharsets.UTF_8);
 
         List<InternalRow> rows = readAll(new BedInputPartition(bed.toString(), null, conf()));
         assertEquals(1, rows.size());
-        assertFalse(rows.get(0).isNullAt(6), "thickStart with decimal should not be null");
-        assertEquals(200L, rows.get(0).getLong(6));
+        assertTrue(rows.get(0).isNullAt(6), "decimal thickStart should be null (no truncation)");
     }
 
     // -------------------------------------------------------------------------

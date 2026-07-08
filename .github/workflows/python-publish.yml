@@ -1,0 +1,75 @@
+name: Python Publish
+
+# Releases the `litebfx` package (python/) to PyPI when a version tag (e.g. v1.0.0) is
+# pushed — the same tags that trigger the Java publish.yml, so one tag ships both the JAR
+# (Maven Central) and the wheel (PyPI). The version is taken from the tag; nothing is
+# committed to the package.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no API token or secret. One-time setup on
+# PyPI (https://pypi.org/manage/account/publishing/): add a trusted publisher for the project
+#   owner: PeterDowdy   repository: lite-bfx-spark   workflow: python-publish.yml
+# The `id-token: write` permission below lets the job mint the short-lived OIDC token PyPI verifies.
+#
+# The GitHub Release object itself is created by the Java publish.yml for the same tag.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'      # e.g. v1.0.0
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'    # e.g. v1.0.0-rc1
+
+concurrency:
+  group: python-publish-${{ github.ref }}
+  cancel-in-progress: false          # never cancel an in-progress publish
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write          # mint the OIDC token for PyPI Trusted Publishing
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          lfs: true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.2.0
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Strip the leading 'v' (v1.0.0 -> 1.0.0) and set the package version to match —
+      # the tag is the single source of truth, mirroring the JAR's versions:set step.
+      - name: Set release version from tag
+        working-directory: python
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Releasing version $VERSION"
+          sed -i "s/^__version__ = .*/__version__ = \"$VERSION\"/" src/litebfx/__init__.py
+
+      # Final gate: rerun the full suite on the exact release commit (JDK 17 + LFS fixtures).
+      - name: Test
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]' 'pyspark>=4.0,<4.1'
+          python -m pytest -q
+
+      - name: Build sdist + wheel
+        working-directory: python
+        run: |
+          pip install build
+          python -m build
+
+      - name: Upload to PyPI            # OIDC Trusted Publishing (no password input)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
