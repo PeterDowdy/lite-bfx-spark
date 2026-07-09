@@ -3,10 +3,13 @@
 Two ways a caller narrows a read to a genomic interval:
 
 * the explicit ``.option("region", "chr1:1000-2000")`` option — version-independent, the
-  reliable path on Spark 4.0 which has no filter-pushdown hook for Python data sources;
-* ``DataSourceReader.pushFilters()`` on Spark 4.1+, parsed here defensively by duck-typing
-  the filter objects (equality on the reference-name column, range on the coordinate
-  column) so we do not hard-depend on a specific 4.1 filter API.
+  reliable path on Spark 4.0 (no filter-pushdown hook for Python data sources at all) and
+  the fallback on 4.1+ when filter pushdown isn't enabled (see ``register_all()`` in
+  ``__init__.py`` for why that's opt-in and off by default);
+* ``DataSourceReader.pushFilters()`` on Spark 4.1+ with ``spark.sql.python.filterPushdown.
+  enabled=true``, parsed here defensively by duck-typing the filter objects (equality on
+  the reference-name column, range on the coordinate column) so we do not hard-depend on a
+  specific 4.1 filter API.
 
 A :class:`Region` uses 1-based inclusive coordinates (SAM/VCF convention). ``pysam.fetch``
 takes 0-based half-open, so callers convert at the boundary.

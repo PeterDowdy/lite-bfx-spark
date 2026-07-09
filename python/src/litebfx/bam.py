@@ -115,15 +115,6 @@ class _AlignmentReader(DataSourceReader):
         self._indexes = {p: (resolve_index(options, p, suffixes, self.single)
                              if self.use_index else None) for p in self.files}
 
-    def pushFilters(self, filters):
-        """Spark 4.1+ pushdown; only prune when every file has an index that can enforce it."""
-        if not all(self._indexes.values()) or self.region is not None:
-            return filters
-        region, unhandled = push_region(filters, self._ref_col, self._coord_col)
-        if region is not None:
-            self.region = region
-        return unhandled
-
     def _open(self, path, index=None):
         import pysam
         if (not self.is_cram) and path.lower().endswith(".sam"):
@@ -228,7 +219,24 @@ class _AlignmentReader(DataSourceReader):
             yield record_to_row(r)
 
 
+class _AlignmentReaderPushdown(_AlignmentReader):
+    def pushFilters(self, filters):
+        """Spark 4.1+ pushdown; only prune when every file has an index that can enforce it."""
+        if not all(self._indexes.values()) or self.region is not None:
+            return filters
+        region, unhandled = push_region(filters, self._ref_col, self._coord_col)
+        if region is not None:
+            self.region = region
+        return unhandled
+
+
 class BamDataSource(DataSource):
+    # Set by register_all() -> _BamDataSourcePushdown when the Spark session has opted in
+    # to spark.sql.python.filterPushdown.enabled; see that class and __init__.py. Spark
+    # errors out at plan time if pushFilters() is implemented but that conf is false, so the
+    # reader class itself (not just its behavior) must vary on this flag.
+    _pushdown_enabled = False
+
     @classmethod
     def name(cls):
         return "bam"
@@ -240,10 +248,17 @@ class BamDataSource(DataSource):
         return base
 
     def reader(self, schema):
-        return _AlignmentReader(self.options, schema, is_cram=False)
+        cls = _AlignmentReaderPushdown if self._pushdown_enabled else _AlignmentReader
+        return cls(self.options, schema, is_cram=False)
+
+
+class _BamDataSourcePushdown(BamDataSource):
+    _pushdown_enabled = True
 
 
 class CramDataSource(DataSource):
+    _pushdown_enabled = False   # see BamDataSource
+
     @classmethod
     def name(cls):
         return "cram"
@@ -255,4 +270,9 @@ class CramDataSource(DataSource):
         return base
 
     def reader(self, schema):
-        return _AlignmentReader(self.options, schema, is_cram=True)
+        cls = _AlignmentReaderPushdown if self._pushdown_enabled else _AlignmentReader
+        return cls(self.options, schema, is_cram=True)
+
+
+class _CramDataSourcePushdown(CramDataSource):
+    _pushdown_enabled = True
