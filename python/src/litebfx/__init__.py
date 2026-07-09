@@ -48,7 +48,13 @@ def register_all(spark):
     from .fastq import FastqDataSource
     from .vcf import VcfDataSource, _VcfDataSourcePushdown
 
-    pushdown = str(spark.conf.get(_PUSHDOWN_CONF, "false")).lower() == "true"
+    try:
+        pushdown = str(spark.conf.get(_PUSHDOWN_CONF, "false")).lower() == "true"
+    except Exception:
+        # Some locked-down environments (e.g. Databricks Serverless) raise
+        # CONFIG_NOT_AVAILABLE.WITHOUT_SUGGESTION instead of returning the default when a
+        # conf is restricted. Treat that the same as "false": disable pushdown.
+        pushdown = False
 
     for ds in (_BamDataSourcePushdown if pushdown else BamDataSource,
                _CramDataSourcePushdown if pushdown else CramDataSource,
