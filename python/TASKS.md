@@ -25,8 +25,13 @@ Java JAR, filesystem-path I/O only (FUSE mounts for cloud), Arrow output.
   to synthesize a CRAI (sorted CRAM; builds without a reference) → reuse indexed path.
   General/unsorted: pure-Python container walk (`spikes/cram_probe.py`) — needs one more
   spike for executor-side container seek (blocked locally by missing reference).
-- **Pushdown:** `pushFilters()` gated to Spark 4.1+; explicit `.option("region", ...)`
-  works on 4.0. No limit/column/stats/ordering pushdown (API has no hooks).
+- **Pushdown:** `pushFilters()` gated to Spark 4.1+ **and** `spark.sql.python.filterPushdown
+  .enabled=true` (defaults false on every 4.1+ build — Spark errors at plan time if
+  pushFilters() is implemented while the conf is off). `register_all()` checks the conf
+  once, driver-side, and registers a reader class with or without `pushFilters()` to match
+  — a `DataSourceReader` can't see this conf itself (worker process, no SparkSession); see
+  `__init__.py`. Explicit `.option("region", ...)` works everywhere, conf or no conf.
+  No limit/column/stats/ordering pushdown (API has no hooks).
 - **Coexistence:** assume JAR **or** package, not both → same short names, no aliasing.
 - **BED numbers:** no truncation — samtools never truncates a BED numeric column, so a
   decimal numeric column → null (narrowPeak `19.76368` → null, not `19`). **The JAR was

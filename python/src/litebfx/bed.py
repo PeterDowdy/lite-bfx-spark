@@ -98,6 +98,12 @@ class _BedPartition(InputPartition):
 
 
 class BedDataSource(DataSource):
+    # Set by register_all() -> _BedDataSourcePushdown when the Spark session has opted in to
+    # spark.sql.python.filterPushdown.enabled; see that class and __init__.py. Spark errors
+    # out at plan time if pushFilters() is implemented but that conf is false, so the reader
+    # class itself (not just its behavior) must vary on this flag.
+    _pushdown_enabled = False
+
     @classmethod
     def name(cls):
         return "bed"
@@ -108,7 +114,12 @@ class BedDataSource(DataSource):
         return BED_SCHEMA
 
     def reader(self, schema):
-        return _BedReader(self.options, schema)
+        cls = _BedReaderPushdown if self._pushdown_enabled else _BedReader
+        return cls(self.options, schema)
+
+
+class _BedDataSourcePushdown(BedDataSource):
+    _pushdown_enabled = True
 
 
 class _BedReader(DataSourceReader):
@@ -122,15 +133,6 @@ class _BedReader(DataSourceReader):
         self._indexes = {p: resolve_index(options, p, (".tbi", ".csi"), self.single)
                          for p in self.files}
         self._arrow = to_arrow_schema(schema)
-
-    def pushFilters(self, filters):
-        # Only prune when every file has an index to enforce it; else Spark filters post-scan.
-        if not all(self._indexes.values()) or self.region is not None:
-            return filters
-        region, unhandled = push_region(filters, "chrom", "chromStart")
-        if region is not None:
-            self.region = region
-        return unhandled
 
     def partitions(self):
         parts = []
@@ -161,6 +163,17 @@ class _BedReader(DataSourceReader):
                     row = parse_bed_line(line)
                     if row:
                         yield row + md
+
+
+class _BedReaderPushdown(_BedReader):
+    def pushFilters(self, filters):
+        # Only prune when every file has an index to enforce it; else Spark filters post-scan.
+        if not all(self._indexes.values()) or self.region is not None:
+            return filters
+        region, unhandled = push_region(filters, "chrom", "chromStart")
+        if region is not None:
+            self.region = region
+        return unhandled
 
 
 def _open_text(path):

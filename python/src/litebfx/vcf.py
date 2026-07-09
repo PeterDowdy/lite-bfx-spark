@@ -72,6 +72,12 @@ class _VcfPartition(InputPartition):
 
 
 class VcfDataSource(DataSource):
+    # Set by register_all() -> _VcfDataSourcePushdown when the Spark session has opted in to
+    # spark.sql.python.filterPushdown.enabled; see that class and __init__.py. Spark errors
+    # out at plan time if pushFilters() is implemented but that conf is false, so the reader
+    # class itself (not just its behavior) must vary on this flag.
+    _pushdown_enabled = False
+
     @classmethod
     def name(cls):
         return "vcf"
@@ -82,7 +88,12 @@ class VcfDataSource(DataSource):
         return VCF_SCHEMA
 
     def reader(self, schema):
-        return _VcfReader(self.options, schema)
+        cls = _VcfReaderPushdown if self._pushdown_enabled else _VcfReader
+        return cls(self.options, schema)
+
+
+class _VcfDataSourcePushdown(VcfDataSource):
+    _pushdown_enabled = True
 
 
 class _VcfReader(DataSourceReader):
@@ -96,14 +107,6 @@ class _VcfReader(DataSourceReader):
         self._indexes = {p: resolve_index(options, p, (".tbi", ".csi"), self.single)
                          for p in self.files}
         self._arrow = to_arrow_schema(schema)
-
-    def pushFilters(self, filters):
-        if not all(self._indexes.values()) or self.region is not None:
-            return filters
-        region, unhandled = push_region(filters, "chrom", "pos")
-        if region is not None:
-            self.region = region
-        return unhandled
 
     def partitions(self):
         parts = []
@@ -126,3 +129,13 @@ class _VcfReader(DataSourceReader):
                 yield record_to_row(rec) + md
         finally:
             vf.close()
+
+
+class _VcfReaderPushdown(_VcfReader):
+    def pushFilters(self, filters):
+        if not all(self._indexes.values()) or self.region is not None:
+            return filters
+        region, unhandled = push_region(filters, "chrom", "pos")
+        if region is not None:
+            self.region = region
+        return unhandled
