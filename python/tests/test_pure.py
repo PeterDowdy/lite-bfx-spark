@@ -9,6 +9,7 @@ import pytest
 from conftest import resource
 
 from litebfx import bgzf, io, regions
+from litebfx._base import import_pysam
 from litebfx.bed import parse_bed_line
 from litebfx.fastq import read_number
 
@@ -76,6 +77,18 @@ def test_parse_bed_line():
     assert parse_bed_line("chr1\t1.5\t100") is None
     assert parse_bed_line("chr1\t5") is None
     assert parse_bed_line("") is None
+
+
+def test_import_pysam_pops_databricks_fips_var(monkeypatch):
+    """Databricks Runtime sets OPENSSL_FORCE_FIPS_MODE for its own bundled OpenSSL. pysam's
+    wheel vendors its own OpenSSL 1.1.1, and the var's mere presence (any value) makes it run
+    a FIPS self-test that fails on the relocated binary and aborts the process. Only the
+    var's absence avoids it, so import_pysam() must strip it before the first import."""
+    pytest.importorskip("pysam")
+    monkeypatch.setenv("OPENSSL_FORCE_FIPS_MODE", "0")
+    pysam = import_pysam()
+    assert pysam.__name__ == "pysam"
+    assert "OPENSSL_FORCE_FIPS_MODE" not in os.environ
 
 
 def _make_multiblock_bam(path, repeat=40):

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
-from ._base import (METADATA_FIELD, get_opt, metadata_value, num_partitions,
+from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
                     resolve_files, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .schemas import FASTQ_SCHEMA
@@ -83,7 +83,7 @@ class _FastqReader(DataSourceReader):
         rn = read_number(partition.path)
         md = (metadata_value(partition.path),) if self.metadata else ()
         if partition.whole:
-            import pysam
+            pysam = import_pysam()
             with pysam.FastxFile(partition.path) as fx:
                 for e in fx:
                     yield (e.name, e.sequence, e.quality, e.comment or None, rn) + md

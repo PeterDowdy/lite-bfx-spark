@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
-from ._base import (METADATA_FIELD, metadata_value, resolve_files, resolve_index,
+from ._base import (METADATA_FIELD, import_pysam, metadata_value, resolve_files, resolve_index,
                     wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .schemas import FASTA_SCHEMA
@@ -60,7 +60,7 @@ class _FastaReader(DataSourceReader):
         yield from batches(self._rows(partition), self._arrow)
 
     def _rows(self, partition):
-        import pysam
+        pysam = import_pysam()
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
         if partition.contigs:
             with pysam.FastaFile(partition.path, filepath_index=partition.index) as fa:

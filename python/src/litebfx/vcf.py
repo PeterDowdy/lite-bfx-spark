@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
-from ._base import (METADATA_FIELD, get_opt, metadata_value, resolve_files,
+from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, resolve_files,
                     resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .regions import parse_region, push_region
@@ -120,7 +120,7 @@ class _VcfReader(DataSourceReader):
         yield from batches(self._rows(partition), self._arrow)
 
     def _rows(self, partition):
-        import pysam
+        pysam = import_pysam()
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
         vf = pysam.VariantFile(partition.path, index_filename=partition.index)
         try:

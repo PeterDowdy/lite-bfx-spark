@@ -73,6 +73,16 @@ handling. Object storage is reached through a FUSE mount:
 Raw `s3://` / `abfss://` / `gs://` URIs are rejected with guidance, because their
 credentials are not visible to a Python worker.
 
+## Known issues
+
+**Databricks Runtime: `import pysam` crash.** Databricks Runtime sets
+`OPENSSL_FORCE_FIPS_MODE` (e.g. `"0"`) in the process environment for its own bundled
+OpenSSL. pysam's wheel vendors a separate, relocated OpenSSL 1.1.1 build that also reads
+that variable — its mere presence, regardless of value, triggers a FIPS self-test that
+fails on the relocated binary and aborts the process (`FATAL FIPS SELFTEST FAILURE`). This
+package works around it automatically — `litebfx._base.import_pysam()` strips the variable
+before the first `import pysam` — so no user action is needed.
+
 ## Relationship to the JAR
 
 The JAR and this package are two implementations of the same reader for two deployment

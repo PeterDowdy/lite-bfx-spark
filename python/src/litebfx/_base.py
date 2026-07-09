@@ -121,6 +121,20 @@ def existing_index(path, suffixes):
     return None
 
 
+def import_pysam():
+    """Import pysam, working around a Databricks Runtime crash.
+
+    Databricks Runtime bakes OPENSSL_FORCE_FIPS_MODE (e.g. "0") into the process
+    environment for its own bundled OpenSSL. pysam's wheel vendors its own OpenSSL 1.1.1
+    build, and merely seeing that var defined — regardless of value — makes it run a FIPS
+    self-test that fails on the auditwheel-relocated binary and aborts the process (SIGABRT).
+    Only the var's absence avoids the self-test, so pop it before the first import.
+    """
+    os.environ.pop("OPENSSL_FORCE_FIPS_MODE", None)
+    import pysam
+    return pysam
+
+
 def round_robin(items, n):
     """Split ``items`` into at most ``n`` contiguous-ish groups (non-empty)."""
     if n <= 1 or len(items) <= 1:

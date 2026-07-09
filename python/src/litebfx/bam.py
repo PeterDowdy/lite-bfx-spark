@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
-from ._base import (METADATA_FIELD, get_opt, metadata_value, num_partitions,
+from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
                     resolve_files, resolve_index, round_robin, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .bgzf import split_start_voffset
@@ -35,7 +35,7 @@ _DEFAULT_SPLIT = 128 * 1024 * 1024   # bgzfSplitSize default, matches the JAR
 # --- record -> row ----------------------------------------------------------------------
 
 def _quals(r):
-    import pysam
+    pysam = import_pysam()
     q = r.query_qualities
     return None if q is None else pysam.array_to_qualitystring(q)
 
@@ -116,7 +116,7 @@ class _AlignmentReader(DataSourceReader):
                              if self.use_index else None) for p in self.files}
 
     def _open(self, path, index=None):
-        import pysam
+        pysam = import_pysam()
         if (not self.is_cram) and path.lower().endswith(".sam"):
             return pysam.AlignmentFile(path, "r")
         kw = {}
@@ -129,7 +129,7 @@ class _AlignmentReader(DataSourceReader):
     def _synthesize_crai(self, path):
         """Build a co-located CRAI for an unindexed (coordinate-sorted) CRAM. None if the CRAM
         is unsorted or its directory is read-only."""
-        import pysam
+        pysam = import_pysam()
         crai = path + ".crai"
         if os.path.exists(crai):
             return crai
