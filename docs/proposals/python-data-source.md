@@ -280,56 +280,69 @@ should be in from Phase 1, not retrofitted.
 This is where a Python port stops being mechanical. None of these are blockers, but
 each is a real difference users must understand.
 
-### Cloud I/O: mounted filesystems, not credential bridging
+### Cloud I/O: native S3/GCS, download-then-open Azure, FUSE for the rest
 
-The reader does exactly **one thing** for I/O: it opens a **local filesystem path** and
-hands it to pysam. It ships no cloud SDK, no htslib remote-URL handling, and no
-credential code. Cloud storage is reached by mounting it into the filesystem — which is
-precisely what the target environment already does.
+**Historical note:** this section originally argued the reader should open local/FUSE-mounted
+paths only, on the reasoning that Python Data Source worker processes don't inherit Spark's
+Hadoop config and "pysam/htslib doesn't understand those schemes." The second half of that
+claim turned out to be wrong for S3 and GCS — empirically verified by binary inspection and
+live reads against MinIO/fake-gcs-server/Azurite through the real Spark pipeline, not just
+assumed. What follows is the design actually shipped; see `litebfx/io.py`, `_cloudfs.py`, and
+`_cloud.py` for the implementation, and `python/README.md`'s "Cloud storage" section for the
+user-facing version of this.
 
-**Why not do what the JAR does?** The Java version routes all I/O through Hadoop
-`FileSystem`, so `s3a://`/`abfss://`/`gs://`/`dbfs:/` resolve with credentials that flow
-from the driver's `hadoopConfiguration` to executors via `SerializableConfiguration`. A
-Python data source has none of that: the Python worker processes that run `partitions()`
-and `read()` do **not** inherit Spark's Hadoop config, and pysam/htslib doesn't
-understand those schemes. Rather than rebuild credential propagation and a cloud SDK
-layer in Python — brittle, cloud-specific, and duplicating what the platform already
-provides — the reader requires the storage to appear as a path.
+**S3 and GCS are opened directly — pysam's bundled htslib has a native remote-read backend
+for both.** `hfile_s3.c` does full SigV4 v2/v4 signing (including session-token support,
+needed for Databricks-vended temporary credentials) and reads `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_DEFAULT_REGION` directly; `hfile_gcs.c` reads
+`GCS_OAUTH_TOKEN`. `spark.read.format("bam").load("s3://bucket/sample.bam")` works with the
+same index-guided range-request behavior as a local file — no credential code needed in the
+common case, since htslib resolves ambient credentials itself. One real wrinkle: htslib's S3
+scheme recognizes only `s3://`/`s3+http://`/`s3+https://` (`s3a://`/`s3n://` give "Protocol
+not supported"), and a non-AWS endpoint (MinIO, on-prem) needs the URL rewritten to
+`s3+http://`/`s3+https://` *and* `HTS_S3_HOST` set — plain `s3://` with only `HTS_S3_HOST` set
+still targets real AWS. `_cloud.py`'s `effective_path()`/`prepare_env()` handle this
+transparently, driven by the standard `AWS_ENDPOINT_URL` env var. GCS has no such override at
+all (confirmed: hardcoded `.googleapis.com`) — a real upstream htslib gap, not a litebfx one;
+see `python/TASKS.md`'s open questions for the contribution opportunity this represents.
 
-**On Databricks (the target), this is free.** Databricks exposes cloud storage as
-FUSE-mounted POSIX paths, and the FUSE layer uses the cluster's configured credentials
-underneath:
+**Azure is opened directly too, but through download-then-open, not a native backend.**
+htslib has no Azure support whatsoever (confirmed absent from the binary). Since pysam also
+can't accept a Python-mediated byte stream for seek-capable reads (it requires a real OS file
+descriptor — confirmed: it rejects `io.BytesIO`), there's no cheap bridge for range-request-only
+access the way S3/GCS get. Instead, `pyarrow.fs.AzureFileSystem` downloads the object (and its
+index, if any) to a local temp file, and pysam opens that local copy. This trades away the
+range-request efficiency story for Azure specifically — the whole file transfers once per
+worker process, regardless of query selectivity — in exchange for direct `abfss://` support
+with no mount. Query efficiency *after* the download is unaffected (pysam's own indexed
+seeking works normally against the local copy).
 
-| Mount | Path form pysam opens | Availability |
-|---|---|---|
-| **Unity Catalog Volumes** | `/Volumes/<cat>/<sch>/<vol>/sample.bam` | classic **and** serverless — recommended |
-| **DBFS FUSE** | `/dbfs/mnt/.../sample.bam` | classic only (not serverless) |
+**On Databricks, credential vending is automatic when the `databricks` extra is installed.**
+`_cloud.py` vends a short-lived, path-scoped credential from Unity Catalog's Temporary
+Credentials API (`generate_temporary_path_credentials`) for any cloud path, lazily on first
+open in a worker process, and it takes priority over ambient credentials. This is the
+Databricks-native equivalent of what UC Volumes' FUSE mount does internally, applied directly
+to `s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE indirection. One thing this
+*doesn't* resolve without a real workspace: whether `WorkspaceClient()`'s default auth
+actually resolves inside the isolated Python Data Source worker subprocess (vs. only the
+driver, which is well-established to work) — see `tests/smoke_uc_credential_vending.py` and
+`TASKS.md`'s open questions.
 
-So `spark.read.format("bam").load("/Volumes/genomics/core/aligned/sample.bam")` works
-with zero credential handling in the library — pysam opens a local path and Databricks
-does the cloud I/O and auth. The reader's only cloud-related job is **path
-normalization**: translate the `dbfs:/x` scheme to its FUSE form `/dbfs/x`, and pass
-`/Volumes/...` and plain local paths straight through. Raw `s3://`/`abfss://`/`gs://`
-URIs are **rejected with a clear error** that points the user at a mounted path — we do
-not attempt SDK-based access, because the credentials for it live in the JVM/Hadoop layer
-the Python worker cannot see.
+**FUSE mounts still matter for everything else.** `adl://`, `hdfs://`, `http(s)://`, `ftp://`
+have no native-or-download story and are still rejected with guidance to mount instead — the
+original reasoning in this section (Databricks exposes cloud storage as FUSE-mounted POSIX
+paths via UC Volumes or DBFS; off Databricks, bring your own `mountpoint-s3`/`gcsfuse`/
+`blobfuse2` mount) still applies exactly as written for those schemes.
 
-**Off Databricks, the user brings their own mount.** The library's contract is "give me
-a filesystem path." Anyone on plain Spark/EMR/Dataproc/k8s who wants to read from object
-storage mounts it themselves with a FUSE driver — `mountpoint-s3` or `s3fs` for S3,
-`gcsfuse` for GCS, `blobfuse2` for ADLS, `rclone mount` for anything — and points the
-reader at the mounted path. All credential and endpoint configuration stays in the mount,
-where the platform or the user already manages it, and out of the library entirely. This
-is a documented requirement, not a limitation we paper over.
-
-!!! warning "The real risk is random-access performance over FUSE, not credentials"
-    The index → range-request I/O reduction only materializes if the FUSE layer turns
-    pysam's seek-heavy `.fetch()` into tight range reads rather than streaming or
-    whole-file local caching. This is the FUSE analog of the `fs.s3a.input.fadvise=random`
-    tuning the JAR's S3 range tests depend on. UC Volumes FUSE random-access behavior
-    must be **benchmarked on an indexed region read** before we claim I/O reduction on
-    Databricks; the older DBFS FUSE was sequential-optimized and would not have delivered
-    it. This replaces credential bridging as the load-bearing open question.
+!!! warning "FUSE random-access performance is still an open question, now scoped narrower"
+    The index → range-request I/O reduction over a FUSE mount only materializes if the mount
+    turns pysam's seek-heavy `.fetch()` into tight range reads rather than streaming or
+    whole-file local caching — this was never benchmarked, and remains unverified. It no
+    longer affects S3/GCS (native reads, verified via real Range-request behavior against
+    MinIO/fake-gcs-server through the actual Spark pipeline) or Azure (download-then-open has
+    a different, already-understood performance story: one full transfer, then local-speed
+    reads). It's now purely about the schemes that still require a mount — UC Volumes for
+    `adl://`/`hdfs://`-style access, or a self-managed FUSE driver for anything else.
 
 ### Filter pushdown is Spark 4.1+ and narrower
 
@@ -519,11 +532,15 @@ Python reader against checked-in golden output generated from the JAR (see
   section); SAM line-range splits; the same machinery extended to `.fastq.gz` and
   uncompressed FASTQ. Spike first to confirm `.seek()` accepts an externally computed
   virtual offset on an index-less open.
-- **Phase 3 — FUSE random-access validation.** Benchmark an indexed region read over a UC
-  Volume and a self-managed `mountpoint-s3`/`s3fs` mount, and confirm it issues range reads
-  / transfers fewer bytes than a full scan — the Databricks analog of the `*RangeS3Test`
-  suite. If a mount streams whole files, document it and add an opt-in localize-then-read
-  fallback for large indexed reads.
+- **Phase 3 — FUSE random-access validation (superseded for S3/GCS/Azure, still open for
+  everything else).** S3/GCS range-request behavior and Azure's download-then-open path are
+  now verified directly (native reads through the real Spark pipeline against MinIO/
+  fake-gcs-server/Azurite — see `python/tests/test_cloud_{s3,gcs,azure}.py`), not via a FUSE
+  mount at all. What's left of this item: benchmark an indexed region read over a UC Volume
+  or a self-managed `mountpoint-s3`/`s3fs` mount for the schemes that still require one
+  (`adl://`, `hdfs://`) — the Databricks analog of the `*RangeS3Test` suite. If a mount
+  streams whole files, document it and add an opt-in localize-then-read fallback for large
+  indexed reads (the same pattern Azure's `_cloudfs.materialize_local` already implements).
 - **Phase 4 (optional) — intra-contig coordinate splitting.** Coordinate sub-range splits
   with start-ownership de-duplication, for skew on files with few contigs (see the
   Splitting section).
@@ -545,11 +562,14 @@ is a validation gate on the I/O-reduction claim; Phase 4 is an enhancement.
   assumption.
 - **Schema parity.** Assert Python `StructType.json()` equals the JAR schema JSON
   (checked-in golden), for every format and for `columnNames=sam`.
-- **Region-read / range-request verification over FUSE.** Mirror the `*RangeS3Test`
-  intent through a mount: front a MinIO bucket with `mountpoint-s3`/`s3fs` in the test
-  container, then assert an indexed region read of the mounted file transfers fewer bytes
-  than a full scan (Phase 3). This proves the index prunes I/O *and* that the mount honors
-  random access — the load-bearing question for Databricks Volumes.
+- **Region-read / range-request verification — direct, not over FUSE.** `test_cloud_s3.py`
+  and `test_cloud_gcs.py` read directly against MinIO/fake-gcs-server (`s3://`/`gs://`, no
+  mount) through the real Spark pipeline and assert region-query correctness against a local
+  pysam oracle; `test_cloud_azure.py` does the same for `abfss://` against Azurite via the
+  download-then-open path. Byte-transfer-reduction assertions (matching the JAR's
+  `*RangeS3Test`) are a known gap for the Python suite — no Hadoop-`FileSystem`-statistics
+  equivalent exists to measure it against; see `TASKS.md`. The FUSE-mount version of this
+  item (Phase 3, below) is still open, but now only for the schemes that still need a mount.
 - **Coordinate-convention tests.** Explicit assertions on 1-based `start` vs. 0-based
   `start0` (BAM) and 0-based half-open `chromStart`/`chromEnd` (BED), since the pysam
   offset conventions differ from htsjdk's and this is the likeliest source of silent
@@ -577,10 +597,13 @@ is a validation gate on the I/O-reduction claim; Phase 4 is an enhancement.
    (249,132 mid-record, zero false positives), and an 8-way chunked split reproduced a full
    sequential read exactly. Remaining work is engineering only: bound the guesser's scan to
    one max BGZF block (~64 KB) and port it into the reader.
-2. **FUSE random-access performance.** Does UC Volumes FUSE (and a common self-managed
-   mount like `mountpoint-s3`) translate pysam's seek-heavy `.fetch()` into range reads,
-   or stream/cache whole files? This decides whether indexed reads actually reduce I/O on
-   the target. **Benchmark before claiming I/O reduction (Phase 3).**
+2. **FUSE random-access performance (scoped down).** No longer applies to S3/GCS (native
+   htslib reads, range-request behavior verified directly against MinIO/fake-gcs-server) or
+   Azure (download-then-open — one full transfer, then local-speed reads, a different and
+   already-understood performance story). Still open for `adl://`/`hdfs://`-style access via
+   a UC Volume or self-managed mount: does the mount translate pysam's seek-heavy `.fetch()`
+   into range reads, or stream/cache whole files? **Benchmark before claiming I/O reduction
+   for those remaining schemes (Phase 3).**
 3. **`pushFilters` contract by version.** The exact `pushFilters` signature and return
    semantics are Spark 4.1+; confirm against the pinned pyspark and gate cleanly so Spark
    4.0 falls back to the explicit `region` option.
@@ -597,9 +620,14 @@ is a validation gate on the I/O-reduction claim; Phase 4 is an enhancement.
 Proceed with Phases 0–2 as the required core: all six formats with filesystem-path I/O,
 Arrow output, and the schema/parity harness (0); indexed region and per-contig reads (1);
 and unindexed BAM splitting via the block + record guesser (2). Phase 3 (the FUSE
-random-access benchmark) gates the I/O-reduction claim on Databricks — add a
-localize-then-read fallback only if a mount proves to stream whole files. Phase 4
-(intra-contig coordinate splitting) is an enhancement driven by real skew. Position the
-Python package as the **JAR-free, pip-installable** reader for any FUSE-mounted path —
-complementary to the JAR, not a replacement for its optimizer integrations, byte-balanced
-region splitting, or Hadoop-native access to every cloud scheme.
+random-access benchmark) now only gates the I/O-reduction claim for schemes without a
+native-or-download story (`adl://`, `hdfs://`) — S3/GCS (native htslib reads) and Azure
+(download-then-open) shipped with their own direct verification instead of a FUSE mount; add
+a localize-then-read fallback only if a *remaining* mount-only scheme proves to stream whole
+files (Azure's `_cloudfs.materialize_local` is already exactly that fallback, applied
+unconditionally rather than as a probe result). Phase 4 (intra-contig coordinate splitting)
+is an enhancement driven by real skew. Position the Python package as the **JAR-free,
+pip-installable** reader — S3, GCS, and Azure direct, FUSE-mounted paths for everything
+else — complementary to the JAR, not a replacement for its optimizer integrations,
+byte-balanced region splitting, or Hadoop-native access to the schemes it still doesn't
+cover directly.

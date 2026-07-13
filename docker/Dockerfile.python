@@ -7,8 +7,21 @@ FROM eclipse-temurin:17
 
 # samtools provides the independent reference oracle for the BAM/SAM parity tests.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv samtools \
+        python3 python3-venv samtools ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# pysam's manylinux wheel bundles a libcurl built expecting the CA bundle at the RedHat/
+# CentOS path (/etc/pki/tls/certs/ca-bundle.crt) via a compiled-in CURLOPT_CAINFO -- not an
+# env-var-configurable default, so CURL_CA_BUNDLE/SSL_CERT_FILE do NOT override it (confirmed
+# empirically: htslib's own S3/GCS backend calls libcurl's C API directly, unlike the `curl`
+# CLI tool, which is what actually honors those env vars). On this Debian-based image the
+# real bundle lives at /etc/ssl/certs/ca-certificates.crt, so any genuine HTTPS connection
+# through pysam's bundled libcurl (real S3/GCS -- MinIO's plain-HTTP test setup never
+# exercises this) fails the TLS handshake with an unhelpful "No such file or directory"
+# from htslib, not a certificate error. Any Debian-based deployment doing real (not MinIO)
+# S3/GCS reads needs this same symlink -- see python/README.md's "Known issues".
+RUN mkdir -p /etc/pki/tls/certs \
+    && ln -s /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
 
 # Isolated venv avoids the "externally managed environment" restriction on newer bases.
 RUN python3 -m venv /opt/venv

@@ -14,6 +14,10 @@
 | `docker compose run --rm spark-uc bash -c "cd tests/smoke && mvn test -Pspark402"` | Pure Spark + Unity Catalog |
 | `docker compose run --rm -e DATABRICKS_HOST=... -e DATABRICKS_TOKEN=... databricks-connect python3 tests/smoke_serverless.py` | Databricks serverless (real credentials needed) |
 | `docker compose run --rm spark-test-s3` | S3 range-access tests against MinIO |
+| `docker compose run --rm python-test-databricks` | Python package, full suite, on real Databricks Runtime 17.3-LTS |
+| `docker compose run --rm python-test-databricks-s3` | Python package, S3 (MinIO), on real Databricks Runtime |
+| `docker compose run --rm python-test-s3-live` | Python package, S3, real AWS bucket (needs `.env`) |
+| `docker compose run --rm python-test-gcs-live` | Python package, GCS, real bucket (needs `.env` + `gcs-test-key.json`) |
 
 ---
 
@@ -302,6 +306,202 @@ databricks fs cp target/lite-bfx-spark-*-serverless.jar \
 databricks fs cp target/lite-bfx-spark-*-serverless.jar \
   /Volumes/<catalog>/<schema>/<volume>/lite-bfx-spark.jar
 ```
+
+---
+
+## Unity Catalog credential vending (Python package, real workspace only)
+
+The Python `litebfx` package can read `s3://`/`gs://`/`abfss://` directly, preferring
+Databricks Unity Catalog's Temporary Credentials API for authentication when running on
+Databricks (see `python/src/litebfx/_cloud.py`). Whether that credential vending actually
+works inside the *isolated Python Data Source worker subprocess* (not just the driver) is
+unverified without a real workspace — this is the one thing MinIO/fake-gcs-server/Azurite
+emulator tests cannot cover.
+
+```bash
+docker compose run --rm \
+  -e DATABRICKS_HOST=https://<workspace>.azuredatabricks.net \
+  -e DATABRICKS_TOKEN=<token> \
+  -e UC_TEST_BAM_URL=s3://my-bucket/genomics/sample.bam \
+  databricks-connect-uc
+```
+
+`UC_TEST_BAM_URL` must point at a small BAM under a Unity Catalog External Location the
+connecting identity has `READ FILES` on. The test script
+(`tests/smoke_uc_credential_vending.py`) reads it via `litebfx` end to end (register, plan,
+read on a worker) and asserts a non-zero row count. Run this manually before a release that
+touches `_cloud.py` — it is not part of default CI.
+
+---
+
+## Live AWS S3 (real bucket, not MinIO)
+
+The Python package's `test_cloud_s3.py` suite normally runs against MinIO (see "Cloud
+storage integration tests" above). It can also run against a real S3 bucket to validate
+htslib's native S3 backend against actual AWS, not just an S3-compatible emulator.
+
+**IAM policy for the identity running the tests** — least-privilege, scoped to a single
+bucket, read/write on objects and list/locate on the bucket itself. No delete permission:
+the test fixtures are uploaded once (fixed keys under `litebfx-test/`) and simply
+overwritten on repeat runs; nothing in the suite deletes objects. Replace
+`<your-bucket-name>` with the real bucket (kept out of this checked-in doc deliberately —
+put the real name only in your local, gitignored `.env`; see below).
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LiteBfxSparkListAndLocate",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::<your-bucket-name>"
+    },
+    {
+      "Sid": "LiteBfxSparkReadWriteObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::<your-bucket-name>/*"
+    }
+  ]
+}
+```
+
+| Permission | Why |
+|---|---|
+| `s3:ListBucket` (bucket resource, not `/*`) | `_cloudfs.py`'s directory listing (`FileSelector`) and existence/stat checks that fall back to a prefix listing |
+| `s3:GetBucketLocation` | Automatic region resolution — `pyarrow.fs.S3FileSystem`/boto3 call this when the region isn't explicit |
+| `s3:GetObject` | htslib's native Range-guided reads, and `HeadObject`-based `exists`/`getsize`/`stat` (authorized under `GetObject`, there's no separate `HeadObject` action) |
+| `s3:PutObject` | The `s3_bucket` fixture's one-time upload of `range.bam`/`.bai`/`realn01.fa`/`.fai` |
+
+Attach this to whichever IAM user/role's access keys get set as `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY` for the run.
+
+**Running it:** copy `.env.example` to `.env` at the repo root (gitignored — never commit
+real credentials) and fill in `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+(`AWS_DEFAULT_REGION` is optional; `s3:GetBucketLocation` above lets boto3/pyarrow
+auto-discover it). `docker compose` auto-loads `.env` for variable substitution — no `-e`
+flags needed, so the real keys never appear on the command line or in shell history:
+
+```bash
+docker compose run --rm python-test-s3-live
+```
+
+This runs the same `test_cloud_s3.py` suite as `python-test-s3`, against the real bucket
+instead of MinIO — no `S3_ENDPOINT`/`AWS_ENDPOINT_URL` needed, since real AWS requires no
+endpoint override.
+
+---
+
+## Live Google Cloud Storage (real bucket, not fake-gcs-server)
+
+The Python package's `test_cloud_gcs.py` suite normally runs against fake-gcs-server (see
+"Cloud storage integration tests" above), but that only ever exercises the `pyarrow.fs`
+orchestration layer. **htslib's native GCS backend has zero endpoint-override capability**
+(confirmed by binary inspection — unlike S3's `HTS_S3_HOST`, there is no equivalent for GCS),
+so a real bucket is the *only* way to test `pysam.AlignmentFile("gs://...")` at all —
+`test_cloud_gcs_live.py` is not extra coverage, it's the only coverage of that read path.
+
+**IAM roles for the service account** — scoped to a single bucket via a resource-level
+binding, not project-wide:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://<your-bucket-name> \
+  --member="serviceAccount:<your-service-account-email>" \
+  --role="roles/storage.objectAdmin"
+
+gcloud storage buckets add-iam-policy-binding gs://<your-bucket-name> \
+  --member="serviceAccount:<your-service-account-email>" \
+  --role="roles/storage.legacyBucketReader"
+```
+
+| Role | Why |
+|---|---|
+| `roles/storage.objectAdmin` | get/list/create/delete on objects. Delete is required, not optional: `pyarrow.fs.GcsFileSystem.open_output_stream()` on a path that already exists (every fixture upload after the first) does a delete-then-recreate under the hood, not an in-place overwrite. This is a real asymmetry from S3, where `s3:PutObject` alone covers overwrite — a narrower `objectViewer` + `objectCreator` pair (create-only, no delete) fails on the second run with `does not have storage.objects.delete access`, confirmed empirically. |
+| `roles/storage.legacyBucketReader` | Bucket-level metadata read (`storage.buckets.get`) — needed by `pyarrow.fs.GcsFileSystem.get_file_info()` on a bare bucket path. Not covered by `objectAdmin` (object-level only) — GCS's rough analog of S3's `GetBucketLocation` gap. Easy to miss: the symptom is `storage.buckets.get access... denied`, which reads like a completely separate problem from the object-level roles above. |
+
+**Two independent credential consumers, from the same service-account key file** — this is
+the other real difference from S3, where one static `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY` pair serves both `boto3`/`pyarrow.fs` *and* htslib:
+
+- `pyarrow.fs.GcsFileSystem`'s ambient resolution (fixture upload, and `_cloudfs.py`'s
+  orchestration layer at read time) wants `GOOGLE_APPLICATION_CREDENTIALS` pointing at the
+  key file itself — standard Application Default Credentials.
+- htslib's native GCS backend wants an already-minted OAuth **access token** (not the key
+  file) in `GCS_OAUTH_TOKEN` — short-lived, ~1 hour. `litebfx._cloud.prepare_env()`
+  deliberately does not mint this off Databricks (see that module's docstring) — it only
+  ever consumes an already-ambient token, matching real usage where a user exports one
+  themselves before running Spark.
+
+**A timing gotcha worth knowing if you touch these tests**: the token must be exported
+*before* `pytest` starts, not set from inside a pytest fixture. `pyspark`'s JVM gateway
+snapshots `os.environ` once, at `Popen` time, the moment the `spark` fixture first calls
+`SparkSession.builder.getOrCreate()` — a fixture that sets `os.environ["GCS_OAUTH_TOKEN"]`
+afterward (even one requested earlier in a test's parameter list) is too late for an
+already-launched JVM and the Python worker subprocesses it forks; htslib then fails with a
+generic `Permission denied` that looks exactly like an IAM problem but isn't. `docker-compose.yml`'s `python-test-gcs-live`/`python-test-databricks-gcs-live` services mint the
+token via `python/scripts/mint_gcs_token.py` and `export` it in the shell *before* invoking
+`pytest`, sidestepping this — see that script's docstring.
+
+**Running it:** place the service-account key JSON at `gcs-test-key.json` in the repo root
+(gitignored — never commit it), and add `GCS_BUCKET` to your `.env` (copy from
+`.env.example` if you haven't already):
+
+```bash
+docker compose run --rm python-test-gcs-live
+```
+
+This runs `test_cloud_gcs_live.py` against the real bucket — full scan, region query, and a
+FASTA contig read, each cross-checked against a local `pysam` read of the same fixture for
+correctness (no byte-transfer-reduction assertion, same posture as `test_cloud_s3.py`).
+
+---
+
+## Python package on real Databricks Runtime (regression suite)
+
+`docker/Dockerfile.python` (used by `python-test`/`python-test-s3`/etc.) is a generic
+Debian image (`eclipse-temurin:17`) — it does not catch bugs that only reproduce on the
+*actual* Databricks Runtime environment. Two real ones were found exactly this way, by
+testing against `databricksruntime/standard:17.3-LTS` directly:
+
+- `OPENSSL_FORCE_FIPS_MODE` crashing `import pysam` (see `python/README.md`'s "Known
+  issues" — `litebfx._base.import_pysam()` works around it, but bare `import pysam` in test
+  files bypassed that protection until `conftest.py` was fixed to pop the var once,
+  process-wide, before any test file loads).
+- pysam's bundled libcurl expecting the CA bundle at a RedHat path that doesn't exist on
+  Databricks' Ubuntu-based image, breaking real (non-MinIO) HTTPS S3/GCS reads (see
+  `python/README.md`'s "Known issues" — `litebfx._cloud.prepare_env()` now self-heals this).
+
+`docker/Dockerfile.python-databricks` runs the Python suite against the real image instead,
+**deliberately without** the CA-bundle Dockerfile-level fix `Dockerfile.python` has — the
+point is testing litebfx's own runtime self-healing against a pristine, unmodified
+Databricks image, catching a regression in that self-healing rather than one Dockerfile
+workaround masking another.
+
+```bash
+docker compose run --rm python-test-databricks             # full suite, local paths
+docker compose run --rm python-test-databricks-s3          # S3 over MinIO (HTTP only --
+                                                             # doesn't exercise the CA-bundle
+                                                             # fix, since that's TLS-specific)
+docker compose run --rm python-test-databricks-s3-live      # S3 over real HTTPS -- the one
+                                                             # that actually proves the
+                                                             # CA-bundle fix; needs .env (see
+                                                             # "Live AWS S3" above)
+docker compose run --rm python-test-databricks-gcs-live     # GCS over real HTTPS, same
+                                                             # rationale as -s3-live; needs
+                                                             # .env + gcs-test-key.json (see
+                                                             # "Live Google Cloud Storage" above)
+```
+
+Not wired into GitHub Actions CI, consistent with the Java side's `databricks`/`databricks-uc`
+services (also Docker-image-based, also manual-only, per the Quick Reference table). Run
+these before a release that touches `_base.py`, `_cloud.py`, `_cloudfs.py`, or `conftest.py`.
 
 ---
 

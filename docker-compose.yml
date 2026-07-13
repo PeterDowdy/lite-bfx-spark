@@ -73,6 +73,225 @@ services:
     command: bash -c "pip install -e . --no-deps -q && python -m pytest -q"
 
   # ---------------------------------------------------------------------------
+  # python-test-databricks: full Python suite on the real Databricks Runtime 17.3-LTS image
+  # (not the generic Dockerfile.python base) -- catches Databricks-specific environment
+  # regressions the generic image can't (history: the OPENSSL_FORCE_FIPS_MODE pysam crash,
+  # the /etc/pki/tls/certs CA-bundle mismatch -- see Dockerfile.python-databricks). Local
+  # tests only (no cloud fixtures); see python-test-databricks-s3 for the cloud-read variant.
+  # ---------------------------------------------------------------------------
+  python-test-databricks:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.python-databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    command: bash -c "pip install -e . --no-deps -q && python -m pytest -q"
+
+  # ---------------------------------------------------------------------------
+  # python-test-databricks-s3: direct s3:// reads on the real Databricks Runtime image
+  # against MinIO -- the regression test for the CA-bundle-path class of bug specifically
+  # (a real HTTPS connection through pysam's bundled libcurl, which the generic
+  # python-test-s3 image no longer exercises meaningfully now that it has the Dockerfile-
+  # level symlink fix baked in; this image deliberately doesn't, to test litebfx's own
+  # runtime self-healing in _cloud.py against a pristine image).
+  # ---------------------------------------------------------------------------
+  python-test-databricks-s3:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.python-databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: test-bucket
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_s3.py -v"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # python-test-s3: direct s3:// reads (litebfx's own S3/GCS support, not the JAR's Hadoop
+  # FileSystem) against MinIO -- pysam/htslib's native S3 backend, no FUSE mount.
+  # ---------------------------------------------------------------------------
+  python-test-s3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: test-bucket
+      # AWS_ENDPOINT_URL is the only endpoint config needed: pyarrow.fs.S3FileSystem's
+      # ambient resolution reads it directly, and litebfx/_cloud.py's prepare_env()/
+      # effective_path() derive htslib's own HTS_S3_HOST/HTS_S3_ADDRESS_STYLE and the
+      # s3+http:// URL rewrite from it automatically (confirmed empirically against MinIO --
+      # plain s3:// only ever targets real AWS, regardless of HTS_S3_HOST alone). Matters for
+      # real production use against any non-AWS S3-compatible store, not just this test.
+      # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY cover both htslib/pyarrow.fs *and* the
+      # s3_bucket test fixture's boto3 client -- boto3 reads the same standard names, no
+      # separate S3_ACCESS_KEY/S3_SECRET_KEY needed.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_s3.py -v"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # python-test-s3-live: same test suite as python-test-s3, against a real S3 bucket instead
+  # of MinIO -- validates htslib's native S3 backend against actual AWS, not just an
+  # S3-compatible emulator. Reads credentials from .env (gitignored; see .env.example and
+  # TESTING.md's "Live AWS S3" section for the IAM policy). No S3_ENDPOINT/AWS_ENDPOINT_URL
+  # -- real AWS needs no override, unlike MinIO.
+  # ---------------------------------------------------------------------------
+  python-test-s3-live:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_s3.py -v"
+
+  # ---------------------------------------------------------------------------
+  # python-test-databricks-s3-live: python-test-databricks-s3 uses MinIO over plain HTTP,
+  # which never exercises TLS at all -- this is the one that actually proves the CA-bundle
+  # self-healing fix (litebfx._cloud._fix_ca_bundle_path()) works end to end: real HTTPS,
+  # through pysam's bundled libcurl, on a pristine (no Dockerfile-level symlink) Databricks
+  # Runtime image. Same .env credentials as python-test-s3-live.
+  # ---------------------------------------------------------------------------
+  python-test-databricks-s3-live:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.python-databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_s3.py -v"
+
+  # ---------------------------------------------------------------------------
+  # python-test-gcs: direct gs:// reads against fake-gcs-server -- pysam/htslib's native GCS
+  # backend, no FUSE mount.
+  # ---------------------------------------------------------------------------
+  python-test-gcs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      GCS_ENDPOINT: http://fake-gcs:4443
+      GCS_BUCKET: test-bucket
+      # litebfx-only convention (no upstream standard exists for GCS, unlike AWS_ENDPOINT_URL)
+      # -- see _cloudfs.py. Orchestration-layer only: htslib's native GCS backend has no
+      # endpoint override at all, so full BAM/VCF reads over gs:// can't target this emulator.
+      GCS_ENDPOINT_URL: http://fake-gcs:4443
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_gcs.py -v"
+    depends_on:
+      fake-gcs:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # python-test-gcs-live: same test suite as python-test-gcs, against a real GCS bucket
+  # instead of fake-gcs-server -- the only way to exercise htslib's native GCS backend at
+  # all (zero endpoint-override capability, confirmed by binary inspection, unlike MinIO's
+  # HTS_S3_HOST for S3). Reads GCS_BUCKET from .env (gitignored; see .env.example and
+  # TESTING.md's "Live Google Cloud Storage" section for the required IAM roles).
+  # GOOGLE_APPLICATION_CREDENTIALS points at gcs-test-key.json at the repo root -- already
+  # visible in-container via *test-volumes' repo-wide mount, no separate bind mount needed.
+  #
+  # GCS_OAUTH_TOKEN is minted and exported *before* pytest runs (scripts/mint_gcs_token.py),
+  # not inside a fixture -- pyspark's JVM gateway snapshots os.environ once, at launch, so a
+  # fixture that sets it after the spark fixture has already started the JVM is too late (see
+  # that script's docstring). This also matches production usage: litebfx never mints this
+  # token off Databricks, it only ever consumes an already-ambient one.
+  # ---------------------------------------------------------------------------
+  python-test-gcs-live:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      GCS_BUCKET: ${GCS_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: /workspace/gcs-test-key.json
+    command: >-
+      bash -c "pip install -e '.[test]' -q &&
+      export GCS_OAUTH_TOKEN=$$(python3 scripts/mint_gcs_token.py) &&
+      python -m pytest -q tests/test_cloud_gcs_live.py -v"
+
+  # ---------------------------------------------------------------------------
+  # python-test-databricks-gcs-live: python-test-gcs-live on the real Databricks Runtime
+  # image -- same CA-bundle-path regression rationale as python-test-databricks-s3-live
+  # (real HTTPS through pysam's bundled libcurl, on a pristine image without the
+  # Dockerfile-level symlink fix). Same .env vars, key file, and GCS_OAUTH_TOKEN pre-export
+  # as python-test-gcs-live.
+  # ---------------------------------------------------------------------------
+  python-test-databricks-gcs-live:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.python-databricks
+      args:
+        SAMTOOLS_VERSION: "1.21"
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      GCS_BUCKET: ${GCS_BUCKET:-}
+      GOOGLE_APPLICATION_CREDENTIALS: /workspace/gcs-test-key.json
+    command: >-
+      bash -c "pip install -e '.[test]' -q &&
+      export GCS_OAUTH_TOKEN=$$(python3 scripts/mint_gcs_token.py) &&
+      python -m pytest -q tests/test_cloud_gcs_live.py -v"
+
+  # ---------------------------------------------------------------------------
+  # python-test-azure: direct abfss:// reads against Azurite -- download-then-open via
+  # pyarrow.fs.AzureFileSystem (htslib has no native Azure backend at all), so unlike GCS
+  # this covers full pysam/Spark-level reads, not just the orchestration layer.
+  # ---------------------------------------------------------------------------
+  python-test-azure:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    volumes: *test-volumes
+    working_dir: /workspace/python
+    environment:
+      # litebfx-only conventions (no ambient env var covers Azure Storage account-key auth
+      # or a custom endpoint the way AWS_ENDPOINT_URL does for S3) -- see _cloudfs.py.
+      # Azurite's well-known dev account/key, same ones documented for spark-test-azure.
+      AZURE_STORAGE_ACCOUNT: devstoreaccount1
+      AZURE_STORAGE_ACCOUNT_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+      AZURE_STORAGE_CONTAINER: test-container
+      # The docker-compose service name, not the devstoreaccount1.dfs.core.windows.net alias
+      # -- confirmed empirically that the alias hostname fails container creation ("Failed to
+      # create a container", no clear error code) while the plain service name works, likely
+      # because it already embeds "devstoreaccount1" as a subdomain-like prefix that confuses
+      # Azurite's account-name parsing for this specific request type.
+      AZURE_STORAGE_ENDPOINT_URL: http://azurite:80
+    command: bash -c "pip install -e '.[test]' -q && python -m pytest -q tests/test_cloud_azure.py -v"
+    depends_on:
+      azurite:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
   # spark402: Apache Spark 4.0.2 runtime
   # ---------------------------------------------------------------------------
   spark402:
@@ -189,6 +408,28 @@ services:
       DATABRICKS_CLIENT_ID: ${DATABRICKS_CLIENT_ID:-}
       DATABRICKS_CLIENT_SECRET: ${DATABRICKS_CLIENT_SECRET:-}
     command: python3 tests/smoke_serverless.py
+
+  # ---------------------------------------------------------------------------
+  # databricks-connect-uc: same image as databricks-connect, plus litebfx[databricks]
+  # installed from the local checkout (needed for the actual credential-vending call, not
+  # just the Spark Connect client) -- for tests/smoke_uc_credential_vending.py, which needs a
+  # real UC-governed external location and cannot run in default CI. See that script's own
+  # docstring for the required env vars (UC_TEST_BAM_URL in addition to the ones below).
+  # ---------------------------------------------------------------------------
+  databricks-connect-uc:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.databricks-connect
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    environment:
+      DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+      DATABRICKS_CLIENT_ID: ${DATABRICKS_CLIENT_ID:-}
+      DATABRICKS_CLIENT_SECRET: ${DATABRICKS_CLIENT_SECRET:-}
+      UC_TEST_BAM_URL: ${UC_TEST_BAM_URL:-}
+    command: bash -c "pip install --no-cache-dir -e 'python[databricks]' -q && python3 tests/smoke_uc_credential_vending.py"
 
   # ---------------------------------------------------------------------------
   # spark-test-s3: run S3 range-access integration tests against MinIO.
@@ -325,7 +566,13 @@ services:
     # Blob port 80: the ABFS connector uses port 80 for HTTP by default (no configurable override).
     # Within the Docker network, containers reach azurite at devstoreaccount1.dfs.core.windows.net:80.
     # The host port mapping (10000:80) preserves backward compatibility for external tools.
-    command: azurite --blobHost 0.0.0.0 --blobPort 80 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+    # --skipApiVersionCheck: pyarrow's bundled Azure SDK (used by the Python package's
+    # AzureFileSystem orchestration) sends a newer Storage REST API version than this pinned
+    # `latest` Azurite build recognizes ("API version ... is not supported by Azurite",
+    # confirmed empirically) -- this is Azurite's own documented escape hatch for a
+    # newer-client-than-emulator mismatch, permissive only (skips a version header check, no
+    # behavior change), safe for the Java side's older SDK too.
+    command: azurite --blobHost 0.0.0.0 --blobPort 80 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "80"]
       interval: 10s

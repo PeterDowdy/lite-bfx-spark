@@ -49,3 +49,11 @@ derby.log
 metastore_db/
 spark-warehouse/
 site/
+
+# Local secrets for live cloud integration testing (see .env.example)
+.env
+
+# Stray index written to the CWD by a test that calls pysam.index()/samtools with a relative
+# path -- the real fixtures live under core/src/test/resources/, this isn't one of them.
+/python/range.bam.bai
+gcs-test-key.json

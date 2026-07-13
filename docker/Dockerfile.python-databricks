@@ -1,0 +1,46 @@
+# Databricks Runtime 17.3-LTS Python Data Source test image.
+# Base: databricksruntime/standard:17.3-LTS (Java 17.0.16, Python 3.12.3, Ubuntu)
+# Used by: `docker compose run --rm python-test-databricks`
+#
+# Catches Databricks-specific environment quirks the generic Dockerfile.python image
+# (eclipse-temurin:17, not Databricks Runtime) cannot -- confirmed history: the
+# OPENSSL_FORCE_FIPS_MODE pysam crash and the /etc/pki/tls/certs CA-bundle path mismatch
+# (pysam's manylinux libcurl expects a RedHat-style CA path; Databricks Runtime is
+# Ubuntu-based) neither reproduce on a generic Debian/Ubuntu image, only on the real
+# Databricks Runtime base -- both were found by testing against this exact image by hand.
+#
+# Deliberately does NOT pre-apply the CA-bundle symlink workaround Dockerfile.python has --
+# the whole point of this image is testing litebfx's own runtime self-healing
+# (litebfx._cloud._fix_ca_bundle_path()) against a pristine, unmodified Databricks image, not
+# masking a regression in it with an image-level fix.
+FROM databricksruntime/standard:17.3-LTS
+
+ARG SAMTOOLS_VERSION=1.21
+
+# samtools provides the independent reference oracle for the BAM/SAM parity tests; built
+# from source (matching Dockerfile.databricks's approach) since this image's own samtools
+# packaging isn't reliable across DBR versions. python3.12-venv: DBR's system Python lacks
+# ensurepip by default (confirmed empirically -- `python3 -m venv` fails without it).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12-venv \
+        curl bzip2 make gcc \
+        zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev libssl-dev libncurses5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY samtools-build.sh /tmp/samtools-build.sh
+RUN chmod +x /tmp/samtools-build.sh \
+    && SAMTOOLS_VERSION="${SAMTOOLS_VERSION}" /tmp/samtools-build.sh \
+    && rm /tmp/samtools-build.sh
+
+# Isolated venv avoids the "externally managed environment" restriction and keeps this
+# separate from whatever Databricks Runtime bundles at the system level.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYSPARK_PYTHON="/opt/venv/bin/python"
+
+# pyspark<4.1 pins the 4.0 baseline (matches the Java default profile spark402, and DBR
+# 17.3-LTS == Spark 4.0.2).
+RUN pip install --no-cache-dir \
+        "pyspark>=4.0,<4.1" "pysam>=0.22" "pyarrow>=15" "pytest>=7"
+
+WORKDIR /workspace

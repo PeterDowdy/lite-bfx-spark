@@ -7,7 +7,8 @@ import os
 
 from pyspark.sql.types import LongType, StringType, StructField, StructType, TimestampType
 
-from .io import normalize_path
+from . import _cloudfs
+from .io import is_cloud_path, normalize_path
 
 _INDEX_EXTS = (".bai", ".crai", ".csi", ".tbi", ".fai", ".gzi")
 
@@ -51,11 +52,16 @@ def resolve_files(options, extensions=None):
     for raw in _raw_paths(options):
         path = normalize_path(raw)
         if any(c in path for c in "*?["):
+            if is_cloud_path(path):
+                raise ValueError(
+                    f"litebfx: glob patterns are not supported on cloud paths ({path!r}). "
+                    "Pass an explicit multi-path .load(a, b, ...) or a plain directory path."
+                )
             out.extend(sorted(glob.glob(path)))
-        elif os.path.isdir(path):
+        elif _cloudfs.isdir(path):
             if not extensions:
                 raise ValueError(f"litebfx: {path!r} is a directory; this format cannot list it")
-            for name in sorted(os.listdir(path)):
+            for name in sorted(_cloudfs.listdir(path)):
                 if name.endswith(extensions) and not name.endswith(_INDEX_EXTS):
                     out.append(os.path.join(path, name))
         else:
@@ -81,7 +87,7 @@ def resolve_index(options, path, suffixes, single_file):
         base = os.path.basename(path)
         for s in suffixes:
             cand = os.path.join(idir, base + s)
-            if os.path.exists(cand):
+            if _cloudfs.exists(cand):
                 return cand
     return existing_index(path, suffixes)
 
@@ -102,9 +108,9 @@ def wants_metadata(options):
 
 
 def metadata_value(path, index_path=None):
-    st = os.stat(path)
-    return (path, os.path.basename(path), st.st_size,
-            _dt.datetime.fromtimestamp(st.st_mtime), index_path)
+    size, mtime = _cloudfs.stat(path)
+    return (path, os.path.basename(path), size,
+            _dt.datetime.fromtimestamp(mtime) if mtime is not None else None, index_path)
 
 
 def num_partitions(options, default=200):
@@ -113,10 +119,10 @@ def num_partitions(options, default=200):
 
 
 def existing_index(path, suffixes):
-    """First co-located index that exists on the local filesystem, or None."""
+    """First co-located index that exists (local or cloud), or None."""
     for s in suffixes:
         cand = path + s
-        if os.path.exists(cand):
+        if _cloudfs.exists(cand):
             return cand
     return None
 

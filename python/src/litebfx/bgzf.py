@@ -5,12 +5,14 @@ Productionized from ``spikes/bam_spike.py`` (validated: 250k offsets, 0 false po
 block and the first BAM record start at/after it, and return a virtual file offset
 ``(coffset << 16) | uoffset`` that ``pysam.AlignmentFile.seek()`` accepts.
 
-Reads only a bounded window from the file, so it works on FUSE-mounted paths without
-pulling the whole object.
+Reads only a bounded window from the file (via ``_cloudfs.open_read_range``), so it works on
+FUSE-mounted and cloud (s3://, gs://) paths alike without pulling the whole object.
 """
 
 import struct
 import zlib
+
+from . import _cloudfs
 
 _MAGIC = b"\x1f\x8b\x08\x04"          # gzip ID1/ID2, CM=deflate, FLG=FEXTRA
 MAX_BLOCK = 1 << 16                    # 64 KiB, the BGZF maximum block size
@@ -95,9 +97,7 @@ def split_start_voffset(path, start_byte, n_ref, window=_DEFAULT_WINDOW):
     Returns None when the split contains no record start (e.g. it falls past the last data
     block), in which case the partition is legitimately empty.
     """
-    with open(path, "rb") as f:
-        f.seek(start_byte)
-        buf = f.read(window)
+    buf = _cloudfs.open_read_range(path, start_byte, window)
 
     bo = find_block(buf, 0)
     if bo is None:

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
+from . import _cloud, _cloudfs
 from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
                     resolve_files, wants_metadata)
 from .arrow import batches, to_arrow_schema
@@ -64,7 +65,7 @@ class _FastqReader(DataSourceReader):
             if path.endswith(".gz"):
                 parts.append(_FastqPartition(path, 0, 0, True))
                 continue
-            size = os.path.getsize(path)
+            size = _cloudfs.getsize(path)
             n = min(self.num_partitions, max(1, size // self.min_split))
             if n <= 1:
                 parts.append(_FastqPartition(path, 0, 0, True))
@@ -83,15 +84,16 @@ class _FastqReader(DataSourceReader):
         rn = read_number(partition.path)
         md = (metadata_value(partition.path),) if self.metadata else ()
         if partition.whole:
-            pysam = import_pysam()
-            with pysam.FastxFile(partition.path) as fx:
-                for e in fx:
-                    yield (e.name, e.sequence, e.quality, e.comment or None, rn) + md
+            with _cloud.cloud_read_scope(partition.path):
+                pysam = import_pysam()
+                with pysam.FastxFile(_cloudfs.resolve_open_path(partition.path)) as fx:
+                    for e in fx:
+                        yield (e.name, e.sequence, e.quality, e.comment or None, rn) + md
         else:
             yield from self._read_range(partition, rn, md)
 
     def _read_range(self, partition, rn, md):
-        with open(partition.path, "rb") as f:
+        with _cloudfs.open_stream(partition.path) as f:
             if partition.start > 0:
                 f.seek(partition.start)
                 if not _resync(f):

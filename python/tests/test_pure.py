@@ -19,9 +19,40 @@ def test_normalize_path():
     assert io.normalize_path("/Volumes/c/s/v/a.bam") == "/Volumes/c/s/v/a.bam"
     assert io.normalize_path("/local/a.bam") == "/local/a.bam"
     assert io.normalize_path("file:///data/a.bam") == "/data/a.bam"
-    for uri in ("s3://b/a.bam", "s3a://b/a.bam", "abfss://c@x/a.bam", "gs://b/a.bam"):
+    # s3/s3a/gs are opened directly (native htslib remote-read backend) -- pass through.
+    for uri in ("s3://b/a.bam", "s3a://b/a.bam", "s3n://b/a.bam", "gs://b/a.bam"):
+        assert io.normalize_path(uri) == uri
+    # abfss/wasbs are opened directly too, via download-then-open (no native htslib backend).
+    for uri in ("abfss://c@x.dfs.core.windows.net/a.bam", "wasbs://c@x.blob.core.windows.net/a.bam"):
+        assert io.normalize_path(uri) == uri
+    # No native htslib backend and no orchestration story at all -- still rejected.
+    for uri in ("adl://x/a.bam", "hdfs://x/a.bam"):
         with pytest.raises(io.UnsupportedPathError):
             io.normalize_path(uri)
+
+
+def test_scheme_and_cloud_read_mode():
+    assert io.scheme("s3://b/a.bam") == "s3"
+    assert io.scheme("/local/a.bam") == ""
+    assert io.scheme("abfss://c@x.dfs.core.windows.net/a.bam") == "abfss"
+    for uri in ("s3://b/a.bam", "gs://b/a.bam"):
+        assert io.is_cloud_path(uri)
+        assert io.cloud_read_mode(uri) == "native"
+    for uri in ("abfss://c@x.dfs.core.windows.net/a.bam", "wasb://c@x.blob.core.windows.net/a.bam"):
+        assert io.is_cloud_path(uri)
+        assert io.cloud_read_mode(uri) == "download"
+    assert not io.is_cloud_path("/local/a.bam")
+    assert io.cloud_read_mode("/local/a.bam") is None
+    assert io.cloud_read_mode("hdfs://x/a.bam") is None    # still rejected, no download story
+
+
+def test_azure_parts():
+    assert io.azure_parts("abfss://cohort@genomics.dfs.core.windows.net/a.bam") == (
+        "genomics", "cohort", "a.bam")
+    assert io.azure_parts("wasbs://cohort@genomics.blob.core.windows.net/dir/a.bam") == (
+        "genomics", "cohort", "dir/a.bam")
+    with pytest.raises(ValueError):
+        io.azure_parts("s3://bucket/a.bam")    # no container@account authority to parse
 
 
 def test_parse_region():

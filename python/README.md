@@ -18,7 +18,15 @@ pip install lite-bfx-spark
 ```
 
 `pysam` is the only hard dependency; `pyspark>=4.0` is expected from the Spark runtime
-(cluster/serverless), exactly like the JAR's `provided`-scope Spark dependency.
+(cluster/serverless), exactly like the JAR's `provided`-scope Spark dependency. Two optional
+extras cover direct cloud reads (see below): `databricks` for Unity Catalog credential
+vending, and `gcp` for minting a GCS access token off Databricks from an ambient
+`GOOGLE_APPLICATION_CREDENTIALS` service-account key:
+
+```bash
+pip install "lite-bfx-spark[databricks]"
+pip install "lite-bfx-spark[gcp]"
+```
 
 ## Usage
 
@@ -59,19 +67,42 @@ spark.read.format("fastq").load("/Volumes/run/lane1/")      # directory of FASTQ
 | `columnNames` | BAM, CRAM | `sam` for canonical SAM field names |
 | `metadata` | all | `true` adds a visible `_metadata` struct (`file_path`, `file_name`, `file_size`, `file_modification_time`, `index_path`) |
 
-## Cloud storage = a filesystem mount
+## Cloud storage
 
-This package reads **local filesystem paths only** and has no cloud SDK or credential
-handling. Object storage is reached through a FUSE mount:
+`s3://`, `s3a://`, and `gs://` are read **directly** — no FUSE mount needed. pysam's bundled
+htslib has a native S3/GCS remote-read backend, so `spark.read.format("bam").load("s3://
+bucket/sample.bam")` just works, with the same index-guided range-request behavior as a local
+file. `abfss://`/`wasbs://` are also read directly, but differently: htslib has no native
+Azure backend, so the object is downloaded to a local temp file first and pysam reads that —
+this gets you direct Azure support with no mount, at the cost of the range-request-only
+efficiency S3/GCS get (the whole file transfers once per worker process, then reads from it
+are as fast as local disk, including index-guided seeks within the downloaded copy).
+
+**Credentials** are ambient by default (env vars, instance profile / workload identity,
+shared config — the same resolution any AWS/GCS/Azure SDK tool uses). **On Databricks**, if
+the `databricks` extra is installed, a short-lived, path-scoped credential is vended
+automatically from Unity Catalog's Temporary Credentials API for any path under a registered
+External Location the caller has `READ FILES` on, and takes priority over ambient
+credentials. No code changes needed either way — this is all handled internally.
+
+**GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
+already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most
+common ambient GCS credential (`GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account
+key, standard Application Default Credentials) isn't directly usable by itself. Off
+Databricks, install the `gcp` extra and this package mints a token from that key file
+automatically (cached and refreshed as it nears expiry); without the extra, `gs://` reads
+fail with a permission error even though the key file is right there. S3 and Azure don't
+have this gap — their ambient credential shapes are exactly what htslib/`pyarrow.fs` already
+expect.
+
+Everything else — `adl://`, `hdfs://`, `http(s)://`, `ftp://` — still needs a mount:
 
 - **On Databricks**, use a **Unity Catalog Volume** path (`/Volumes/<cat>/<schema>/<vol>/…`,
   works on classic and serverless) or a `dbfs:/…` path — Databricks does the cloud I/O and
-  auth under the mount. `dbfs:/` is normalized to `/dbfs/`.
+  auth under the mount. `dbfs:/` is normalized to `/dbfs/`. UC Volumes also work as a matter
+  of course for `s3://`/`gs://`/`abfss://` if you'd rather not manage direct-path permissions.
 - **Off Databricks**, mount the bucket yourself (`mountpoint-s3`, `s3fs`, `gcsfuse`,
   `blobfuse2`, `rclone mount`) and pass the mounted path.
-
-Raw `s3://` / `abfss://` / `gs://` URIs are rejected with guidance, because their
-credentials are not visible to a Python worker.
 
 ## Known issues
 
@@ -83,12 +114,38 @@ fails on the relocated binary and aborts the process (`FATAL FIPS SELFTEST FAILU
 package works around it automatically — `litebfx._base.import_pysam()` strips the variable
 before the first `import pysam` — so no user action is needed.
 
+**Debian/Ubuntu images — including Databricks Runtime: real `s3://`/`gs://` reads fail with a
+misleading "No such file or directory."** pysam's manylinux wheel bundles a libcurl built
+expecting the CA bundle at the RedHat/CentOS path (`/etc/pki/tls/certs/ca-bundle.crt`),
+compiled in via `CURLOPT_CAINFO` — not something `CURL_CA_BUNDLE`/`SSL_CERT_FILE` can
+override at runtime, since htslib calls libcurl's C API directly rather than going through
+the `curl` CLI tool (which is what actually honors those env vars). Debian/Ubuntu — this
+includes Databricks Runtime, confirmed on 17.3-LTS, it is not exempt — keeps the real bundle
+at `/etc/ssl/certs/ca-certificates.crt` instead, so any genuine HTTPS connection through
+pysam's bundled libcurl (real S3/GCS — a plain-HTTP test emulator like MinIO never exercises
+this path) fails the TLS handshake, and htslib reports it as a generic "No such file or
+directory" rather than a certificate error.
+
+This package works around it automatically where it can — `litebfx._cloud.prepare_env()`
+symlinks the expected path to the real bundle on first native S3/GCS open, best-effort and
+silent on failure — but that needs write access to `/etc/`, which isn't guaranteed (a
+non-root process, a read-only filesystem). If your environment doesn't allow it, fix it once
+in your image instead:
+```dockerfile
+RUN apt-get install -y ca-certificates \
+    && mkdir -p /etc/pki/tls/certs \
+    && ln -s /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
+```
+(`docker/Dockerfile.python` in this repo does exactly this, as belt-and-suspenders alongside
+the runtime fix.)
+
 ## Relationship to the JAR
 
 The JAR and this package are two implementations of the same reader for two deployment
 models — install **one**, not both. Use the JAR when you need optimizer integration
-(statistics, ordering), byte-balanced splitting, or Hadoop-native access to every cloud
-scheme; use this package when you want a `pip install` with no JVM library to provision.
+(statistics, ordering), byte-balanced splitting, or Hadoop-native access to a cloud scheme
+this package doesn't cover directly (`adl://`, `hdfs://`); use this package when you want a
+`pip install` with no JVM library to provision — S3, GCS, and Azure are all direct here too.
 
 ## Supported formats
 
