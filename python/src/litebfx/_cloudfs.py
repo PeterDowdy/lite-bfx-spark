@@ -45,7 +45,7 @@ import pyarrow.fs
 from . import _cloud
 from . import io as _io
 
-_FS_CACHE = {}   # (scheme, bucket-or-account) -> pyarrow.fs.FileSystem
+_FS_CACHE = {}   # (scheme, bucket-or-account, credential-id-or-None) -> pyarrow.fs.FileSystem
 
 _AZURE_SCHEMES = ("abfs", "abfss", "wasb", "wasbs")
 
@@ -56,16 +56,41 @@ _FS_CTOR = {
 }
 
 
+def _cache_fs(cache_key, fs):
+    """Insert `fs` under `cache_key` and drop any other entry sharing the same (scheme,
+    bucket-or-account) prefix -- a credential refresh changes `cache_key`'s third element
+    (see filesystem_for()'s docstring), so without this, _FS_CACHE would grow by one stale,
+    never-reused entry per re-vend over a long-running worker process instead of staying at
+    one live entry per bucket."""
+    prefix = cache_key[:2]
+    for other in [k for k in _FS_CACHE if k[:2] == prefix and k != cache_key]:
+        del _FS_CACHE[other]
+    _FS_CACHE[cache_key] = fs
+
+
 def filesystem_for(path: str):
     """Return (pyarrow.fs.FileSystem, within-fs-path) for a cloud URI.
 
-    The filesystem is memoized per (scheme, bucket-or-account): constructing one does real
-    credential resolution, not free. Ambient credential resolution (env vars, instance
-    metadata, shared config) happens via `pyarrow.fs.FileSystem.from_uri` for S3/GCS, with no
-    arguments needed -- unless `_cloud.credentials_for()` has a vended credential cached for
-    this bucket (Databricks UC), in which case the scheme-specific FileSystem is constructed
-    with explicit credential kwargs instead, taking priority over ambient resolution. Azure
-    always needs explicit construction (see module docstring) -- see `_azure_filesystem_for`.
+    The filesystem is memoized per (scheme, bucket-or-account, credential identity):
+    constructing one does real credential resolution, not free. Ambient credential resolution
+    (env vars, instance metadata, shared config) happens via `pyarrow.fs.FileSystem.from_uri`
+    for S3/GCS, with no arguments needed -- unless `_cloud.credentials_for()` has a vended
+    credential for this bucket (Databricks UC), in which case the scheme-specific FileSystem
+    is constructed with explicit credential kwargs instead, taking priority over ambient
+    resolution. Azure always needs explicit construction (see module docstring) -- see
+    `_azure_filesystem_for`.
+
+    The credential identity is part of the cache key -- not just (scheme, bucket) -- so a
+    freshly re-vended credential (near-expiry refresh, or a retry after a transient vending
+    failure) naturally invalidates the old entry instead of the stale filesystem being reused
+    forever. Without this, a single transient vend_credential() failure on the *first* cloud
+    touch in a worker process (network blip, WorkspaceClient() not yet warmed up) would
+    permanently pin that bucket to the unauthorized ambient-fallback filesystem for the rest
+    of the process's life, even though _cloud.credentials_for() itself retries correctly on
+    every call -- confirmed by reading credentials_for()'s own cache logic, which re-attempts
+    vending whenever the cached entry is None, not just on expiry. This bug's symptom looks
+    exactly like a permissions problem (a clean, consistent AWS ACCESS_DENIED / 403) rather
+    than the transient-hiccup-then-cache-poisoning it actually is.
 
     Raises ValueError if `path` is not a cloud path litebfx recognizes.
     """
@@ -75,10 +100,10 @@ def filesystem_for(path: str):
     if s not in _FS_CTOR:
         raise ValueError(f"not a cloud path: {path!r}")
     _, bucket, key = _io.bucket_key(path)
-    cache_key = (s, bucket)
+    cred = _cloud.credentials_for(path) if _cloud.is_databricks() else None
+    cache_key = (s, bucket, id(cred) if cred is not None else None)
     fs = _FS_CACHE.get(cache_key)
     if fs is None:
-        cred = _cloud.credentials_for(path) if _cloud.is_databricks() else None
         gcs_endpoint = os.environ.get("GCS_ENDPOINT_URL") if s in ("gs", "gcs") else None
         if cred is not None and cred.fs_kwargs:
             fs = _FS_CTOR[s](**cred.fs_kwargs)
@@ -88,17 +113,17 @@ def filesystem_for(path: str):
                 anonymous=True, scheme=parsed.scheme or "http", endpoint_override=parsed.netloc)
         else:
             fs, _ = pyarrow.fs.FileSystem.from_uri(f"{s}://{bucket}")
-        _FS_CACHE[cache_key] = fs
+        _cache_fs(cache_key, fs)
     return fs, f"{bucket}/{key}" if key else bucket
 
 
 def _azure_filesystem_for(path: str):
     account_name, container, key = _io.azure_parts(path)
-    cache_key = (_io.scheme(path), account_name)
+    cred = _cloud.credentials_for(path) if _cloud.is_databricks() else None
+    cache_key = (_io.scheme(path), account_name, id(cred) if cred is not None else None)
     fs = _FS_CACHE.get(cache_key)
     if fs is None:
         kwargs = {}
-        cred = _cloud.credentials_for(path) if _cloud.is_databricks() else None
         if cred is not None and cred.fs_kwargs:
             kwargs.update(cred.fs_kwargs)
         endpoint = os.environ.get("AZURE_STORAGE_ENDPOINT_URL")
@@ -113,7 +138,7 @@ def _azure_filesystem_for(path: str):
         if account_key and "sas_token" not in kwargs:
             kwargs.setdefault("account_key", account_key)
         fs = pyarrow.fs.AzureFileSystem(account_name, **kwargs)
-        _FS_CACHE[cache_key] = fs
+        _cache_fs(cache_key, fs)
     return fs, f"{container}/{key}" if key else container
 
 

@@ -117,3 +117,58 @@ def test_prepare_env_off_databricks_is_noop(monkeypatch):
     before = dict(os.environ)
     _cloud.prepare_env("s3://bucket/key")
     assert dict(os.environ) == before
+
+
+def test_vend_credential_logs_when_sdk_missing(monkeypatch, caplog):
+    """Previously silent -- a Databricks user who forgot to install the `databricks` extra
+    got no indication vending was skipped at all, just an eventual, unrelated-looking
+    permission error from ambient resolution."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    monkeypatch.setattr(_cloud, "_import_databricks_sdk", lambda: None)
+    with caplog.at_level("INFO", logger="litebfx._cloud"):
+        assert _cloud.vend_credential("s3://bucket/key") is None
+    assert any("databricks" in r.message and "extra" in r.message for r in caplog.records)
+
+
+def test_vend_credential_logs_on_exception(monkeypatch, caplog):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+
+    class _RaisingWorkspaceClient:
+        def __init__(self):
+            raise RuntimeError("auth did not resolve in this process")
+
+    import databricks.sdk
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", _RaisingWorkspaceClient)
+    with caplog.at_level("WARNING", logger="litebfx._cloud"):
+        assert _cloud.vend_credential("s3://my-bucket/key") is None
+    records = [r for r in caplog.records if "my-bucket/key" in r.message or
+               "my-bucket/key" in str(r.args)]
+    assert records, f"expected a warning naming the path, got: {[r.message for r in caplog.records]}"
+    assert records[0].exc_info is not None    # the actual exception must be attached, not swallowed
+
+
+def test_vend_credential_logs_when_response_unusable(monkeypatch, caplog):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+
+    class _FakeTempCredentials:
+        def generate_temporary_path_credentials(self, path, op):
+            return GenerateTemporaryPathCredentialResponse()   # no credential field populated
+
+    class _FakeWorkspaceClient:
+        def __init__(self):
+            self.temporary_path_credentials = _FakeTempCredentials()
+
+    import databricks.sdk
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", _FakeWorkspaceClient)
+    with caplog.at_level("WARNING", logger="litebfx._cloud"):
+        assert _cloud.vend_credential("s3://bucket/key") is None
+    assert any("no usable credential" in r.message for r in caplog.records)
+
+
+def test_vend_credential_no_log_when_off_databricks(monkeypatch, caplog):
+    """The overwhelmingly common case (off Databricks entirely) must stay silent -- only
+    genuine on-Databricks vending problems should log."""
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    with caplog.at_level("DEBUG", logger="litebfx._cloud"):
+        assert _cloud.vend_credential("s3://bucket/key") is None
+    assert caplog.records == []
