@@ -1,14 +1,16 @@
 """FASTA DataSource — one row per contig, one partition per contig when a ``.fai`` exists."""
 
-import os
+import io
 from dataclasses import dataclass, field
 
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
+from . import _cloud, _cloudfs
 from ._base import (METADATA_FIELD, import_pysam, metadata_value, resolve_files, resolve_index,
                     wants_metadata)
 from .arrow import batches, to_arrow_schema
+from .io import cloud_read_mode
 from .schemas import FASTA_SCHEMA
 
 _EXT = (".fa", ".fasta", ".fna", ".fa.gz", ".fasta.gz")
@@ -47,8 +49,8 @@ class _FastaReader(DataSourceReader):
         parts = []
         for path in self.files:
             fai = resolve_index(self.options, path, (".fai",), self.single)
-            if fai and os.path.exists(fai):
-                with open(fai) as fh:
+            if fai and _cloudfs.exists(fai):
+                with io.TextIOWrapper(_cloudfs.open_stream(fai)) as fh:
                     contigs = [ln.split("\t", 1)[0] for ln in fh if ln.strip()]
                 parts += ([_FastaPartition(path, [c], fai) for c in contigs]
                           or [_FastaPartition(path, [], fai)])
@@ -60,14 +62,37 @@ class _FastaReader(DataSourceReader):
         yield from batches(self._rows(partition), self._arrow)
 
     def _rows(self, partition):
-        pysam = import_pysam()
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        if partition.contigs:
-            with pysam.FastaFile(partition.path, filepath_index=partition.index) as fa:
-                for contig in partition.contigs:
-                    seq = fa.fetch(contig)
-                    yield (contig, seq, len(seq)) + md
-        else:
-            with pysam.FastxFile(partition.path) as fx:
-                for e in fx:
-                    yield (e.name, e.sequence, len(e.sequence)) + md
+        with _cloud.cloud_read_scope(partition.path):
+            pysam = import_pysam()
+            mode = cloud_read_mode(partition.path)
+            path = _cloudfs.resolve_open_path(partition.path)
+            if partition.contigs:
+                if mode == "native":
+                    # pysam.FastaFile's explicit filepath_index= does its own local-only
+                    # os.path-style pre-check in Cython before ever reaching htslib -- it
+                    # always reports "does not exist" for a remote URL regardless of correct
+                    # syntax (confirmed empirically). Omitting it lets htslib auto-discover a
+                    # co-located .fai itself (a real, remote-aware open), which works. A
+                    # non-co-located index (indexPath/indexDir pointing elsewhere) on a
+                    # native cloud path can't use this workaround -- passing it explicit
+                    # deliberately raises pysam's local-only error rather than silently
+                    # reading the wrong (or no) index; this is a known pysam limitation, not
+                    # something litebfx's own code can route around.
+                    co_located = partition.index == partition.path + ".fai"
+                    kw = {} if (co_located or not partition.index) else (
+                        {"filepath_index": _cloudfs.resolve_open_path(partition.index)})
+                else:
+                    # Local, or Azure "download" mode: materialize_local() already produced
+                    # a real local file, so pysam's pre-check succeeds normally -- no
+                    # co-located restriction needed, unlike the native-mode branch above.
+                    kw = ({"filepath_index": _cloudfs.resolve_open_path(partition.index)}
+                          if partition.index else {})
+                with pysam.FastaFile(path, **kw) as fa:
+                    for contig in partition.contigs:
+                        seq = fa.fetch(contig)
+                        yield (contig, seq, len(seq)) + md
+            else:
+                with pysam.FastxFile(path) as fx:
+                    for e in fx:
+                        yield (e.name, e.sequence, len(e.sequence)) + md

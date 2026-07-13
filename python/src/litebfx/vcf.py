@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
+from . import _cloud, _cloudfs
 from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, resolve_files,
                     resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
@@ -120,15 +121,17 @@ class _VcfReader(DataSourceReader):
         yield from batches(self._rows(partition), self._arrow)
 
     def _rows(self, partition):
-        pysam = import_pysam()
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        vf = pysam.VariantFile(partition.path, index_filename=partition.index)
-        try:
-            it = vf.fetch(*partition.region) if partition.region else vf
-            for rec in it:
-                yield record_to_row(rec) + md
-        finally:
-            vf.close()
+        with _cloud.cloud_read_scope(partition.path):
+            pysam = import_pysam()
+            index = _cloudfs.resolve_open_path(partition.index) if partition.index else None
+            vf = pysam.VariantFile(_cloudfs.resolve_open_path(partition.path), index_filename=index)
+            try:
+                it = vf.fetch(*partition.region) if partition.region else vf
+                for rec in it:
+                    yield record_to_row(rec) + md
+            finally:
+                vf.close()
 
 
 class _VcfReaderPushdown(_VcfReader):

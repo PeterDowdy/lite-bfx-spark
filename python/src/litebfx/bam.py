@@ -15,17 +15,17 @@ stays entirely in pysam, so BAM/SAM/CRAM share one mapping and parity holds.
 """
 
 import math
-import os
 from dataclasses import dataclass, field
 
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
+from . import _cloud, _cloudfs
 from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
                     resolve_files, resolve_index, round_robin, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .bgzf import split_start_voffset
-from .io import normalize_path
+from .io import is_cloud_path, normalize_path
 from .regions import parse_region, push_region
 from .schemas import bam_schema, is_sam_column_names
 
@@ -117,25 +117,29 @@ class _AlignmentReader(DataSourceReader):
 
     def _open(self, path, index=None):
         pysam = import_pysam()
+        path = _cloudfs.resolve_open_path(path)
         if (not self.is_cram) and path.lower().endswith(".sam"):
             return pysam.AlignmentFile(path, "r")
         kw = {}
         if self.reference:
             kw["reference_filename"] = self.reference
         if index:
-            kw["index_filename"] = index
+            kw["index_filename"] = _cloudfs.resolve_open_path(index)
         return pysam.AlignmentFile(path, "rc" if self.is_cram else "rb", **kw)
 
     def _synthesize_crai(self, path):
         """Build a co-located CRAI for an unindexed (coordinate-sorted) CRAM. None if the CRAM
-        is unsorted or its directory is read-only."""
+        is unsorted, its directory is read-only, or it's a cloud path (pysam has no cloud
+        write support -- same fallback as a read-only local directory)."""
+        if is_cloud_path(path):
+            return None
         pysam = import_pysam()
         crai = path + ".crai"
-        if os.path.exists(crai):
+        if _cloudfs.exists(crai):
             return crai
         try:
             pysam.index(path)
-            return crai if os.path.exists(crai) else None
+            return crai if _cloudfs.exists(crai) else None
         except Exception:
             return None
 
@@ -156,7 +160,7 @@ class _AlignmentReader(DataSourceReader):
             index = self._synthesize_crai(path)
 
         if index:
-            with self._open(path, index) as af:
+            with _cloud.cloud_read_scope(path), self._open(path, index) as af:
                 refs = list(af.references)
             parts = [_AlnPartition("contigs", path, index, contigs=g)
                      for g in round_robin(refs, self.num_partitions)]
@@ -166,7 +170,7 @@ class _AlignmentReader(DataSourceReader):
         if self.is_cram:                       # unindexed CRAM, could not synthesize an index
             return [_AlnPartition("all", path)]
 
-        size = os.path.getsize(path)           # unindexed BAM -> BGZF byte-range splits
+        size = _cloudfs.getsize(path)           # unindexed BAM -> BGZF byte-range splits
         n = max(1, math.ceil(size / self.split_size))
         return [_AlnPartition("range", path, start_byte=i * self.split_size,
                               end_byte=min((i + 1) * self.split_size, size))
@@ -177,27 +181,28 @@ class _AlignmentReader(DataSourceReader):
 
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        af = self._open(partition.path, partition.index)
-        try:
-            if partition.kind == "all":
-                for r in af.fetch(until_eof=True):
-                    yield record_to_row(r) + md
-            elif partition.kind == "region":
-                for r in af.fetch(*partition.region):
-                    yield record_to_row(r) + md
-            elif partition.kind == "contigs":
-                for contig in partition.contigs:
-                    for r in af.fetch(contig):
+        with _cloud.cloud_read_scope(partition.path):
+            af = self._open(partition.path, partition.index)
+            try:
+                if partition.kind == "all":
+                    for r in af.fetch(until_eof=True):
                         yield record_to_row(r) + md
-            elif partition.kind == "unmapped":
-                for r in af.fetch(contig="*"):
-                    yield record_to_row(r) + md
-            elif partition.kind == "range":
-                for row in self._read_range(af, partition.path,
-                                            partition.start_byte, partition.end_byte):
-                    yield row + md
-        finally:
-            af.close()
+                elif partition.kind == "region":
+                    for r in af.fetch(*partition.region):
+                        yield record_to_row(r) + md
+                elif partition.kind == "contigs":
+                    for contig in partition.contigs:
+                        for r in af.fetch(contig):
+                            yield record_to_row(r) + md
+                elif partition.kind == "unmapped":
+                    for r in af.fetch(contig="*"):
+                        yield record_to_row(r) + md
+                elif partition.kind == "range":
+                    for row in self._read_range(af, partition.path,
+                                                partition.start_byte, partition.end_byte):
+                        yield row + md
+            finally:
+                af.close()
 
     def _read_range(self, af, path, start_byte, end_byte):
         """Unindexed BAM byte-range split: block+record guesser -> seek -> stop at boundary."""

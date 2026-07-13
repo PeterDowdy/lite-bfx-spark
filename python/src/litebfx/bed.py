@@ -1,11 +1,13 @@
 """BED DataSource — BED3..BED12, plain or bgzipped, optional tabix region query."""
 
 import gzip
+import io
 from dataclasses import dataclass
 
 from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
+from . import _cloud, _cloudfs
 from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, resolve_files,
                     resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
@@ -150,13 +152,15 @@ class _BedReader(DataSourceReader):
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
         if partition.region:
-            pysam = import_pysam()
-            c, s0, e = partition.region
-            with pysam.TabixFile(partition.path, index=partition.index) as tbx:
-                for line in tbx.fetch(c, s0, e):
-                    row = parse_bed_line(line)
-                    if row:
-                        yield row + md
+            with _cloud.cloud_read_scope(partition.path):
+                pysam = import_pysam()
+                c, s0, e = partition.region
+                index = _cloudfs.resolve_open_path(partition.index) if partition.index else None
+                with pysam.TabixFile(_cloudfs.resolve_open_path(partition.path), index=index) as tbx:
+                    for line in tbx.fetch(c, s0, e):
+                        row = parse_bed_line(line)
+                        if row:
+                            yield row + md
         else:
             for line in _open_text(partition.path):
                 if _is_data_line(line):
@@ -177,10 +181,11 @@ class _BedReaderPushdown(_BedReader):
 
 
 def _open_text(path):
-    """Iterate text lines of a plain or gzip/bgzip BED file."""
+    """Iterate text lines of a plain or gzip/bgzip BED file, local or cloud."""
+    raw = _cloudfs.open_stream(path)
     if path.endswith((".gz", ".bgz")):
-        with gzip.open(path, "rt") as fh:
-            yield from fh
+        with gzip.GzipFile(fileobj=raw) as gz:
+            yield from io.TextIOWrapper(gz)
     else:
-        with open(path) as fh:
+        with io.TextIOWrapper(raw) as fh:
             yield from fh

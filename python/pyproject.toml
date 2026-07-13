@@ -26,7 +26,8 @@ dependencies = ["pysam>=0.22", "pyarrow>=4"]
 
 [project.optional-dependencies]
 spark = ["pyspark>=4.0"]
-test = ["pytest>=7.0", "pyspark>=4.0"]
+databricks = ["databricks-sdk>=0.120"]
+test = ["pytest>=7.0", "pyspark>=4.0", "boto3>=1.28"]
 
 [project.urls]
 Homepage = "https://github.com/PeterDowdy/lite-bfx-spark"

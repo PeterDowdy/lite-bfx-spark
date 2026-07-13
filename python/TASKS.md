@@ -13,8 +13,20 @@ Java JAR, filesystem-path I/O only (FUSE mounts for cloud), Arrow output.
 ## Validated decisions (do not re-litigate)
 
 - **Parsing:** pysam 0.24.0 (bundled htslib). One decode path.
-- **Cloud I/O:** local/FUSE paths only; normalize `dbfs:/`→`/dbfs/`, pass `/Volumes` &
-  local through, **reject** raw `s3://`/`abfss://`/`gs://`. No SDK/credentials in-package.
+- **Cloud I/O (superseded, see below):** `s3://`/`s3a://`/`s3n://`/`gs://`/`gcs://` are now
+  opened **directly** — pysam's bundled htslib has a native S3/GCS remote-read backend
+  (confirmed by binary inspection + live MinIO/fake-gcs reads through the real Spark
+  pipeline), no FUSE mount needed. `abfss://`/`wasbs://`/`abfs://`/`wasb://` are also opened
+  directly, but via a different mechanism: htslib has **no native Azure backend at all**
+  (confirmed absent), so the object is downloaded to a local temp file via
+  `pyarrow.fs.AzureFileSystem` and pysam opens the local copy — no range-request efficiency
+  for Azure specifically, but no FUSE mount either. `adl://`/`hdfs://`/`http(s)://`/`ftp://`
+  are still rejected, unchanged, with FUSE-mount guidance. Credential handling: ambient
+  (env vars / instance metadata / shared config, resolved by htslib/pyarrow.fs themselves)
+  everywhere; on Databricks, `_cloud.py` additionally vends short-lived, path-scoped
+  credentials via Unity Catalog's Temporary Credentials API and prefers them over ambient.
+  See `io.py`, `_cloudfs.py`, `_cloud.py`, and `docs/proposals/python-data-source.md`'s
+  "Cloud I/O" section for the full design.
 - **Intra-contig parallelism:** coordinate sub-ranges + start-ownership dedup
   (approximate balance accepted; byte-balanced VFO splitting NOT built).
 - **Unindexed BAM split:** SPIKE PASSED. `pysam.seek(voffset)` works index-less;
@@ -60,7 +72,9 @@ python/
   src/litebfx/
     __init__.py             # register_all(spark), __version__
     schemas.py              # StructTypes == Java *Schema (incl. columnNames=sam)
-    io.py                   # path normalization; reject raw cloud URIs
+    io.py                   # path normalization; scheme gate (native / download / rejected)
+    _cloudfs.py             # pyarrow.fs dispatch: local-vs-cloud exists/stat/listdir/reads
+    _cloud.py               # cloud credentials: ambient + Databricks UC vending
     regions.py              # region option + pushFilters parsing
     arrow.py                # StructType -> pyarrow schema; RecordBatch builders
     bgzf.py                 # BGZF block finder + BAM record guesser (from spike)
@@ -138,4 +152,29 @@ pytest -q -m "not spark"        # pure-Python units only (no JVM)
 
 - Executor-side CRAM container seek (`.seek()` + decode) — spike with a reference-present CRAM.
 - Confirm exact `pushFilters` return contract on the pinned Spark 4.1.x.
-- FUSE random-access benchmark on UC Volumes / `mountpoint-s3` (proposal Phase 3).
+- FUSE random-access benchmark on UC Volumes / `mountpoint-s3` — now scoped to the schemes
+  that still need a mount (`adl://`, `hdfs://`), not S3/GCS/Azure, which no longer depend on
+  FUSE at all.
+- **htslib upstream contribution opportunity**: htslib's S3 backend (`hfile_s3.c`) supports a
+  custom endpoint via `HTS_S3_HOST`/`HTS_S3_ADDRESS_STYLE`, but the GCS backend
+  (`hfile_gcs.c`) has no equivalent at all — confirmed by binary inspection (only
+  `GCS_OAUTH_TOKEN`/`GCS_REQUESTER_PAYS_PROJECT` are read; the URL rewrite is hardcoded to
+  `.googleapis.com`) and by direct testing (a `gs://` read against fake-gcs-server hangs
+  30+ minutes retrying real Google OAuth2 endpoints before failing). Adding a GCS host
+  override mirroring the existing S3 one would let htslib-based tools (this package
+  included) test against `fake-gcs-server`/`gcs-emulator`, not just real GCS buckets — a
+  genuinely useful, scoped upstream fix for github.com/samtools/htslib, not just a litebfx
+  workaround. `test_cloud_gcs.py` documents the current workaround (orchestration-layer-only
+  testing via `pyarrow.fs.GcsFileSystem`'s explicit `endpoint_override`).
+- Databricks UC credential vending (`_cloud.py`): whether `WorkspaceClient()`'s default auth
+  resolves inside the isolated Python Data Source worker subprocess (vs. only the driver) is
+  unverified without a real workspace — see `tests/smoke_uc_credential_vending.py`, run
+  manually pre-release, not in default CI.
+- `_cloud.py`'s cloud-read lock serializes all cloud-backed reads within one worker process
+  (a deliberate correctness-over-parallelism tradeoff — see its module docstring) because
+  it's unverified whether htslib re-reads env vars only at open time or per range-request.
+  Revisit only if this is a measured bottleneck.
+- Azure download-fallback (`_cloudfs.materialize_local`) caches by source URL for a worker
+  process's lifetime but doesn't bound total local disk usage across distinct files — a
+  long-running worker touching many large Azure files could accumulate significant local
+  temp storage. Acceptable for typical partition-plan sizes; revisit if it becomes an issue.

@@ -5,6 +5,18 @@ import os
 
 import pytest
 
+# conftest.py always loads before any test file, so this applies litebfx's Databricks
+# FIPS-crash workaround (see _base.import_pysam()'s docstring) exactly once, process-wide,
+# before any test file's own `import pysam` runs -- test code doesn't go through litebfx's
+# internal call sites, so without this it would crash on a real Databricks image the same
+# way an unpatched `import pysam` would (confirmed: this is exactly how
+# python-test-databricks first caught this gap).
+try:
+    from litebfx._base import import_pysam
+    import_pysam()
+except ImportError:
+    pass    # litebfx (or pysam) not installed yet -- fine, individual tests importorskip
+
 _HERE = os.path.dirname(__file__)
 _RES = os.path.abspath(os.path.join(_HERE, "..", "..", "core", "src", "test", "resources"))
 
@@ -44,6 +56,102 @@ def spark():
     litebfx.register_all(s)
     yield s
     s.stop()
+
+
+@pytest.fixture(scope="session")
+def s3_bucket():
+    """Uploads range.bam/.bai and realn01.fa/.fai to S3; yields the s3://bucket/prefix base
+    URI. Skipped (not failed) when S3_BUCKET is unset -- run via `docker compose run --rm
+    python-test-s3` (MinIO) or `python-test-s3-live` (real AWS), not in default CI.
+
+    Credentials are never read here directly: boto3's own default chain resolves
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or instance profile / shared config) the same
+    way htslib and pyarrow.fs do, so MinIO's fake keys and a real IAM user's keys both just
+    work via the same env vars, set in docker-compose.yml / .env -- nothing here needs to
+    know which one it is.
+    """
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        pytest.skip("S3_BUCKET not set -- run via docker compose run --rm python-test-s3 "
+                     "(MinIO) or python-test-s3-live (real AWS)")
+    boto3 = pytest.importorskip("boto3")
+    endpoint = os.environ.get("S3_ENDPOINT")    # unset -> real AWS default endpoint
+    s3 = boto3.client("s3", **({"endpoint_url": endpoint} if endpoint else {}))
+    try:
+        s3.create_bucket(Bucket=bucket)
+    except Exception:
+        pass    # already exists (BucketAlreadyOwnedByYou on MinIO reruns; on a real bucket
+                # this identity may not even have s3:CreateBucket, which is fine -- it
+                # already exists, per the least-privilege policy in TESTING.md)
+    prefix = "litebfx-test"
+    # INTELLIGENT_TIERING on a real bucket only: a cost safety net in case these fixtures
+    # are ever left behind and forgotten -- objects that go untouched automatically move to
+    # cheaper access tiers over time instead of sitting at STANDARD indefinitely. MinIO
+    # rejects it outright (InvalidStorageClass, confirmed empirically -- it validates
+    # against its own small supported set, unlike silently ignoring an unknown class), so
+    # this only applies when there's no custom endpoint (i.e. real AWS).
+    extra_args = {} if endpoint else {"ExtraArgs": {"StorageClass": "INTELLIGENT_TIERING"}}
+    for name in ("range.bam", "range.bam.bai", "realn01.fa", "realn01.fa.fai"):
+        s3.upload_file(resource(name), bucket, f"{prefix}/{name}", **extra_args)
+    yield f"s3://{bucket}/{prefix}"
+
+
+@pytest.fixture(scope="session")
+def gcs_bucket():
+    """Uploads the same fixtures as s3_bucket, to fake-gcs-server via its REST API directly
+    (no google-cloud-storage client dependency needed, matching the Java side's
+    spark-test-gcs approach). Skipped when GCS_ENDPOINT is unset."""
+    endpoint = os.environ.get("GCS_ENDPOINT")
+    if not endpoint:
+        pytest.skip("GCS_ENDPOINT not set -- run via docker compose run --rm python-test-gcs")
+    import urllib.request
+    bucket = os.environ.get("GCS_BUCKET", "test-bucket")
+    req = urllib.request.Request(
+        f"{endpoint}/storage/v1/b", method="POST",
+        data=f'{{"name": "{bucket}"}}'.encode(), headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req)
+    except Exception:
+        pass    # already exists on repeat local runs
+    prefix = "litebfx-test"
+    for name in ("range.bam", "range.bam.bai", "realn01.fa", "realn01.fa.fai"):
+        with open(resource(name), "rb") as fh:
+            data = fh.read()
+        url = f"{endpoint}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={prefix}/{name}"
+        urllib.request.urlopen(urllib.request.Request(url, method="POST", data=data))
+    yield f"gs://{bucket}/{prefix}"
+
+
+@pytest.fixture(scope="session")
+def azure_container():
+    """Uploads the same fixtures as s3_bucket, to Azurite via pyarrow.fs.AzureFileSystem
+    directly (it can write too, so no azure-storage-blob client dependency needed). Uses
+    Azurite's well-known dev account/key -- the same ones this repo's docker-compose.yml
+    already documents for the Java side's spark-test-azure. Skipped when
+    AZURE_STORAGE_ENDPOINT_URL is unset."""
+    endpoint = os.environ.get("AZURE_STORAGE_ENDPOINT_URL")
+    if not endpoint:
+        pytest.skip("AZURE_STORAGE_ENDPOINT_URL not set -- run via docker compose run --rm "
+                     "python-test-azure")
+    import urllib.parse
+    import pyarrow.fs
+    account = os.environ.get("AZURE_STORAGE_ACCOUNT", "devstoreaccount1")
+    container = os.environ.get("AZURE_STORAGE_CONTAINER", "test-container")
+    parsed = urllib.parse.urlparse(endpoint)
+    fs = pyarrow.fs.AzureFileSystem(
+        account_name=account, account_key=os.environ["AZURE_STORAGE_ACCOUNT_KEY"],
+        blob_storage_authority=parsed.netloc, dfs_storage_authority=parsed.netloc,
+        blob_storage_scheme=parsed.scheme or "http", dfs_storage_scheme=parsed.scheme or "http")
+    try:
+        fs.create_dir(container)
+    except Exception:
+        pass    # already exists on repeat local runs
+    prefix = "litebfx-test"
+    for name in ("range.bam", "range.bam.bai", "realn01.fa", "realn01.fa.fai"):
+        with open(resource(name), "rb") as src, fs.open_output_stream(
+                f"{container}/{prefix}/{name}") as dst:
+            dst.write(src.read())
+    yield f"abfss://{container}@{account}.dfs.core.windows.net/{prefix}"
 
 
 @pytest.fixture(scope="session")
