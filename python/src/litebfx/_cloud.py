@@ -1,14 +1,27 @@
 """Cloud credentials for htslib's native S3/GCS remote-read backend, and for the pyarrow.fs
 filesystems _cloudfs.py uses for orchestration (including Azure's download-fallback path).
 
-Ambient credentials (env vars, instance metadata, shared config) need nothing from this
-module -- htslib and pyarrow.fs both resolve them on their own. This module only matters on
-Databricks: prepare_env() vends a short-lived, path-scoped credential via Unity Catalog's
-Temporary Credentials API and writes it into os.environ, taking priority over ambient
-credentials (it's scoped to exactly what the caller is authorized for). Vending is lazy --
-the first cloud open in a worker process -- and cached per (scheme, bucket), re-vending near
-expiry. Off Databricks, or if the `databricks` extra isn't installed, or if vending fails for
-any reason, everything here is a no-op and htslib/pyarrow.fs fall back to ambient resolution.
+For S3 and Azure, ambient credentials (env vars, instance metadata, shared config) need
+nothing from this module -- htslib and pyarrow.fs both resolve them on their own. GCS is a
+real exception: htslib's native GCS backend wants an already-minted OAuth *access token* in
+GCS_OAUTH_TOKEN, not GOOGLE_APPLICATION_CREDENTIALS (a key *file path*) -- the credential
+shape most GCS users actually have ambiently, and the one pyarrow.fs.GcsFileSystem itself
+resolves happily on its own. Left alone, that's a silent read failure for anyone off
+Databricks with only a service-account key file. prepare_env() closes this: when
+GOOGLE_APPLICATION_CREDENTIALS is set and the `gcp` extra (google-auth) is installed, it
+mints an access token from the key file directly (see _mint_ambient_gcs_token()) -- cached
+process-wide and refreshed near expiry, independent of Databricks. Missing extra, missing env
+var, or any minting failure is a silent no-op, same as the rest of this module's failure
+posture: htslib/pyarrow.fs just fall back to whatever's already ambient.
+
+On Databricks, prepare_env() *additionally* vends a short-lived, path-scoped credential via
+Unity Catalog's Temporary Credentials API and writes it into os.environ, taking priority over
+both plain ambient resolution and the GOOGLE_APPLICATION_CREDENTIALS mint above (it's scoped
+to exactly what the caller is authorized for). Vending is lazy -- the first cloud open in a
+worker process -- and cached per (scheme, bucket), re-vending near expiry. Off Databricks, or
+if the `databricks` extra isn't installed, or if vending fails for any reason, this step is
+skipped and prepare_env() falls through to the GOOGLE_APPLICATION_CREDENTIALS mint (GCS) or
+plain ambient resolution (S3/Azure).
 
 Not threaded through InputPartition: InputPartition objects get logged in Spark's plan
 explain output and worker tracebacks (a credential-bearing field is a real exposure risk),
@@ -42,10 +55,18 @@ from . import io as _io
 # the +http/+https scheme suffix is what actually switches the target host, not just the env
 # var). effective_path() below handles all of this.
 _S3_SCHEMES = ("s3", "s3a", "s3n")
+_GCS_SCHEMES = ("gs", "gcs")
 
 _LOCK = threading.RLock()
 
 _CACHE = {}   # (scheme, bucket) -> _VendedCredential | None
+
+# Ambient GCS token minted from GOOGLE_APPLICATION_CREDENTIALS -- unlike _CACHE above, this
+# is a single process-wide credential, not per-bucket: one service-account key file mints one
+# token usable against every bucket that key is authorized for, so there is no bucket key to
+# scope it by. None means "not yet minted"; a _VendedCredential that is_expired() means
+# "mint again". See _mint_ambient_gcs_token().
+_AMBIENT_GCS_CACHE = None
 
 
 def cloud_read_lock():
@@ -91,6 +112,17 @@ def _import_databricks_sdk():
         return None
 
 
+def _import_google_auth():
+    """Lazy import, same pattern as _import_databricks_sdk() -- returns None (not a raise)
+    when the `gcp` extra isn't installed; caller falls back to whatever's already ambient."""
+    try:
+        import google.auth
+        import google.auth.transport.requests
+        return google.auth, google.auth.transport.requests
+    except ImportError:
+        return None
+
+
 class _VendedCredential:
     __slots__ = ("env", "fs_kwargs", "expiration_time_ms")
 
@@ -103,6 +135,51 @@ class _VendedCredential:
         if self.expiration_time_ms is None:
             return False
         return time.time() * 1000 >= self.expiration_time_ms - skew_seconds * 1000
+
+
+def _mint_ambient_gcs_token():
+    """Mint (or reuse a still-valid cached) OAuth access token from
+    GOOGLE_APPLICATION_CREDENTIALS -- the off-Databricks counterpart to vend_credential()'s
+    Unity Catalog path: same _VendedCredential shape and cache-and-refresh-near-expiry
+    behavior, but sourced from a static service-account key file via google-auth instead of a
+    per-call vending API. Read-only scope -- this package never writes to cloud storage.
+
+    Returns None on ANY failure (GOOGLE_APPLICATION_CREDENTIALS unset, `gcp` extra not
+    installed, malformed key file, network) -- every failure mode falls back to whatever's
+    already ambient, never raises. Cached process-wide in _AMBIENT_GCS_CACHE: one
+    service-account key mints one token usable against any bucket that key can reach, so
+    there's no per-bucket cache key the way Databricks' path-scoped vended credentials need.
+    """
+    global _AMBIENT_GCS_CACHE
+    if _AMBIENT_GCS_CACHE is not None and not _AMBIENT_GCS_CACHE.is_expired():
+        return _AMBIENT_GCS_CACHE
+    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return None
+    mods = _import_google_auth()
+    if mods is None:
+        return None
+    google_auth, google_auth_transport_requests = mods
+    try:
+        credentials, _ = google_auth.default(
+            scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
+        credentials.refresh(google_auth_transport_requests.Request())
+        expiration_time_ms = None
+        if credentials.expiry is not None:
+            # credentials.expiry is a naive datetime that google-auth always sets in UTC
+            # (confirmed: every credential type's refresh() populates it via
+            # datetime.utcnow() + expires_in) -- .timestamp() on a naive datetime instead
+            # interprets it in the *local* system timezone, which would silently miscompute
+            # expiry on any host not already running UTC.
+            import datetime
+            expiration_time_ms = credentials.expiry.replace(
+                tzinfo=datetime.timezone.utc).timestamp() * 1000
+        cred = _VendedCredential(
+            {"GCS_OAUTH_TOKEN": credentials.token}, {"access_token": credentials.token},
+            expiration_time_ms)
+        _AMBIENT_GCS_CACHE = cred
+        return cred
+    except Exception:
+        return None
 
 
 def _credential_from_response(resp):
@@ -184,10 +261,17 @@ def prepare_env(path: str) -> None:
     `path`. No-op for local paths and for Azure (download mode -- Azure never reaches
     htslib).
 
-    Two independent things happen here for a "native" cloud path:
+    Independent things happen here for a "native" cloud path:
     - On Databricks, if a vended credential is available, its env vars take priority over
-      ambient ones. Off Databricks, SDK missing, or vending failed: skipped, htslib resolves
-      ambient credentials itself.
+      everything else below (it's scoped to exactly what the caller is authorized for). Off
+      Databricks, SDK missing, or vending failed: skipped.
+    - For a GCS path specifically, if Databricks vending didn't already supply a
+      GCS_OAUTH_TOKEN, GOOGLE_APPLICATION_CREDENTIALS is minted into one when set and the
+      `gcp` extra is installed (see _mint_ambient_gcs_token()) -- this is the fallback for
+      everyone off Databricks, since GOOGLE_APPLICATION_CREDENTIALS itself is not something
+      htslib's GCS backend can use directly. Missing extra, missing env var, or a minting
+      failure: skipped, htslib resolves GCS_OAUTH_TOKEN from the ambient environment itself
+      (i.e. does nothing further -- same as if this bullet didn't exist).
     - If AWS_ENDPOINT_URL is set (a non-AWS S3-compatible endpoint), HTS_S3_HOST and
       HTS_S3_ADDRESS_STYLE are derived from it, since htslib has no other way to learn a
       non-default host. This alone is *not* enough for htslib to actually use that host --
@@ -201,9 +285,15 @@ def prepare_env(path: str) -> None:
     if _io.cloud_read_mode(path) != "native":
         return
     _fix_ca_bundle_path()
+    vended_gcs_token = False
     if is_databricks():
         cred = credentials_for(path)
         if cred is not None and cred.env:
+            os.environ.update(cred.env)
+            vended_gcs_token = "GCS_OAUTH_TOKEN" in cred.env
+    if _io.scheme(path) in _GCS_SCHEMES and not vended_gcs_token:
+        cred = _mint_ambient_gcs_token()
+        if cred is not None:
             os.environ.update(cred.env)
     endpoint = os.environ.get("AWS_ENDPOINT_URL")
     if endpoint and _io.scheme(path) in _S3_SCHEMES:

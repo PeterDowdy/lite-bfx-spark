@@ -23,8 +23,11 @@ Java JAR, filesystem-path I/O only (FUSE mounts for cloud), Arrow output.
   for Azure specifically, but no FUSE mount either. `adl://`/`hdfs://`/`http(s)://`/`ftp://`
   are still rejected, unchanged, with FUSE-mount guidance. Credential handling: ambient
   (env vars / instance metadata / shared config, resolved by htslib/pyarrow.fs themselves)
-  everywhere; on Databricks, `_cloud.py` additionally vends short-lived, path-scoped
-  credentials via Unity Catalog's Temporary Credentials API and prefers them over ambient.
+  everywhere, **except GCS off Databricks**, where the `gcp` extra mints htslib's required
+  `GCS_OAUTH_TOKEN` from an ambient `GOOGLE_APPLICATION_CREDENTIALS` key file (htslib never
+  reads that env var itself — see `_cloud.py`'s module docstring); on Databricks, `_cloud.py`
+  additionally vends short-lived, path-scoped credentials via Unity Catalog's Temporary
+  Credentials API and prefers them over both ambient resolution and the `gcp`-extra mint.
   See `io.py`, `_cloudfs.py`, `_cloud.py`, and `docs/proposals/python-data-source.md`'s
   "Cloud I/O" section for the full design.
 - **Intra-contig parallelism:** coordinate sub-ranges + start-ownership dedup
@@ -121,6 +124,13 @@ JDK 17 + PySpark 4.0, 29 passing).**
   coordinate-sorted CRAM in a writable directory, then reads per-contig; single partition otherwise.
 - **Arrow output** — all readers yield `pyarrow.RecordBatch` (the columnar fast path).
 - `DIRECTORY.md` regenerated to index `python/`.
+- **Ambient GCS credential minting off Databricks** (`gcp` extra) — `_cloud.py`'s
+  `prepare_env()` mints htslib's required `GCS_OAUTH_TOKEN` from an ambient
+  `GOOGLE_APPLICATION_CREDENTIALS` service-account key file, cached and refreshed near
+  expiry, whenever Databricks UC vending didn't already supply one. Closes a real gap: GCS
+  was previously the one cloud where "ambient credentials just work" wasn't true, since
+  htslib never reads `GOOGLE_APPLICATION_CREDENTIALS` itself. See `_mint_ambient_gcs_token()`
+  and `python/tests/test_cloud_gcp_ambient.py`.
 
 ### Still deferred (documented limitations)
 

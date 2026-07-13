@@ -18,11 +18,14 @@ pip install lite-bfx-spark
 ```
 
 `pysam` is the only hard dependency; `pyspark>=4.0` is expected from the Spark runtime
-(cluster/serverless), exactly like the JAR's `provided`-scope Spark dependency. Add the
-`databricks` extra for Unity Catalog credential vending on direct cloud reads (see below):
+(cluster/serverless), exactly like the JAR's `provided`-scope Spark dependency. Two optional
+extras cover direct cloud reads (see below): `databricks` for Unity Catalog credential
+vending, and `gcp` for minting a GCS access token off Databricks from an ambient
+`GOOGLE_APPLICATION_CREDENTIALS` service-account key:
 
 ```bash
 pip install "lite-bfx-spark[databricks]"
+pip install "lite-bfx-spark[gcp]"
 ```
 
 ## Usage
@@ -81,6 +84,16 @@ the `databricks` extra is installed, a short-lived, path-scoped credential is ve
 automatically from Unity Catalog's Temporary Credentials API for any path under a registered
 External Location the caller has `READ FILES` on, and takes priority over ambient
 credentials. No code changes needed either way — this is all handled internally.
+
+**GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
+already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most
+common ambient GCS credential (`GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account
+key, standard Application Default Credentials) isn't directly usable by itself. Off
+Databricks, install the `gcp` extra and this package mints a token from that key file
+automatically (cached and refreshed as it nears expiry); without the extra, `gs://` reads
+fail with a permission error even though the key file is right there. S3 and Azure don't
+have this gap — their ambient credential shapes are exactly what htslib/`pyarrow.fs` already
+expect.
 
 Everything else — `adl://`, `hdfs://`, `http(s)://`, `ftp://` — still needs a mount:
 

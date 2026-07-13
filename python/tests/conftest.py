@@ -123,6 +123,49 @@ def gcs_bucket():
 
 
 @pytest.fixture(scope="session")
+def gcs_bucket_live():
+    """Uploads the same fixtures as gcs_bucket, to a real GCS bucket instead of fake-gcs-
+    server -- the only way to test htslib's actual native gs:// read path at all. Unlike S3,
+    htslib's GCS backend has zero endpoint-override capability (confirmed by binary
+    inspection), so fake-gcs-server can only ever exercise the pyarrow.fs orchestration
+    layer (see gcs_bucket / test_cloud_gcs.py); this is the real thing. Skipped when
+    GOOGLE_APPLICATION_CREDENTIALS is unset -- run via `docker compose run --rm
+    python-test-gcs-live` (or python-test-databricks-gcs-live), not in default CI.
+
+    Two credential consumers, two different things needed from the same service-account
+    key -- unlike S3, where one long-lived AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY pair
+    serves both boto3/pyarrow.fs *and* htslib:
+    - pyarrow.fs.GcsFileSystem's ambient resolution (used for the fixture upload here, and
+      by _cloudfs.py's orchestration layer at read time) wants GOOGLE_APPLICATION_CREDENTIALS
+      pointing at the key file directly -- standard Application Default Credentials.
+    - htslib's native GCS backend wants an already-minted OAuth access token in
+      GCS_OAUTH_TOKEN, not the key file itself. Minted here from the same key, refreshed
+      once per test session (~1h token lifetime) -- litebfx itself has no equivalent ambient
+      minting today (see TASKS.md); this fixture only covers the test-time need.
+    """
+    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        pytest.skip("GOOGLE_APPLICATION_CREDENTIALS not set -- run via docker compose run "
+                     "--rm python-test-gcs-live")
+    google_auth = pytest.importorskip("google.auth")
+    import google.auth.transport.requests
+    import pyarrow.fs
+
+    bucket = os.environ["GCS_BUCKET"]
+    credentials, _ = google_auth.default(
+        scopes=["https://www.googleapis.com/auth/devstorage.read_write"])
+    credentials.refresh(google.auth.transport.requests.Request())
+    os.environ["GCS_OAUTH_TOKEN"] = credentials.token
+
+    fs = pyarrow.fs.GcsFileSystem()   # ambient: reads GOOGLE_APPLICATION_CREDENTIALS itself
+    prefix = "litebfx-test"
+    for name in ("range.bam", "range.bam.bai", "realn01.fa", "realn01.fa.fai"):
+        with open(resource(name), "rb") as src, fs.open_output_stream(
+                f"{bucket}/{prefix}/{name}") as dst:
+            dst.write(src.read())
+    yield f"gs://{bucket}/{prefix}"
+
+
+@pytest.fixture(scope="session")
 def azure_container():
     """Uploads the same fixtures as s3_bucket, to Azurite via pyarrow.fs.AzureFileSystem
     directly (it can write too, so no azure-storage-blob client dependency needed). Uses

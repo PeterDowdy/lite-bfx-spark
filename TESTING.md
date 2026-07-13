@@ -16,6 +16,8 @@
 | `docker compose run --rm spark-test-s3` | S3 range-access tests against MinIO |
 | `docker compose run --rm python-test-databricks` | Python package, full suite, on real Databricks Runtime 17.3-LTS |
 | `docker compose run --rm python-test-databricks-s3` | Python package, S3 (MinIO), on real Databricks Runtime |
+| `docker compose run --rm python-test-s3-live` | Python package, S3, real AWS bucket (needs `.env`) |
+| `docker compose run --rm python-test-gcs-live` | Python package, GCS, real bucket (needs `.env` + `gcs-test-key.json`) |
 
 ---
 
@@ -397,6 +399,70 @@ endpoint override.
 
 ---
 
+## Live Google Cloud Storage (real bucket, not fake-gcs-server)
+
+The Python package's `test_cloud_gcs.py` suite normally runs against fake-gcs-server (see
+"Cloud storage integration tests" above), but that only ever exercises the `pyarrow.fs`
+orchestration layer. **htslib's native GCS backend has zero endpoint-override capability**
+(confirmed by binary inspection — unlike S3's `HTS_S3_HOST`, there is no equivalent for GCS),
+so a real bucket is the *only* way to test `pysam.AlignmentFile("gs://...")` at all —
+`test_cloud_gcs_live.py` is not extra coverage, it's the only coverage of that read path.
+
+**IAM roles for the service account** — scoped to a single bucket via a resource-level
+binding, not project-wide:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://<your-bucket-name> \
+  --member="serviceAccount:<your-service-account-email>" \
+  --role="roles/storage.objectAdmin"
+
+gcloud storage buckets add-iam-policy-binding gs://<your-bucket-name> \
+  --member="serviceAccount:<your-service-account-email>" \
+  --role="roles/storage.legacyBucketReader"
+```
+
+| Role | Why |
+|---|---|
+| `roles/storage.objectAdmin` | get/list/create/delete on objects. Delete is required, not optional: `pyarrow.fs.GcsFileSystem.open_output_stream()` on a path that already exists (every fixture upload after the first) does a delete-then-recreate under the hood, not an in-place overwrite. This is a real asymmetry from S3, where `s3:PutObject` alone covers overwrite — a narrower `objectViewer` + `objectCreator` pair (create-only, no delete) fails on the second run with `does not have storage.objects.delete access`, confirmed empirically. |
+| `roles/storage.legacyBucketReader` | Bucket-level metadata read (`storage.buckets.get`) — needed by `pyarrow.fs.GcsFileSystem.get_file_info()` on a bare bucket path. Not covered by `objectAdmin` (object-level only) — GCS's rough analog of S3's `GetBucketLocation` gap. Easy to miss: the symptom is `storage.buckets.get access... denied`, which reads like a completely separate problem from the object-level roles above. |
+
+**Two independent credential consumers, from the same service-account key file** — this is
+the other real difference from S3, where one static `AWS_ACCESS_KEY_ID`/
+`AWS_SECRET_ACCESS_KEY` pair serves both `boto3`/`pyarrow.fs` *and* htslib:
+
+- `pyarrow.fs.GcsFileSystem`'s ambient resolution (fixture upload, and `_cloudfs.py`'s
+  orchestration layer at read time) wants `GOOGLE_APPLICATION_CREDENTIALS` pointing at the
+  key file itself — standard Application Default Credentials.
+- htslib's native GCS backend wants an already-minted OAuth **access token** (not the key
+  file) in `GCS_OAUTH_TOKEN` — short-lived, ~1 hour. `litebfx._cloud.prepare_env()`
+  deliberately does not mint this off Databricks (see that module's docstring) — it only
+  ever consumes an already-ambient token, matching real usage where a user exports one
+  themselves before running Spark.
+
+**A timing gotcha worth knowing if you touch these tests**: the token must be exported
+*before* `pytest` starts, not set from inside a pytest fixture. `pyspark`'s JVM gateway
+snapshots `os.environ` once, at `Popen` time, the moment the `spark` fixture first calls
+`SparkSession.builder.getOrCreate()` — a fixture that sets `os.environ["GCS_OAUTH_TOKEN"]`
+afterward (even one requested earlier in a test's parameter list) is too late for an
+already-launched JVM and the Python worker subprocesses it forks; htslib then fails with a
+generic `Permission denied` that looks exactly like an IAM problem but isn't. `docker-compose.yml`'s `python-test-gcs-live`/`python-test-databricks-gcs-live` services mint the
+token via `python/scripts/mint_gcs_token.py` and `export` it in the shell *before* invoking
+`pytest`, sidestepping this — see that script's docstring.
+
+**Running it:** place the service-account key JSON at `gcs-test-key.json` in the repo root
+(gitignored — never commit it), and add `GCS_BUCKET` to your `.env` (copy from
+`.env.example` if you haven't already):
+
+```bash
+docker compose run --rm python-test-gcs-live
+```
+
+This runs `test_cloud_gcs_live.py` against the real bucket — full scan, region query, and a
+FASTA contig read, each cross-checked against a local `pysam` read of the same fixture for
+correctness (no byte-transfer-reduction assertion, same posture as `test_cloud_s3.py`).
+
+---
+
 ## Python package on real Databricks Runtime (regression suite)
 
 `docker/Dockerfile.python` (used by `python-test`/`python-test-s3`/etc.) is a generic
@@ -419,14 +485,18 @@ Databricks image, catching a regression in that self-healing rather than one Doc
 workaround masking another.
 
 ```bash
-docker compose run --rm python-test-databricks           # full suite, local paths
-docker compose run --rm python-test-databricks-s3         # S3 over MinIO (HTTP only --
-                                                            # doesn't exercise the CA-bundle
-                                                            # fix, since that's TLS-specific)
-docker compose run --rm python-test-databricks-s3-live     # S3 over real HTTPS -- the one
-                                                            # that actually proves the
-                                                            # CA-bundle fix; needs .env (see
-                                                            # "Live AWS S3" above)
+docker compose run --rm python-test-databricks             # full suite, local paths
+docker compose run --rm python-test-databricks-s3          # S3 over MinIO (HTTP only --
+                                                             # doesn't exercise the CA-bundle
+                                                             # fix, since that's TLS-specific)
+docker compose run --rm python-test-databricks-s3-live      # S3 over real HTTPS -- the one
+                                                             # that actually proves the
+                                                             # CA-bundle fix; needs .env (see
+                                                             # "Live AWS S3" above)
+docker compose run --rm python-test-databricks-gcs-live     # GCS over real HTTPS, same
+                                                             # rationale as -s3-live; needs
+                                                             # .env + gcs-test-key.json (see
+                                                             # "Live Google Cloud Storage" above)
 ```
 
 Not wired into GitHub Actions CI, consistent with the Java side's `databricks`/`databricks-uc`
