@@ -131,6 +131,25 @@ JDK 17 + PySpark 4.0, 29 passing).**
   was previously the one cloud where "ambient credentials just work" wasn't true, since
   htslib never reads `GOOGLE_APPLICATION_CREDENTIALS` itself. See `_mint_ambient_gcs_token()`
   and `python/tests/test_cloud_gcp_ambient.py`.
+- **Fixed: stale `_cloudfs.py` filesystem cache poisoning UC-vended reads** — reported as a
+  clean, consistent `AWS ACCESS_DENIED`/403 on a Databricks Serverless S3 path the reporting
+  user could otherwise access. Root cause: `filesystem_for()` cached the constructed
+  `pyarrow.fs.S3FileSystem` by `(scheme, bucket)` *before* ever consulting
+  `_cloud.credentials_for()`, so a single transient vending failure on the first cloud touch
+  in a worker process (network blip, `WorkspaceClient()` not yet warmed up, etc.) permanently
+  pinned that bucket to the unauthorized ambient-fallback filesystem for the rest of the
+  process's life — even though `_cloud.credentials_for()` itself already retries vending on
+  every call while its own cache holds `None`. The symptom looked exactly like a permissions
+  problem rather than the one-time-hiccup-then-cache-poisoning it actually was. Fixed by
+  folding credential identity into the cache key (`filesystem_for()`'s docstring has the full
+  writeup) so a refreshed or retried credential naturally invalidates the stale entry, with
+  `_cache_fs()` evicting the old entry so the cache doesn't grow unbounded across a
+  long-running process's credential refreshes. `vend_credential()`'s failures (exception,
+  missing `databricks` extra, unrecognized response shape) are now also logged instead of
+  silently swallowed — the fallback-to-ambient behavior itself is still deliberate and
+  correct, but a fallback that then *also* fails previously gave zero indication vending was
+  even attempted. See `python/tests/test_cloudfs_cache.py` and the new logging tests in
+  `test_cloud_databricks.py`.
 
 ### Still deferred (documented limitations)
 
@@ -179,7 +198,17 @@ pytest -q -m "not spark"        # pure-Python units only (no JVM)
 - Databricks UC credential vending (`_cloud.py`): whether `WorkspaceClient()`'s default auth
   resolves inside the isolated Python Data Source worker subprocess (vs. only the driver) is
   unverified without a real workspace — see `tests/smoke_uc_credential_vending.py`, run
-  manually pre-release, not in default CI.
+  manually pre-release, not in default CI. A real Serverless 403 report traced to a *different*
+  bug (stale `_cloudfs.py` filesystem cache, now fixed — see "Implemented since first cut"),
+  not this one, so this question is still open, not resolved by that fix.
+- Whether `_cloud.is_databricks()`'s single-signal check (`DATABRICKS_RUNTIME_VERSION` env
+  var) reliably detects Databricks **Serverless** compute specifically (vs. classic clusters,
+  where it's long-established to work) is unconfirmed — flagged during the Serverless 403
+  investigation above but not yet verified either way. If it turns out to under-detect
+  Serverless, `vend_credential()` would now at least log *why* (`is_databricks()` returning
+  False makes it return early with no log line at all, by design, since that's also the
+  correct behavior for the common "genuinely not on Databricks" case) — so confirm via the
+  now-logged INFO/WARNING output first before assuming this is the cause.
 - `_cloud.py`'s cloud-read lock serializes all cloud-backed reads within one worker process
   (a deliberate correctness-over-parallelism tradeoff — see its module docstring) because
   it's unverified whether htslib re-reads env vars only at open time or per range-request.

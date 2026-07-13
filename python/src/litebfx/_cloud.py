@@ -39,12 +39,15 @@ Local-path reads never touch this lock.
 """
 
 import contextlib
+import logging
 import os
 import threading
 import time
 import urllib.parse
 
 from . import io as _io
+
+_logger = logging.getLogger(__name__)
 
 # htslib's S3 backend recognizes only s3://, s3+http://, and s3+https:// -- s3a:// and
 # s3n:// give "Protocol not supported" (confirmed empirically), so they're normalized to
@@ -220,7 +223,7 @@ def _credential_from_response(resp):
         # resolution, which will fail closed (permission error) if that doesn't separately
         # have access. Document as a known Phase 3 Azure gap, not silently swallowed.
         return _VendedCredential({}, {}, resp.expiration_time)
-    return None
+    return None    # unrecognized shape -- vend_credential() logs this, not this pure mapper
 
 
 def vend_credential(path: str):
@@ -228,11 +231,24 @@ def vend_credential(path: str):
     or None on ANY failure (not on Databricks, SDK missing, network, permissions, path not
     UC-governed) -- every failure mode is treated identically: fall back to ambient
     credentials, never raise. A hard failure here would break every cloud read on a
-    Databricks cluster that simply isn't UC-governed for this particular path."""
+    Databricks cluster that simply isn't UC-governed for this particular path.
+
+    Every non-trivial failure is logged at WARNING (not just silently returned as None) --
+    the fallback-to-ambient behavior is deliberate and correct (see above), but a silent
+    fallback that then also fails (ambient resolution picking up an unauthorized identity,
+    e.g. serverless compute's own base infrastructure role rather than the caller's
+    UC-governed storage credential) previously surfaced only as an opaque AWS/GCS permission
+    error several layers away, with zero indication that vending was even attempted, let
+    alone why it didn't produce a usable credential."""
     if not is_databricks():
         return None
     sdk = _import_databricks_sdk()
     if sdk is None:
+        _logger.info(
+            "litebfx: running on Databricks but the `databricks` extra isn't installed, so "
+            "Unity Catalog credential vending is skipped for %r -- falling back to ambient "
+            "credential resolution. Install with pip install \"lite-bfx-spark[databricks]\" "
+            "if this path needs a UC-vended credential rather than an ambient one.", path)
         return None
     try:
         from databricks.sdk import WorkspaceClient
@@ -240,8 +256,18 @@ def vend_credential(path: str):
         w = WorkspaceClient()
         resp = w.temporary_path_credentials.generate_temporary_path_credentials(
             path, PathOperation.PATH_READ)
-        return _credential_from_response(resp)
+        cred = _credential_from_response(resp)
+        if cred is None:
+            _logger.warning("litebfx: Unity Catalog vending returned no usable credential for "
+                             "%r -- falling back to ambient credential resolution.", path)
+        return cred
     except Exception:
+        _logger.warning(
+            "litebfx: Unity Catalog credential vending failed for %r -- falling back to "
+            "ambient credential resolution, which may not be authorized for this path. Common "
+            "causes: the path isn't under a registered External Location, the caller isn't "
+            "granted READ FILES on it, or WorkspaceClient() auth didn't resolve in this "
+            "process (see tests/smoke_uc_credential_vending.py).", path, exc_info=True)
         return None
 
 
