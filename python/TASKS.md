@@ -149,7 +149,24 @@ JDK 17 + PySpark 4.0, 29 passing).**
   silently swallowed — the fallback-to-ambient behavior itself is still deliberate and
   correct, but a fallback that then *also* fails previously gave zero indication vending was
   even attempted. See `python/tests/test_cloudfs_cache.py` and the new logging tests in
-  `test_cloud_databricks.py`.
+  `test_cloud_databricks.py`. **Not yet confirmed against the reporting user's live
+  workspace** — their first retest used an install command that omitted the `databricks`
+  extra (see the dependency-conflict entry below), so vending was never actually exercised;
+  genuinely unknown yet whether this fix alone resolves the original report.
+- **Fixed: `pyarrow` as a hard dependency broke installs on Databricks dedicated compute** —
+  surfaced while trying to get a clean install of the fix above onto a real workspace for
+  verification. `pyproject.toml` declared `pyarrow>=4` unconditionally, but every Databricks
+  Runtime image (classic or serverless) already bundles its own runtime-pinned `pyarrow`
+  tightly coupled to internal Spark/Arrow machinery — `pip install` on dedicated compute
+  (version-pinned images, unlike a from-scratch environment) tries to reconcile against that
+  pin and conflicts. `pyspark` already got this right (an extra, not a hard dependency,
+  specifically because it's runtime-provided); `pyarrow` now follows the same rule, moved
+  into the `spark`/`test` extras only. This also fixes a pre-existing docs/code mismatch —
+  `python/README.md` already (incorrectly) claimed "pysam is the only hard dependency" while
+  `pyarrow` was also unconditionally required. See `python/README.md`'s new "Installing on
+  Databricks dedicated compute" section for the `--no-deps` recipe as a further fallback
+  (e.g. for a runtime-pinned `databricks-sdk` conflict, which loosening `pyarrow` alone
+  doesn't address).
 
 ### Still deferred (documented limitations)
 

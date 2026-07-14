@@ -28,6 +28,26 @@ pip install "lite-bfx-spark[databricks]"
 pip install "lite-bfx-spark[gcp]"
 ```
 
+### Installing on Databricks dedicated compute
+
+`pyarrow`/`pyspark`/`databricks-sdk` are deliberately kept out of the hard dependency list and
+the `databricks`/`gcp` extras stay narrowly scoped (see `pyproject.toml`'s comments) precisely
+so a normal `pip install "lite-bfx-spark[databricks]"` shouldn't need to touch anything a
+Databricks Runtime image already bundles. If it still does — a runtime-pinned `pyarrow` or
+`databricks-sdk` version conflicting with what pip wants to install is the most common
+cause on **dedicated compute** specifically (version-pinned images, unlike a from-scratch
+environment) — install with `--no-deps` to skip dependency resolution for the litebfx package
+entirely, then handle the one dependency Databricks never bundles (`pysam`) on its own:
+
+```bash
+pip install --no-deps "lite-bfx-spark[databricks] @ git+https://github.com/PeterDowdy/lite-bfx-spark.git@main#subdirectory=python"
+pip install pysam>=0.22
+```
+
+Only add `pip install "databricks-sdk>=0.120"` afterward if `import databricks.sdk` fails —
+most Databricks Runtime images already have a compatible version, and installing over it is
+exactly the kind of pin conflict `--no-deps` was meant to avoid.
+
 ## Usage
 
 ```python
