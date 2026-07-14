@@ -18,21 +18,28 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-# pysam parses the files; pyarrow is required by Spark's Python Data Source machinery to
-# transfer rows from the Python worker (needed even when read() yields tuples). pyspark is
-# *provided* by the Spark runtime (cluster/serverless) — like the JAR's `provided`-scope
-# Spark dependency — so it is an extra, not a pin, to avoid clashing with the cluster's version.
-dependencies = ["pysam>=0.22", "pyarrow>=4"]
+# pysam parses the files -- always needed, never provided by a Spark/Databricks runtime.
+# pyarrow is required by Spark's Python Data Source machinery to transfer rows from the
+# Python worker (needed even when read() yields tuples), but -- like pyspark itself -- it is
+# *provided* by every environment this package actually runs in (any Spark cluster, and
+# Databricks classic or serverless both bundle a runtime-pinned pyarrow tightly coupled to
+# their own internals). Declaring it as a hard dependency risks pip upgrading/downgrading
+# that pinned version out from under the environment -- a real, observed install failure on
+# Databricks dedicated compute, not a hypothetical one -- so it lives in the `spark`/`test`
+# extras only, exactly like pyspark. See python/README.md's "Installing on Databricks"
+# section for the --no-deps recipe when even that still conflicts (e.g. a runtime-pinned
+# databricks-sdk).
+dependencies = ["pysam>=0.22"]
 
 [project.optional-dependencies]
-spark = ["pyspark>=4.0"]
+spark = ["pyspark>=4.0", "pyarrow>=4"]
 databricks = ["databricks-sdk>=0.120"]
 # Mints htslib's required GCS_OAUTH_TOKEN from an ambient GOOGLE_APPLICATION_CREDENTIALS
 # service-account key file, off Databricks -- see _cloud.py's module docstring. Not needed
 # for S3 (ambient AWS credentials work unmodified) or for Databricks GCS reads (Unity
 # Catalog vending covers that without this extra).
 gcp = ["google-auth>=2.20", "requests>=2.28"]
-test = ["pytest>=7.0", "pyspark>=4.0", "boto3>=1.28", "google-auth>=2.20", "requests>=2.28"]
+test = ["pytest>=7.0", "pyspark>=4.0", "pyarrow>=4", "boto3>=1.28", "google-auth>=2.20", "requests>=2.28"]
 
 [project.urls]
 Homepage = "https://github.com/PeterDowdy/lite-bfx-spark"
