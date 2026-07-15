@@ -2,7 +2,11 @@
 
 Mocked responses only -- constructed from the real databricks-sdk dataclasses so a future SDK
 response-shape change breaks this test rather than silently mismatching _cloud.py's parsing.
-No network call, no real workspace needed; gated on the `databricks` extra being installed.
+No network call, no real workspace needed; gated on databricks-sdk being importable. Not a
+litebfx extra -- see pyproject.toml's comment on why -- so it's pulled in via the `test`
+extra instead (`.github/workflows/python-ci.yml` installs `.[test]`, so this file runs for
+real there). docker-compose.yml's plain `python-test`/`python-test-databricks` services use
+`pip install -e . --no-deps`, which skips it -- this file only skips (not fails) without it.
 Real-workspace validation (does WorkspaceClient() auth actually resolve inside an isolated
 Python Data Source worker subprocess?) is a separate, unverifiable-in-CI concern -- see
 tests/smoke_uc_credential_vending.py.
@@ -120,14 +124,16 @@ def test_prepare_env_off_databricks_is_noop(monkeypatch):
 
 
 def test_vend_credential_logs_when_sdk_missing(monkeypatch, caplog):
-    """Previously silent -- a Databricks user who forgot to install the `databricks` extra
-    got no indication vending was skipped at all, just an eventual, unrelated-looking
-    permission error from ambient resolution."""
+    """Previously silent -- a Databricks user whose environment genuinely lacks
+    databricks-sdk (unusual -- it's normally preinstalled) got no indication vending was
+    skipped at all, just an eventual, unrelated-looking permission error from ambient
+    resolution."""
     monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
     monkeypatch.setattr(_cloud, "_import_databricks_sdk", lambda: None)
     with caplog.at_level("INFO", logger="litebfx._cloud"):
         assert _cloud.vend_credential("s3://bucket/key") is None
-    assert any("databricks" in r.message and "extra" in r.message for r in caplog.records)
+    assert any("databricks-sdk" in r.message and "preinstalled" in r.message
+               for r in caplog.records)
 
 
 def test_vend_credential_logs_on_exception(monkeypatch, caplog):

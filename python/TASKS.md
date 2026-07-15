@@ -145,14 +145,13 @@ JDK 17 + PySpark 4.0, 29 passing).**
   writeup) so a refreshed or retried credential naturally invalidates the stale entry, with
   `_cache_fs()` evicting the old entry so the cache doesn't grow unbounded across a
   long-running process's credential refreshes. `vend_credential()`'s failures (exception,
-  missing `databricks` extra, unrecognized response shape) are now also logged instead of
+  databricks-sdk not importable, unrecognized response shape) are now also logged instead of
   silently swallowed — the fallback-to-ambient behavior itself is still deliberate and
   correct, but a fallback that then *also* fails previously gave zero indication vending was
   even attempted. See `python/tests/test_cloudfs_cache.py` and the new logging tests in
   `test_cloud_databricks.py`. **Not yet confirmed against the reporting user's live
-  workspace** — their first retest used an install command that omitted the `databricks`
-  extra (see the dependency-conflict entry below), so vending was never actually exercised;
-  genuinely unknown yet whether this fix alone resolves the original report.
+  workspace** — two separate install-time blockers (see the next two entries) prevented a
+  clean retest; genuinely unknown yet whether this fix alone resolves the original report.
 - **Fixed: `pyarrow` as a hard dependency broke installs on Databricks dedicated compute** —
   surfaced while trying to get a clean install of the fix above onto a real workspace for
   verification. `pyproject.toml` declared `pyarrow>=4` unconditionally, but every Databricks
@@ -167,6 +166,20 @@ JDK 17 + PySpark 4.0, 29 passing).**
   Databricks dedicated compute" section for the `--no-deps` recipe as a further fallback
   (e.g. for a runtime-pinned `databricks-sdk` conflict, which loosening `pyarrow` alone
   doesn't address).
+- **Fixed: exactly that predicted `databricks-sdk` conflict, for real** — the very next
+  retest hit a setuptools incompatibility installing `lite-bfx-spark[databricks]` on
+  dedicated compute. `databricks-sdk` doesn't declare `setuptools` as a runtime dependency
+  itself (confirmed against PyPI metadata), but it's preinstalled on every Databricks
+  Runtime/Serverless image regardless (Databricks' own tooling depends on it) — so the
+  `databricks` extra never needed to declare it at all, for the same reason `pyarrow`
+  shouldn't have: doing so just forces pip to reconcile against whatever version and
+  transitive chain is already pinned there. Removed the `databricks` extra entirely (moved
+  `databricks-sdk` into `test` only, since this repo's own Docker test images don't have it
+  preinstalled the way real Databricks compute does); `_cloud.py`'s
+  `_import_databricks_sdk()` already degraded gracefully when it's absent, so nothing in the
+  runtime behavior changes off the extras mechanism itself — only the install-time story
+  does. Off Databricks, install it directly (`pip install databricks-sdk`) if exercising the
+  vending code path without a real workspace.
 
 ### Still deferred (documented limitations)
 

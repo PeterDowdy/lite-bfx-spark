@@ -27,19 +27,28 @@ classifiers = [
 # that pinned version out from under the environment -- a real, observed install failure on
 # Databricks dedicated compute, not a hypothetical one -- so it lives in the `spark`/`test`
 # extras only, exactly like pyspark. See python/README.md's "Installing on Databricks"
-# section for the --no-deps recipe when even that still conflicts (e.g. a runtime-pinned
-# databricks-sdk).
+# section for the --no-deps recipe when even that still conflicts.
 dependencies = ["pysam>=0.22"]
 
 [project.optional-dependencies]
 spark = ["pyspark>=4.0", "pyarrow>=4"]
-databricks = ["databricks-sdk>=0.120"]
+# No `databricks` extra: databricks-sdk is preinstalled on every Databricks Runtime/Serverless
+# image (Databricks' own tooling depends on it), and declaring it here -- even with a loose
+# version floor -- forces pip to reconcile against whatever's already pinned there, which was
+# the direct cause of a real install failure on dedicated compute (a setuptools conflict
+# surfacing from *its* transitive dependency chain, not from anything litebfx itself
+# declares). _cloud.py's _import_databricks_sdk() already imports it lazily and degrades to
+# ambient credentials if it's ever genuinely absent -- see that module's docstring. Off
+# Databricks (e.g. this repo's own test suite, or local dev exercising the vending code path
+# without a real workspace), install it directly: pip install databricks-sdk>=0.120 -- or see
+# the `test` extra below.
 # Mints htslib's required GCS_OAUTH_TOKEN from an ambient GOOGLE_APPLICATION_CREDENTIALS
 # service-account key file, off Databricks -- see _cloud.py's module docstring. Not needed
 # for S3 (ambient AWS credentials work unmodified) or for Databricks GCS reads (Unity
 # Catalog vending covers that without this extra).
 gcp = ["google-auth>=2.20", "requests>=2.28"]
-test = ["pytest>=7.0", "pyspark>=4.0", "pyarrow>=4", "boto3>=1.28", "google-auth>=2.20", "requests>=2.28"]
+test = ["pytest>=7.0", "pyspark>=4.0", "pyarrow>=4", "boto3>=1.28", "google-auth>=2.20",
+        "requests>=2.28", "databricks-sdk>=0.120"]
 
 [project.urls]
 Homepage = "https://github.com/PeterDowdy/lite-bfx-spark"

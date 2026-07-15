@@ -410,11 +410,14 @@ services:
     command: python3 tests/smoke_serverless.py
 
   # ---------------------------------------------------------------------------
-  # databricks-connect-uc: same image as databricks-connect, plus litebfx[databricks]
+  # databricks-connect-uc: same image as databricks-connect, plus litebfx and databricks-sdk
   # installed from the local checkout (needed for the actual credential-vending call, not
   # just the Spark Connect client) -- for tests/smoke_uc_credential_vending.py, which needs a
   # real UC-governed external location and cannot run in default CI. See that script's own
   # docstring for the required env vars (UC_TEST_BAM_URL in addition to the ones below).
+  # databricks-sdk is installed standalone, not via a litebfx extra -- there isn't one (see
+  # pyproject.toml's comment): it's preinstalled on real Databricks compute, but this service
+  # runs databricks-connect on a local/CI machine, which genuinely doesn't have it ambiently.
   # ---------------------------------------------------------------------------
   databricks-connect-uc:
     build:
@@ -429,7 +432,7 @@ services:
       DATABRICKS_CLIENT_ID: ${DATABRICKS_CLIENT_ID:-}
       DATABRICKS_CLIENT_SECRET: ${DATABRICKS_CLIENT_SECRET:-}
       UC_TEST_BAM_URL: ${UC_TEST_BAM_URL:-}
-    command: bash -c "pip install --no-cache-dir -e 'python[databricks]' -q && python3 tests/smoke_uc_credential_vending.py"
+    command: bash -c "pip install --no-cache-dir -e python -q && pip install --no-cache-dir 'databricks-sdk>=0.120' -q && python3 tests/smoke_uc_credential_vending.py"
 
   # ---------------------------------------------------------------------------
   # spark-test-s3: run S3 range-access integration tests against MinIO.
