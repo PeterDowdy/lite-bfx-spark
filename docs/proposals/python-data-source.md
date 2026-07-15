@@ -317,16 +317,30 @@ worker process, regardless of query selectivity — in exchange for direct `abfs
 with no mount. Query efficiency *after* the download is unaffected (pysam's own indexed
 seeking works normally against the local copy).
 
-**On Databricks, credential vending is automatic when the `databricks` extra is installed.**
-`_cloud.py` vends a short-lived, path-scoped credential from Unity Catalog's Temporary
-Credentials API (`generate_temporary_path_credentials`) for any cloud path, lazily on first
-open in a worker process, and it takes priority over ambient credentials. This is the
-Databricks-native equivalent of what UC Volumes' FUSE mount does internally, applied directly
-to `s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE indirection. One thing this
-*doesn't* resolve without a real workspace: whether `WorkspaceClient()`'s default auth
-actually resolves inside the isolated Python Data Source worker subprocess (vs. only the
-driver, which is well-established to work) — see `tests/smoke_uc_credential_vending.py` and
-`TASKS.md`'s open questions.
+**On Databricks, credential vending is automatic — no extra install step.** `_cloud.py` vends
+a short-lived, path-scoped credential from Unity Catalog's Temporary Credentials API
+(`generate_temporary_path_credentials`) for any cloud path, lazily on first open in a worker
+process, and it takes priority over ambient credentials. This relies on `databricks-sdk`,
+which is *not* a litebfx extra (there was one briefly; it was removed after a real install
+failure on dedicated compute — see `pyproject.toml`'s comment and `python/TASKS.md`) —
+`databricks-sdk` is preinstalled on every Databricks Runtime/Serverless image, and declaring
+it as a dependency just forces pip to reconcile against whatever version is already pinned
+there. This is the Databricks-native equivalent of what UC Volumes' FUSE mount does
+internally, applied directly to `s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE
+indirection. One thing this *doesn't* resolve without a real workspace: whether
+`WorkspaceClient()`'s default auth actually resolves inside the isolated Python Data Source
+worker subprocess (vs. only the driver, which is well-established to work) — see
+`tests/smoke_uc_credential_vending.py` and `TASKS.md`'s open questions.
+
+**Off Databricks, `pip install lite-bfx-spark` alone covers S3 and Azure; GCS needs the `gcp`
+extra.** `pysam` is the only hard dependency — `pyspark`/`pyarrow` are expected to already be
+present (the Spark runtime), matching the JAR's `provided`-scope dependency. GCS is a partial
+exception to "ambient credentials just work": htslib's native GCS backend needs an
+already-minted OAuth access token in `GCS_OAUTH_TOKEN`, not the `GOOGLE_APPLICATION_CREDENTIALS`
+key-file path most GCS users actually have ambiently. `pip install "lite-bfx-spark[gcp]"`
+mints one automatically from that key file (cached, refreshed near expiry) — see `_cloud.py`'s
+`_mint_ambient_gcs_token()`. S3 and Azure don't have this gap; their ambient credential shapes
+are exactly what htslib/`pyarrow.fs` already expect.
 
 **FUSE mounts still matter for everything else.** `adl://`, `hdfs://`, `http(s)://`, `ftp://`
 have no native-or-download story and are still rejected with guidance to mount instead — the
