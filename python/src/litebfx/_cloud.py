@@ -19,9 +19,12 @@ Unity Catalog's Temporary Credentials API and writes it into os.environ, taking 
 both plain ambient resolution and the GOOGLE_APPLICATION_CREDENTIALS mint above (it's scoped
 to exactly what the caller is authorized for). Vending is lazy -- the first cloud open in a
 worker process -- and cached per (scheme, bucket), re-vending near expiry. Off Databricks, or
-if the `databricks` extra isn't installed, or if vending fails for any reason, this step is
-skipped and prepare_env() falls through to the GOOGLE_APPLICATION_CREDENTIALS mint (GCS) or
-plain ambient resolution (S3/Azure).
+if databricks-sdk isn't importable, or if vending fails for any reason, this step is skipped
+and prepare_env() falls through to the GOOGLE_APPLICATION_CREDENTIALS mint (GCS) or plain
+ambient resolution (S3/Azure). databricks-sdk is deliberately not a litebfx extra -- it's
+preinstalled on every Databricks Runtime/Serverless image, and declaring it here forces pip
+to reconcile against whatever's already pinned there instead of just using it; see
+pyproject.toml's comment on this for the real install failure that caused the change.
 
 Not threaded through InputPartition: InputPartition objects get logged in Spark's plan
 explain output and worker tracebacks (a credential-bearing field is a real exposure risk),
@@ -107,7 +110,9 @@ def is_databricks() -> bool:
 
 def _import_databricks_sdk():
     """Lazy import, same pattern as _base.import_pysam() -- returns None (not a raise) when
-    the `databricks` extra isn't installed; caller falls back to ambient credentials."""
+    databricks-sdk isn't importable; caller falls back to ambient credentials. Deliberately
+    not a litebfx extra -- see pyproject.toml's comment on this -- so "not installed" here
+    almost always means "genuinely off Databricks", not "forgot to pip install an extra"."""
     try:
         import databricks.sdk
         return databricks.sdk
@@ -245,10 +250,12 @@ def vend_credential(path: str):
     sdk = _import_databricks_sdk()
     if sdk is None:
         _logger.info(
-            "litebfx: running on Databricks but the `databricks` extra isn't installed, so "
-            "Unity Catalog credential vending is skipped for %r -- falling back to ambient "
-            "credential resolution. Install with pip install \"lite-bfx-spark[databricks]\" "
-            "if this path needs a UC-vended credential rather than an ambient one.", path)
+            "litebfx: running on Databricks but databricks-sdk isn't importable, so Unity "
+            "Catalog credential vending is skipped for %r -- falling back to ambient "
+            "credential resolution. It's normally preinstalled on Databricks Runtime/"
+            "Serverless; if this environment genuinely lacks it and this path needs a "
+            "UC-vended credential rather than an ambient one, pip install databricks-sdk.",
+            path)
         return None
     try:
         from databricks.sdk import WorkspaceClient

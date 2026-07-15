@@ -15,10 +15,13 @@ Prerequisites:
     Unity Catalog External Location the identity above is granted READ FILES on. A co-located
     or indexPath-resolvable .bai is optional but recommended (exercises the region-query path
     too, not just a full scan).
-  - The `databricks` extra installed: pip install -e '.[databricks]' (or `lite-bfx-spark
-    [databricks]`), so litebfx._cloud can actually call the Temporary Credentials API.
+  - databricks-sdk installed (pip install databricks-sdk), so litebfx._cloud can actually
+    call the Temporary Credentials API. Not a litebfx extra -- see pyproject.toml's comment
+    on why -- but this script runs via databricks-connect on a local/CI machine, not real
+    Databricks compute, so unlike there, it genuinely isn't preinstalled here and must be
+    added explicitly.
 
-Run via the databricks-connect-uc service (installs litebfx[databricks] from the local
+Run via the databricks-connect-uc service (installs litebfx + databricks-sdk from the local
 checkout on top of the databricks-connect image -- needed for the actual credential-vending
 call, not just the Spark Connect client):
   docker compose run --rm \\

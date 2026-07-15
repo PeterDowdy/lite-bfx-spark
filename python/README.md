@@ -17,36 +17,29 @@ the JAR field-for-field.
 pip install lite-bfx-spark
 ```
 
-`pysam` is the only hard dependency; `pyspark>=4.0` is expected from the Spark runtime
-(cluster/serverless), exactly like the JAR's `provided`-scope Spark dependency. Two optional
-extras cover direct cloud reads (see below): `databricks` for Unity Catalog credential
-vending, and `gcp` for minting a GCS access token off Databricks from an ambient
+`pysam` is the only hard dependency. `pyspark`, `pyarrow`, and (on Databricks) `databricks-sdk`
+are all deliberately left out of the dependency graph entirely — they're already present in
+every environment this package actually runs in (any Spark cluster; Databricks Runtime/
+Serverless specifically bundles a runtime-pinned `pyarrow` and `databricks-sdk`, both tightly
+coupled to internal machinery), and declaring them risks pip reconciling against those pins
+and conflicting — a real, observed install failure on Databricks dedicated compute, not a
+hypothetical one (see `pyproject.toml`'s comments for the details). One optional extra
+remains: `gcp`, for minting a GCS access token off Databricks from an ambient
 `GOOGLE_APPLICATION_CREDENTIALS` service-account key:
 
 ```bash
-pip install "lite-bfx-spark[databricks]"
 pip install "lite-bfx-spark[gcp]"
 ```
 
-### Installing on Databricks dedicated compute
-
-`pyarrow`/`pyspark`/`databricks-sdk` are deliberately kept out of the hard dependency list and
-the `databricks`/`gcp` extras stay narrowly scoped (see `pyproject.toml`'s comments) precisely
-so a normal `pip install "lite-bfx-spark[databricks]"` shouldn't need to touch anything a
-Databricks Runtime image already bundles. If it still does — a runtime-pinned `pyarrow` or
-`databricks-sdk` version conflicting with what pip wants to install is the most common
-cause on **dedicated compute** specifically (version-pinned images, unlike a from-scratch
-environment) — install with `--no-deps` to skip dependency resolution for the litebfx package
-entirely, then handle the one dependency Databricks never bundles (`pysam`) on its own:
+If installing on Databricks dedicated compute still hits a dependency conflict — some other
+package that environment has differently pinned — install with `--no-deps` to skip dependency
+resolution entirely, then just ensure `pysam` (the one dependency Databricks never bundles) is
+present:
 
 ```bash
-pip install --no-deps "lite-bfx-spark[databricks] @ git+https://github.com/PeterDowdy/lite-bfx-spark.git@main#subdirectory=python"
+pip install --no-deps "lite-bfx-spark @ git+https://github.com/PeterDowdy/lite-bfx-spark.git@main#subdirectory=python"
 pip install pysam>=0.22
 ```
-
-Only add `pip install "databricks-sdk>=0.120"` afterward if `import databricks.sdk` fails —
-most Databricks Runtime images already have a compatible version, and installing over it is
-exactly the kind of pin conflict `--no-deps` was meant to avoid.
 
 ## Usage
 
@@ -99,11 +92,11 @@ efficiency S3/GCS get (the whole file transfers once per worker process, then re
 are as fast as local disk, including index-guided seeks within the downloaded copy).
 
 **Credentials** are ambient by default (env vars, instance profile / workload identity,
-shared config — the same resolution any AWS/GCS/Azure SDK tool uses). **On Databricks**, if
-the `databricks` extra is installed, a short-lived, path-scoped credential is vended
-automatically from Unity Catalog's Temporary Credentials API for any path under a registered
-External Location the caller has `READ FILES` on, and takes priority over ambient
-credentials. No code changes needed either way — this is all handled internally.
+shared config — the same resolution any AWS/GCS/Azure SDK tool uses). **On Databricks**, a
+short-lived, path-scoped credential is vended automatically (via the preinstalled
+`databricks-sdk`) from Unity Catalog's Temporary Credentials API for any path under a
+registered External Location the caller has `READ FILES` on, and takes priority over ambient
+credentials. No code changes or extra installs needed — this is all handled internally.
 
 **GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
 already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most
