@@ -6,40 +6,27 @@ nothing from this module -- htslib and pyarrow.fs both resolve them on their own
 real exception: htslib's native GCS backend wants an already-minted OAuth *access token* in
 GCS_OAUTH_TOKEN, not GOOGLE_APPLICATION_CREDENTIALS (a key *file path*) -- the credential
 shape most GCS users actually have ambiently, and the one pyarrow.fs.GcsFileSystem itself
-resolves happily on its own. Left alone, that's a silent read failure for anyone off
-Databricks with only a service-account key file. prepare_env() closes this: when
-GOOGLE_APPLICATION_CREDENTIALS is set and the `gcp` extra (google-auth) is installed, it
-mints an access token from the key file directly (see _mint_ambient_gcs_token()) -- cached
-process-wide and refreshed near expiry, independent of Databricks. Missing extra, missing env
-var, or any minting failure is a silent no-op, same as the rest of this module's failure
-posture: htslib/pyarrow.fs just fall back to whatever's already ambient.
+resolves happily on its own. Left alone, that's a silent read failure for anyone with only a
+service-account key file. prepare_env() closes this: when GOOGLE_APPLICATION_CREDENTIALS is
+set and the `gcp` extra (google-auth) is installed, it mints an access token from the key
+file directly (see _mint_ambient_gcs_token()) -- cached process-wide and refreshed near
+expiry. Missing extra, missing env var, or any minting failure is a silent no-op, same as the
+rest of this module's failure posture: htslib/pyarrow.fs just fall back to whatever's already
+ambient.
 
-On Databricks, prepare_env() *additionally* vends a short-lived, path-scoped credential via
-Unity Catalog's Temporary Credentials API and writes it into os.environ, taking priority over
-both plain ambient resolution and the GOOGLE_APPLICATION_CREDENTIALS mint above (it's scoped
-to exactly what the caller is authorized for). Vending is lazy -- the first cloud open in a
-worker process -- and cached per (scheme, bucket), re-vending near expiry. Off Databricks, or
-if databricks-sdk isn't importable, or if vending fails for any reason, this step is skipped
-and prepare_env() falls through to the GOOGLE_APPLICATION_CREDENTIALS mint (GCS) or plain
-ambient resolution (S3/Azure). databricks-sdk is deliberately not a litebfx extra -- it's
-preinstalled on every Databricks Runtime/Serverless image, and declaring it here forces pip
-to reconcile against whatever's already pinned there instead of just using it; see
-pyproject.toml's comment on this for the real install failure that caused the change.
-
-Path-scoped vending needs a databricks-sdk new enough to have
-generate_temporary_path_credentials -- confirmed empirically (downloaded and inspected actual
-wheels) absent through classic Databricks Runtime 17.3 LTS (bundles 0.49.0) and present from
-Runtime 18.0 (bundles 0.67.0) onward; Serverless uses a completely separate versioning scheme
-(DATABRICKS_RUNTIME_VERSION like "client.5.8", not a classic DBR number) and reaches the
-needed SDK version at client generation 5 (also 0.67.0). See _import_path_credentials_api()
-and uc_path_vending_warning() for the version-detection logic, and register_all() (__init__.py)
-for the proactive setup-time warning on runtimes below that threshold.
-
-Not threaded through InputPartition: InputPartition objects get logged in Spark's plan
-explain output and worker tracebacks (a credential-bearing field is a real exposure risk),
-and htslib reads credentials from os.environ, not a constructor argument, so a dataclass
-field would just be an indirect carrier for something that has to land in global env state
-right before use anyway. Nothing here ever crosses the driver->worker cloudpickle boundary.
+No Databricks-specific credential vending: Unity Catalog's Temporary Credentials API
+(generate_temporary_path_credentials) was implemented and then removed after confirming, via
+a diagnostic run inside an isolated Python Data Source worker subprocess on a real Databricks
+Serverless workspace, that WorkspaceClient()'s default auth cannot resolve there at all --
+the worker environment has no ambient DATABRICKS_HOST/TOKEN/CLIENT_ID/CLIENT_SECRET of any
+kind, and the SDK's "runtime native" auth strategy depends on an internal `dbruntime` package
+that isn't present in that stripped-down venv either. See python/TASKS.md's "Implemented
+since first cut" section for the full investigation (multiple real bugs were found and fixed
+along the way -- a stale filesystem cache, unnecessary hard dependencies on pyarrow/
+databricks-sdk, a genuine SDK-version gap -- before this final, structural blocker surfaced).
+Ambient credentials (an instance-profile-configured classic cluster, or a manually-provisioned
+service principal's DATABRICKS_CLIENT_ID/SECRET injected into the compute environment) are
+the only way to authenticate direct cloud reads on Databricks going forward.
 
 Concurrency: os.environ mutation is process-global, and it's unverified whether htslib
 re-reads env vars only at open time or on every subsequent range request against an
@@ -51,16 +38,12 @@ Local-path reads never touch this lock.
 """
 
 import contextlib
-import logging
 import os
-import re
 import threading
 import time
 import urllib.parse
 
 from . import io as _io
-
-_logger = logging.getLogger(__name__)
 
 # htslib's S3 backend recognizes only s3://, s3+http://, and s3+https:// -- s3a:// and
 # s3n:// give "Protocol not supported" (confirmed empirically), so they're normalized to
@@ -75,13 +58,10 @@ _GCS_SCHEMES = ("gs", "gcs")
 
 _LOCK = threading.RLock()
 
-_CACHE = {}   # (scheme, bucket) -> _VendedCredential | None
-
-# Ambient GCS token minted from GOOGLE_APPLICATION_CREDENTIALS -- unlike _CACHE above, this
-# is a single process-wide credential, not per-bucket: one service-account key file mints one
-# token usable against every bucket that key is authorized for, so there is no bucket key to
-# scope it by. None means "not yet minted"; a _VendedCredential that is_expired() means
-# "mint again". See _mint_ambient_gcs_token().
+# Ambient GCS token minted from GOOGLE_APPLICATION_CREDENTIALS. A single process-wide
+# credential, not per-bucket: one service-account key file mints one token usable against
+# every bucket that key is authorized for. None means "not yet minted"; a _VendedCredential
+# that is_expired() means "mint again". See _mint_ambient_gcs_token().
 _AMBIENT_GCS_CACHE = None
 
 
@@ -112,121 +92,8 @@ def cloud_read_scope(path: str):
         yield
 
 
-def is_databricks() -> bool:
-    """True when running inside a Databricks cluster/serverless process, driver or worker --
-    DATABRICKS_RUNTIME_VERSION is set on every node."""
-    return "DATABRICKS_RUNTIME_VERSION" in os.environ
-
-
-def _databricks_runtime_info():
-    """Parse DATABRICKS_RUNTIME_VERSION into (is_serverless, major_version), or None if unset
-    or unparseable.
-
-    Classic Databricks Runtime: a plain numeric version like "17.3" -> (False, 17). Serverless
-    uses a *completely separate* versioning scheme -- confirmed distinct from classic DBR
-    numbering, not just cosmetically -- reported as a "client"-prefixed version such as
-    "client.5.8" (exact separator between "client" and the number is not confirmed either way,
-    so this matches both "client.5.8" and "client5.8") -> (True, 5). Different generations of
-    each scheme bundle different databricks-sdk versions independently of one another; see
-    uc_path_vending_warning() for the specific thresholds and evidence.
-    """
-    v = os.environ.get("DATABRICKS_RUNTIME_VERSION")
-    if not v:
-        return None
-    m = re.match(r"client\.?(\d+)", v, re.IGNORECASE)
-    if m:
-        return True, int(m.group(1))
-    m = re.match(r"(\d+)", v)
-    if m:
-        return False, int(m.group(1))
-    return None
-
-
-def uc_path_vending_warning():
-    """A human-readable warning message if this Databricks runtime generation is expected to
-    predate path-scoped Unity Catalog credential vending support in its bundled databricks-sdk,
-    or None if not on Databricks, the version string is unparseable, or the runtime is at or
-    above the threshold.
-
-    Thresholds, confirmed empirically (downloaded and inspected the actual wheels, not
-    guessed) rather than assumed: classic Databricks Runtime 18.0 bundles databricks-sdk
-    0.67.0, which has generate_temporary_path_credentials; Runtime 17.3 LTS bundles 0.49.0,
-    which doesn't (only a table-scoped generate_temporary_table_credentials, unusable here --
-    litebfx reads arbitrary cloud paths, not paths pre-resolved to a registered UC table_id).
-    Serverless client generation 5.x independently bundles 0.67.0 too, so the threshold there
-    is 5, not 18 -- the two version numbers are not comparable to each other, only each to its
-    own scheme's threshold.
-
-    This is a proactive, version-string-based heuristic meant to be checked once at setup time
-    (register_all(), so a user finds out immediately in a notebook rather than discovering the
-    gap lazily on first cloud read) -- it is deliberately *not* the source of truth
-    vend_credential() itself relies on for the actual fallback decision. That's
-    _import_path_credentials_api()'s job: an actual-import-based check against the real
-    installed SDK, which stays correct even if this version-string heuristic is ever wrong
-    (e.g. someone manually upgraded databricks-sdk despite an older runtime, or Databricks
-    changes its bundling policy) -- the two checks intentionally overlap rather than one
-    replacing the other.
-    """
-    info = _databricks_runtime_info()
-    if info is None:
-        return None
-    is_serverless, major = info
-    threshold = 5 if is_serverless else 18
-    if major >= threshold:
-        return None
-    kind = "Serverless client" if is_serverless else "Runtime"
-    return (
-        f"litebfx: Databricks {kind} generation {major}.x is expected to bundle a "
-        "databricks-sdk version that doesn't support path-scoped Unity Catalog credential "
-        "vending (generate_temporary_path_credentials) -- confirmed present starting classic "
-        "Runtime 18.0 / Serverless client 5.x, absent on Runtime 17.3 LTS and earlier. Direct "
-        "s3://, gs://, or abfss:// reads will fall back to ambient credential resolution, "
-        "which works on an instance-profile-configured classic cluster but not on Serverless "
-        "(no instance-profile equivalent there). Upgrade to Runtime 18+ / Serverless client "
-        "5+ for automatic vending, or use a Unity Catalog Volume path instead."
-    )
-
-
-def _import_databricks_sdk():
-    """Lazy import, same pattern as _base.import_pysam() -- returns None (not a raise) when
-    databricks-sdk isn't importable; caller falls back to ambient credentials. Deliberately
-    not a litebfx extra -- see pyproject.toml's comment on this -- so "not installed" here
-    almost always means "genuinely off Databricks", not "forgot to pip install an extra"."""
-    try:
-        import databricks.sdk
-        return databricks.sdk
-    except ImportError:
-        return None
-
-
-def _import_path_credentials_api():
-    """Returns the PathOperation enum class if this databricks-sdk supports path-scoped
-    Unity Catalog credential vending (generate_temporary_path_credentials), or None if not --
-    not a bug or misconfiguration when None, just an older preinstalled SDK.
-
-    Confirmed empirically (downloaded and inspected the actual wheels, not guessed): this API
-    was added to databricks-sdk somewhere between 0.49.0 (absent) and 0.67.0 (present).
-    Databricks Runtime 17.3 LTS bundles 0.49.0 -- which has *only* a table-scoped
-    generate_temporary_table_credentials(table_id=...), unusable here since litebfx reads
-    arbitrary cloud paths, not paths pre-resolved to a registered UC table_id. Runtime 18.0
-    bundles 0.67.0 and has the real path-scoped API. Since databricks-sdk is deliberately not
-    a litebfx extra (see pyproject.toml's comment -- upgrading it explicitly risks the exact
-    dependency conflict that caused that), this means UC path-credential vending is simply
-    unavailable out of the box on 17.x-and-earlier LTS runtimes -- prepare_env() falls back to
-    ambient credential resolution there, same as off Databricks entirely. See
-    python/TASKS.md's open questions for what that means practically (instance-profile-based
-    classic clusters still work via ambient resolution; Serverless has no instance-profile
-    equivalent, so this is a real gap there specifically until Serverless's own bundled SDK --
-    unverified whether it tracks classic DBR's version or moves independently -- catches up)."""
-    try:
-        from databricks.sdk.service.catalog import PathOperation
-        return PathOperation
-    except ImportError:
-        return None
-
-
 def _import_google_auth():
-    """Lazy import, same pattern as _import_databricks_sdk() -- returns None (not a raise)
+    """Lazy import, same pattern as _base.import_pysam() -- returns None (not a raise)
     when the `gcp` extra isn't installed; caller falls back to whatever's already ambient."""
     try:
         import google.auth
@@ -240,8 +107,8 @@ class _VendedCredential:
     __slots__ = ("env", "fs_kwargs", "expiration_time_ms")
 
     def __init__(self, env, fs_kwargs, expiration_time_ms):
-        self.env = env                            # for htslib (S3/GCS only -- Azure never
-        self.fs_kwargs = fs_kwargs                 # reaches htslib) and for pyarrow.fs
+        self.env = env                            # for htslib (GCS only) and for pyarrow.fs
+        self.fs_kwargs = fs_kwargs
         self.expiration_time_ms = expiration_time_ms
 
     def is_expired(self, skew_seconds=60) -> bool:
@@ -252,16 +119,14 @@ class _VendedCredential:
 
 def _mint_ambient_gcs_token():
     """Mint (or reuse a still-valid cached) OAuth access token from
-    GOOGLE_APPLICATION_CREDENTIALS -- the off-Databricks counterpart to vend_credential()'s
-    Unity Catalog path: same _VendedCredential shape and cache-and-refresh-near-expiry
-    behavior, but sourced from a static service-account key file via google-auth instead of a
-    per-call vending API. Read-only scope -- this package never writes to cloud storage.
+    GOOGLE_APPLICATION_CREDENTIALS, via google-auth. Read-only scope -- this package never
+    writes to cloud storage.
 
     Returns None on ANY failure (GOOGLE_APPLICATION_CREDENTIALS unset, `gcp` extra not
     installed, malformed key file, network) -- every failure mode falls back to whatever's
     already ambient, never raises. Cached process-wide in _AMBIENT_GCS_CACHE: one
     service-account key mints one token usable against any bucket that key can reach, so
-    there's no per-bucket cache key the way Databricks' path-scoped vended credentials need.
+    there's no per-bucket cache key needed.
     """
     global _AMBIENT_GCS_CACHE
     if _AMBIENT_GCS_CACHE is not None and not _AMBIENT_GCS_CACHE.is_expired():
@@ -295,133 +160,18 @@ def _mint_ambient_gcs_token():
         return None
 
 
-def _credential_from_response(resp):
-    """Map a GenerateTemporaryPathCredentialResponse to a _VendedCredential, or None for a
-    cloud/auth shape this version doesn't recognize. fs_kwargs are confirmed against the
-    actual pyarrow.fs.{S3,Gcs,Azure}FileSystem constructor signatures, not guessed."""
-    if resp.aws_temp_credentials is not None:
-        c = resp.aws_temp_credentials
-        env = {"AWS_ACCESS_KEY_ID": c.access_key_id, "AWS_SECRET_ACCESS_KEY": c.secret_access_key}
-        fs_kwargs = {"access_key": c.access_key_id, "secret_key": c.secret_access_key}
-        if c.session_token:
-            env["AWS_SESSION_TOKEN"] = c.session_token
-            fs_kwargs["session_token"] = c.session_token
-        return _VendedCredential(env, fs_kwargs, resp.expiration_time)
-    if resp.gcp_oauth_token is not None:
-        token = resp.gcp_oauth_token.oauth_token
-        env = {"GCS_OAUTH_TOKEN": token}
-        # GcsFileSystem(access_token=..., credential_token_expiration=...) accepts a
-        # pre-obtained token directly (confirmed against its constructor signature) --
-        # credential_token_expiration wants a datetime, not the epoch-ms this API returns.
-        fs_kwargs = {"access_token": token}
-        if resp.expiration_time is not None:
-            import datetime
-            fs_kwargs["credential_token_expiration"] = datetime.datetime.fromtimestamp(
-                resp.expiration_time / 1000, tz=datetime.timezone.utc)
-        return _VendedCredential(env, fs_kwargs, resp.expiration_time)
-    if resp.azure_user_delegation_sas is not None:
-        # AzureFileSystem(sas_token=...) accepts this directly (confirmed against its
-        # constructor signature). Azure never reaches htslib -- no env vars, ever.
-        return _VendedCredential({}, {"sas_token": resp.azure_user_delegation_sas.sas_token},
-                                  resp.expiration_time)
-    if resp.azure_aad is not None:
-        # Confirmed gap, not a guess: pyarrow.fs.AzureFileSystem's constructor has no kwarg
-        # for injecting a pre-obtained bearer token -- only account_key/sas_token (raw
-        # secrets) or client_id+client_secret+tenant_id (build a *new* credential via
-        # service-principal flow, not usable with an already-vended token). A UC-vended
-        # azure_aad token has nowhere to go; this falls back to ambient DefaultAzureCredential
-        # resolution, which will fail closed (permission error) if that doesn't separately
-        # have access. Document as a known Phase 3 Azure gap, not silently swallowed.
-        return _VendedCredential({}, {}, resp.expiration_time)
-    return None    # unrecognized shape -- vend_credential() logs this, not this pure mapper
-
-
-def vend_credential(path: str):
-    """Call UC's generate_temporary_path_credentials for `path`. Returns a _VendedCredential,
-    or None on ANY failure (not on Databricks, SDK missing, network, permissions, path not
-    UC-governed) -- every failure mode is treated identically: fall back to ambient
-    credentials, never raise. A hard failure here would break every cloud read on a
-    Databricks cluster that simply isn't UC-governed for this particular path.
-
-    Every non-trivial failure is logged at WARNING (not just silently returned as None) --
-    the fallback-to-ambient behavior is deliberate and correct (see above), but a silent
-    fallback that then also fails (ambient resolution picking up an unauthorized identity,
-    e.g. serverless compute's own base infrastructure role rather than the caller's
-    UC-governed storage credential) previously surfaced only as an opaque AWS/GCS permission
-    error several layers away, with zero indication that vending was even attempted, let
-    alone why it didn't produce a usable credential."""
-    if not is_databricks():
-        return None
-    sdk = _import_databricks_sdk()
-    if sdk is None:
-        _logger.info(
-            "litebfx: running on Databricks but databricks-sdk isn't importable, so Unity "
-            "Catalog credential vending is skipped for %r -- falling back to ambient "
-            "credential resolution. It's normally preinstalled on Databricks Runtime/"
-            "Serverless; if this environment genuinely lacks it and this path needs a "
-            "UC-vended credential rather than an ambient one, pip install databricks-sdk.",
-            path)
-        return None
-    path_operation = _import_path_credentials_api()
-    if path_operation is None:
-        _logger.info(
-            "litebfx: databricks-sdk is installed but this version doesn't support "
-            "path-scoped Unity Catalog credential vending (generate_temporary_path_"
-            "credentials) -- confirmed absent through at least 0.49.0 (Databricks Runtime "
-            "17.3 LTS's bundled version) and present by 0.67.0 (Runtime 18.0's). Falling "
-            "back to ambient credential resolution for %r. This is expected on 17.x-and-"
-            "earlier LTS runtimes, not a bug -- an instance-profile-based classic cluster "
-            "still resolves ambient credentials correctly; Serverless has no instance-"
-            "profile equivalent, so this is a real gap there until its bundled SDK has this "
-            "API. See python/TASKS.md's open questions.", path)
-        return None
-    try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
-        resp = w.temporary_path_credentials.generate_temporary_path_credentials(
-            path, path_operation.PATH_READ)
-        cred = _credential_from_response(resp)
-        if cred is None:
-            _logger.warning("litebfx: Unity Catalog vending returned no usable credential for "
-                             "%r -- falling back to ambient credential resolution.", path)
-        return cred
-    except Exception:
-        _logger.warning(
-            "litebfx: Unity Catalog credential vending failed for %r -- falling back to "
-            "ambient credential resolution, which may not be authorized for this path. Common "
-            "causes: the path isn't under a registered External Location, the caller isn't "
-            "granted READ FILES on it, or WorkspaceClient() auth didn't resolve in this "
-            "process (see tests/smoke_uc_credential_vending.py).", path, exc_info=True)
-        return None
-
-
-def credentials_for(path: str):
-    """Cached vended credential for path's bucket; re-vends when missing or expired
-    (respecting expiration_time's own advice to re-vend near expiry, not vend-once)."""
-    key = _io.bucket_key(path)[:2]
-    cached = _CACHE.get(key)
-    if cached is None or cached.is_expired():
-        cached = vend_credential(path)
-        _CACHE[key] = cached
-    return cached
-
-
 def prepare_env(path: str) -> None:
     """Ensure the process environment has whatever htslib's S3/GCS backend needs to open
     `path`. No-op for local paths and for Azure (download mode -- Azure never reaches
     htslib).
 
     Independent things happen here for a "native" cloud path:
-    - On Databricks, if a vended credential is available, its env vars take priority over
-      everything else below (it's scoped to exactly what the caller is authorized for). Off
-      Databricks, SDK missing, or vending failed: skipped.
-    - For a GCS path specifically, if Databricks vending didn't already supply a
-      GCS_OAUTH_TOKEN, GOOGLE_APPLICATION_CREDENTIALS is minted into one when set and the
-      `gcp` extra is installed (see _mint_ambient_gcs_token()) -- this is the fallback for
-      everyone off Databricks, since GOOGLE_APPLICATION_CREDENTIALS itself is not something
-      htslib's GCS backend can use directly. Missing extra, missing env var, or a minting
-      failure: skipped, htslib resolves GCS_OAUTH_TOKEN from the ambient environment itself
-      (i.e. does nothing further -- same as if this bullet didn't exist).
+    - For a GCS path specifically, GOOGLE_APPLICATION_CREDENTIALS is minted into a
+      GCS_OAUTH_TOKEN when set and the `gcp` extra is installed (see
+      _mint_ambient_gcs_token()), since GOOGLE_APPLICATION_CREDENTIALS itself is not
+      something htslib's GCS backend can use directly. Missing extra, missing env var, or a
+      minting failure: skipped, htslib resolves GCS_OAUTH_TOKEN from the ambient environment
+      itself (i.e. does nothing further -- same as if this bullet didn't exist).
     - If AWS_ENDPOINT_URL is set (a non-AWS S3-compatible endpoint), HTS_S3_HOST and
       HTS_S3_ADDRESS_STYLE are derived from it, since htslib has no other way to learn a
       non-default host. This alone is *not* enough for htslib to actually use that host --
@@ -435,13 +185,7 @@ def prepare_env(path: str) -> None:
     if _io.cloud_read_mode(path) != "native":
         return
     _fix_ca_bundle_path()
-    vended_gcs_token = False
-    if is_databricks():
-        cred = credentials_for(path)
-        if cred is not None and cred.env:
-            os.environ.update(cred.env)
-            vended_gcs_token = "GCS_OAUTH_TOKEN" in cred.env
-    if _io.scheme(path) in _GCS_SCHEMES and not vended_gcs_token:
+    if _io.scheme(path) in _GCS_SCHEMES:
         cred = _mint_ambient_gcs_token()
         if cred is not None:
             os.environ.update(cred.env)

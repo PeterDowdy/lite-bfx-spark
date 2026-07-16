@@ -292,8 +292,8 @@ assumed. What follows is the design actually shipped; see `litebfx/io.py`, `_clo
 user-facing version of this.
 
 **S3 and GCS are opened directly — pysam's bundled htslib has a native remote-read backend
-for both.** `hfile_s3.c` does full SigV4 v2/v4 signing (including session-token support,
-needed for Databricks-vended temporary credentials) and reads `AWS_ACCESS_KEY_ID`/
+for both.** `hfile_s3.c` does full SigV4 v2/v4 signing (including session-token support, e.g.
+for an EC2/Databricks instance profile's temporary credentials) and reads `AWS_ACCESS_KEY_ID`/
 `AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`/`AWS_DEFAULT_REGION` directly; `hfile_gcs.c` reads
 `GCS_OAUTH_TOKEN`. `spark.read.format("bam").load("s3://bucket/sample.bam")` works with the
 same index-guided range-request behavior as a local file — no credential code needed in the
@@ -317,43 +317,40 @@ worker process, regardless of query selectivity — in exchange for direct `abfs
 with no mount. Query efficiency *after* the download is unaffected (pysam's own indexed
 seeking works normally against the local copy).
 
-**On Databricks Runtime 18.0+ / Serverless client 5+, credential vending is automatic — no
-extra install step.** `_cloud.py` vends a short-lived, path-scoped credential from Unity
-Catalog's Temporary Credentials API (`generate_temporary_path_credentials`) for any cloud
-path, lazily on first open in a worker process, and it takes priority over ambient
-credentials. This relies on `databricks-sdk`, which is *not* a litebfx extra (there was one
-briefly; it was removed after a real install failure on dedicated compute — see
-`pyproject.toml`'s comment and `python/TASKS.md`) — `databricks-sdk` is preinstalled on every
-Databricks Runtime/Serverless image, and declaring it as a dependency just forces pip to
-reconcile against whatever version is already pinned there. This is the Databricks-native
-equivalent of what UC Volumes' FUSE mount does internally, applied directly to
-`s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE indirection.
+**No Databricks-specific credential vending — ambient credentials only, everywhere.** Unity
+Catalog's Temporary Credentials API (`generate_temporary_path_credentials`) was implemented
+(`_cloud.vend_credential()`), shipped, and then removed after a multi-stage live investigation
+against a real Databricks Serverless workspace, prompted by a genuine production 403 report.
+Three real, independent bugs were found and fixed along the way — a stale `_cloudfs.py`
+filesystem cache poisoning vended credentials, `pyarrow`/`databricks-sdk` as unnecessary hard/
+extra dependencies conflicting with what Databricks Runtime images already bundle, and a
+genuine SDK-version gap (`generate_temporary_path_credentials` doesn't exist at all in the
+databricks-sdk bundled with Runtime 17.3 LTS or earlier, confirmed by inspecting actual PyPI
+wheels) — but fixing all three finally exposed the structural blocker underneath: a worker-side
+diagnostic run inside the actual isolated Python Data Source worker subprocess (not the
+driver) showed `WorkspaceClient()`'s default auth failing with `ModuleNotFoundError: No
+module named 'dbruntime'` (an internal Databricks package available in notebook/driver
+contexts but not in the worker's stripped-down venv), and a follow-up diagnostic confirmed the
+worker has *no* ambient `DATABRICKS_HOST`/`TOKEN`/`CLIENT_ID`/`CLIENT_SECRET` of any kind
+either. So automatic, zero-config vending from inside a Python Data Source worker isn't
+achievable with today's databricks-sdk auth model, regardless of SDK version — see
+`python/TASKS.md`'s "Implemented since first cut" section for the full investigation, findings,
+and the reasoning behind not building a riskier fallback (a different, older UC API was
+evaluated and rejected — it needs a materially more privileged grant than plain `READ FILES`).
 
-**The version floor is real, not conservative padding**: inspecting the actual bundled SDK
-wheels (not guessing) found that `generate_temporary_path_credentials` doesn't exist at all
-in Runtime 17.3 LTS's databricks-sdk (0.49.0) or earlier — only a table-scoped equivalent
-that needs a UC `table_id`, unusable for arbitrary paths. `_cloud.uc_path_vending_warning()`
-detects this (parsing `DATABRICKS_RUNTIME_VERSION`'s two independent schemes: classic DBR's
-plain numeric version, and Serverless's separate `client.N.M` versioning) and
-`register_all()` warns once at setup time; `_cloud._import_path_credentials_api()` is the
-actual-import-based check `vend_credential()` itself relies on, so a stale or wrong version
-inference in the warning never causes an incorrect *behavior*, only a possibly-missing or
-spurious warning. Below the threshold, direct cloud reads fall back to ambient credentials —
-fine on a classic cluster with an instance profile, a real gap on Serverless (no
-instance-profile equivalent) below client 5.
+On Databricks, this means an instance-profile-configured classic cluster's ambient credentials
+work as they always have (this predates and is independent of Unity Catalog vending); direct
+cloud reads on Serverless need credentials made ambient some other way — e.g. a manually
+provisioned service principal's `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` injected
+into the compute environment — or a Unity Catalog Volume path instead.
 
-One thing this *still doesn't* resolve without a real workspace, even where the version floor
-is met: whether `WorkspaceClient()`'s default auth actually resolves inside the isolated
-Python Data Source worker subprocess (vs. only the driver, which is well-established to
-work) — see `tests/smoke_uc_credential_vending.py` and `TASKS.md`'s open questions.
-
-**Off Databricks, `pip install lite-bfx-spark` alone covers S3 and Azure; GCS needs the `gcp`
-extra.** `pysam` is the only hard dependency — `pyspark`/`pyarrow` are expected to already be
-present (the Spark runtime), matching the JAR's `provided`-scope dependency. GCS is a partial
-exception to "ambient credentials just work": htslib's native GCS backend needs an
-already-minted OAuth access token in `GCS_OAUTH_TOKEN`, not the `GOOGLE_APPLICATION_CREDENTIALS`
-key-file path most GCS users actually have ambiently. `pip install "lite-bfx-spark[gcp]"`
-mints one automatically from that key file (cached, refreshed near expiry) — see `_cloud.py`'s
+**`pip install lite-bfx-spark` alone covers S3 and Azure; GCS needs the `gcp` extra.** `pysam`
+is the only hard dependency — `pyspark`/`pyarrow` are expected to already be present (the
+Spark runtime), matching the JAR's `provided`-scope dependency. GCS is a partial exception to
+"ambient credentials just work": htslib's native GCS backend needs an already-minted OAuth
+access token in `GCS_OAUTH_TOKEN`, not the `GOOGLE_APPLICATION_CREDENTIALS` key-file path most
+GCS users actually have ambiently. `pip install "lite-bfx-spark[gcp]"` mints one automatically
+from that key file (cached, refreshed near expiry) — see `_cloud.py`'s
 `_mint_ambient_gcs_token()`. S3 and Azure don't have this gap; their ambient credential shapes
 are exactly what htslib/`pyarrow.fs` already expect.
 

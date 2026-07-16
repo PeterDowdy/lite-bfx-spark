@@ -13,21 +13,21 @@ Java JAR, filesystem-path I/O only (FUSE mounts for cloud), Arrow output.
 ## Validated decisions (do not re-litigate)
 
 - **Parsing:** pysam 0.24.0 (bundled htslib). One decode path.
-- **Cloud I/O (superseded, see below):** `s3://`/`s3a://`/`s3n://`/`gs://`/`gcs://` are now
-  opened **directly** — pysam's bundled htslib has a native S3/GCS remote-read backend
-  (confirmed by binary inspection + live MinIO/fake-gcs reads through the real Spark
-  pipeline), no FUSE mount needed. `abfss://`/`wasbs://`/`abfs://`/`wasb://` are also opened
-  directly, but via a different mechanism: htslib has **no native Azure backend at all**
-  (confirmed absent), so the object is downloaded to a local temp file via
-  `pyarrow.fs.AzureFileSystem` and pysam opens the local copy — no range-request efficiency
-  for Azure specifically, but no FUSE mount either. `adl://`/`hdfs://`/`http(s)://`/`ftp://`
-  are still rejected, unchanged, with FUSE-mount guidance. Credential handling: ambient
-  (env vars / instance metadata / shared config, resolved by htslib/pyarrow.fs themselves)
-  everywhere, **except GCS off Databricks**, where the `gcp` extra mints htslib's required
-  `GCS_OAUTH_TOKEN` from an ambient `GOOGLE_APPLICATION_CREDENTIALS` key file (htslib never
-  reads that env var itself — see `_cloud.py`'s module docstring); on Databricks, `_cloud.py`
-  additionally vends short-lived, path-scoped credentials via Unity Catalog's Temporary
-  Credentials API and prefers them over both ambient resolution and the `gcp`-extra mint.
+- **Cloud I/O:** `s3://`/`s3a://`/`s3n://`/`gs://`/`gcs://` are opened **directly** — pysam's
+  bundled htslib has a native S3/GCS remote-read backend (confirmed by binary inspection +
+  live MinIO/fake-gcs reads through the real Spark pipeline), no FUSE mount needed.
+  `abfss://`/`wasbs://`/`abfs://`/`wasb://` are also opened directly, but via a different
+  mechanism: htslib has **no native Azure backend at all** (confirmed absent), so the object
+  is downloaded to a local temp file via `pyarrow.fs.AzureFileSystem` and pysam opens the
+  local copy — no range-request efficiency for Azure specifically, but no FUSE mount either.
+  `adl://`/`hdfs://`/`http(s)://`/`ftp://` are still rejected, unchanged, with FUSE-mount
+  guidance. Credential handling: ambient (env vars / instance metadata / shared config,
+  resolved by htslib/pyarrow.fs themselves) **everywhere, including Databricks** — no
+  Databricks-specific credential vending (see "Implemented since first cut" for the Unity
+  Catalog vending feature that was built, then removed, and why). **Except GCS**, where the
+  `gcp` extra mints htslib's required `GCS_OAUTH_TOKEN` from an ambient
+  `GOOGLE_APPLICATION_CREDENTIALS` key file (htslib never reads that env var itself — see
+  `_cloud.py`'s module docstring) — this applies the same way everywhere, Databricks or not.
   See `io.py`, `_cloudfs.py`, `_cloud.py`, and `docs/proposals/python-data-source.md`'s
   "Cloud I/O" section for the full design.
 - **Intra-contig parallelism:** coordinate sub-ranges + start-ownership dedup
@@ -90,7 +90,7 @@ python/
     schemas.py              # StructTypes == Java *Schema (incl. columnNames=sam)
     io.py                   # path normalization; scheme gate (native / download / rejected)
     _cloudfs.py             # pyarrow.fs dispatch: local-vs-cloud exists/stat/listdir/reads
-    _cloud.py               # cloud credentials: ambient + Databricks UC vending
+    _cloud.py               # cloud credentials: ambient everywhere + GCS token minting
     regions.py              # region option + pushFilters parsing
     arrow.py                # StructType -> pyarrow schema; RecordBatch builders
     bgzf.py                 # BGZF block finder + BAM record guesser (from spike)
@@ -137,13 +137,12 @@ JDK 17 + PySpark 4.0, 29 passing).**
   coordinate-sorted CRAM in a writable directory, then reads per-contig; single partition otherwise.
 - **Arrow output** — all readers yield `pyarrow.RecordBatch` (the columnar fast path).
 - `DIRECTORY.md` regenerated to index `python/`.
-- **Ambient GCS credential minting off Databricks** (`gcp` extra) — `_cloud.py`'s
-  `prepare_env()` mints htslib's required `GCS_OAUTH_TOKEN` from an ambient
-  `GOOGLE_APPLICATION_CREDENTIALS` service-account key file, cached and refreshed near
-  expiry, whenever Databricks UC vending didn't already supply one. Closes a real gap: GCS
-  was previously the one cloud where "ambient credentials just work" wasn't true, since
-  htslib never reads `GOOGLE_APPLICATION_CREDENTIALS` itself. See `_mint_ambient_gcs_token()`
-  and `python/tests/test_cloud_gcp_ambient.py`.
+- **Ambient GCS credential minting** (`gcp` extra) — `_cloud.py`'s `prepare_env()` mints
+  htslib's required `GCS_OAUTH_TOKEN` from an ambient `GOOGLE_APPLICATION_CREDENTIALS`
+  service-account key file, cached and refreshed near expiry. Closes a real gap: GCS was
+  previously the one cloud where "ambient credentials just work" wasn't true, since htslib
+  never reads `GOOGLE_APPLICATION_CREDENTIALS` itself. See `_mint_ambient_gcs_token()` and
+  `python/tests/test_cloud_gcp_ambient.py`.
 - **Fixed: stale `_cloudfs.py` filesystem cache poisoning UC-vended reads** — reported as a
   clean, consistent `AWS ACCESS_DENIED`/403 on a Databricks Serverless S3 path the reporting
   user could otherwise access. Root cause: `filesystem_for()` cached the constructed
@@ -246,6 +245,47 @@ JDK 17 + PySpark 4.0, 29 passing).**
   classic cluster with an instance profile configured (that predates UC vending and is
   independent of it) but not on Serverless below client generation 5, which has no
   instance-profile equivalent — a real, currently-unclosed gap there, not just a rough edge.
+- **Removed: the entire Unity Catalog credential-vending feature, after the fix above
+  finally exposed the actual structural blocker underneath.** The reporting user's workspace
+  reached Runtime 18.2 (bundled SDK has `generate_temporary_path_credentials`), and the very
+  same worker-side log-capturing diagnostic that found the SDK-version gap above caught the
+  real, final cause: `vend_credential()`'s `WorkspaceClient()` construction failing with
+
+  ```
+  ModuleNotFoundError: No module named 'dbruntime'
+  ```
+
+  `dbruntime` is a Databricks-internal package available in notebook/driver contexts but not
+  in the isolated Python Data Source worker's stripped-down venv
+  (`/local_disk0/.ephemeral_nfs/envs/pythonEnv-.../`) — `databricks-sdk`'s default auth chain
+  tries a "runtime native auth" strategy first that depends on it, and that failure cascades
+  into the whole chain failing. A follow-up diagnostic (dumping `DATABRICKS_HOST`/`TOKEN`/
+  `CLIENT_ID`/`CLIENT_SECRET`/`ACCOUNT_ID` presence from inside the same worker context, per
+  Databricks' own [unified authentication
+  docs](https://docs.databricks.com/en/dev-tools/auth.html#databricks-client-unified-authentication)
+  — never values, these would be real secrets) confirmed the worker has **no ambient
+  Databricks credential material of any kind**. This is the question `_import_path_
+  credentials_api()`'s docstring and `tests/smoke_uc_credential_vending.py` had flagged as
+  open since the feature's first implementation: whether `WorkspaceClient()`'s default auth
+  resolves inside the isolated worker subprocess. Now answered, decisively: **no, not with
+  today's databricks-sdk auth model** — not a litebfx bug, a structural gap between how
+  Python Data Source workers are isolated and what the SDK's zero-config auth expects.
+
+  Automatic, zero-config UC vending from inside a worker isn't achievable without the user
+  explicitly provisioning and threading through their own credentials (e.g. a service
+  principal's `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` injected into the compute
+  environment) — a materially different, much larger feature than "vending just works," and
+  not one litebfx can make transparent the way the rest of this investigation aimed for. User
+  decision: remove the feature entirely rather than ship something requiring bespoke setup
+  per workspace. Removed: `vend_credential()`, `credentials_for()`,
+  `_credential_from_response()`, `_VendedCredential`-for-Databricks, `is_databricks()`,
+  `_databricks_runtime_info()`, `uc_path_vending_warning()`, `_import_databricks_sdk()`,
+  `_import_path_credentials_api()`, the credential-identity-aware cache in `_cloudfs.py`
+  (reverted to plain `(scheme, bucket)` caching), `register_all()`'s setup-time warning,
+  `test_cloud_databricks.py`, `test_cloudfs_cache.py`, `tests/smoke_uc_credential_vending.py`,
+  and the `databricks-connect-uc` compose service. `_VendedCredential` itself and the GCS
+  ambient-minting bullet above are unaffected — that ambient-token-minting design pattern
+  outlived the Databricks-specific feature it was originally paired with.
 
 ### Still deferred (documented limitations)
 
@@ -291,29 +331,19 @@ pytest -q -m "not spark"        # pure-Python units only (no JVM)
   genuinely useful, scoped upstream fix for github.com/samtools/htslib, not just a litebfx
   workaround. `test_cloud_gcs.py` documents the current workaround (orchestration-layer-only
   testing via `pyarrow.fs.GcsFileSystem`'s explicit `endpoint_override`).
-- Databricks UC credential vending (`_cloud.py`): whether `WorkspaceClient()`'s default auth
-  resolves inside the isolated Python Data Source worker subprocess (vs. only the driver) is
-  **still unverified** — a live Serverless 403 report turned out to be caused by two other,
-  earlier issues in sequence (stale `_cloudfs.py` filesystem cache; then, decisively, the
-  reporting user's Runtime 17.3 LTS bundling a databricks-sdk with no path-scoped vending API
-  at all — see "Implemented since first cut"), and on 17.x the fix for the second one means
-  `vend_credential()` now returns early (`_import_path_credentials_api()` is None) *before*
-  ever reaching `WorkspaceClient()` construction. So this investigation, despite getting
-  real worker-side diagnostic access to the reporting user's live workspace, never actually
-  exercised this code path — the question remains open, answerable only on Runtime 18+ /
-  Serverless client 5+, or via `tests/smoke_uc_credential_vending.py` against such a
-  workspace (run manually pre-release, not in default CI).
-- `_cloud.is_databricks()`'s single-signal check (`DATABRICKS_RUNTIME_VERSION` env var)
-  **confirmed** to correctly detect Databricks inside an isolated worker subprocess on
-  dedicated/classic compute, via a worker-side diagnostic (`is_databricks: True,
-  DATABRICKS_RUNTIME_VERSION: '17.3'`) run against the reporting user's live workspace.
-  Serverless sets `DATABRICKS_RUNTIME_VERSION` too, just in a different format
-  (`"client.N.M"`, confirmed by the user directly) — `is_databricks()` itself only checks
-  the var's *presence*, not its shape, so this should hold there as well, though not
-  independently re-verified via a Serverless-side diagnostic (Serverless doesn't expose
-  `sparkContext.parallelize()`/`.map()`, so the same kind of direct worker-side check used
-  for dedicated compute isn't available there — confirmed by the user hitting exactly this
-  limitation while trying to reproduce this diagnostic on Serverless).
+- ~~Databricks UC credential vending: whether `WorkspaceClient()`'s default auth resolves
+  inside the isolated Python Data Source worker subprocess~~ — **resolved: no, it doesn't**,
+  and the feature was removed entirely as a result. See "Implemented since first cut"'s
+  closing entry for the full finding (a real worker-side diagnostic showing zero ambient
+  Databricks credentials of any kind in that environment, plus a `dbruntime`
+  `ModuleNotFoundError`). Kept here only as a pointer, not a live question anymore.
+- (Reference, function since removed) Databricks sets `DATABRICKS_RUNTIME_VERSION` inside
+  isolated worker subprocesses too, not just the driver — confirmed via a live worker-side
+  diagnostic on dedicated/classic compute. Serverless uses a value shaped like `"client.N.M"`
+  rather than classic DBR's plain numeric version (confirmed by a user directly, not
+  independently verified via a worker-side diagnostic — Serverless doesn't expose
+  `sparkContext.parallelize()`/`.map()`, so the same check isn't available there). Worth
+  knowing if any future code needs to detect Databricks from a worker context again.
 - `_cloud.py`'s cloud-read lock serializes all cloud-backed reads within one worker process
   (a deliberate correctness-over-parallelism tradeoff — see its module docstring) because
   it's unverified whether htslib re-reads env vars only at open time or per range-request.

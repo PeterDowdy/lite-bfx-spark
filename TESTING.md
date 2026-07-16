@@ -309,31 +309,6 @@ databricks fs cp target/lite-bfx-spark-*-serverless.jar \
 
 ---
 
-## Unity Catalog credential vending (Python package, real workspace only)
-
-The Python `litebfx` package can read `s3://`/`gs://`/`abfss://` directly, preferring
-Databricks Unity Catalog's Temporary Credentials API for authentication when running on
-Databricks (see `python/src/litebfx/_cloud.py`). Whether that credential vending actually
-works inside the *isolated Python Data Source worker subprocess* (not just the driver) is
-unverified without a real workspace — this is the one thing MinIO/fake-gcs-server/Azurite
-emulator tests cannot cover.
-
-```bash
-docker compose run --rm \
-  -e DATABRICKS_HOST=https://<workspace>.azuredatabricks.net \
-  -e DATABRICKS_TOKEN=<token> \
-  -e UC_TEST_BAM_URL=s3://my-bucket/genomics/sample.bam \
-  databricks-connect-uc
-```
-
-`UC_TEST_BAM_URL` must point at a small BAM under a Unity Catalog External Location the
-connecting identity has `READ FILES` on. The test script
-(`tests/smoke_uc_credential_vending.py`) reads it via `litebfx` end to end (register, plan,
-read on a worker) and asserts a non-zero row count. Run this manually before a release that
-touches `_cloud.py` — it is not part of default CI.
-
----
-
 ## Live AWS S3 (real bucket, not MinIO)
 
 The Python package's `test_cloud_s3.py` suite normally runs against MinIO (see "Cloud
