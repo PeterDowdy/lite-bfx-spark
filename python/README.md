@@ -98,6 +98,15 @@ short-lived, path-scoped credential is vended automatically (via the preinstalle
 registered External Location the caller has `READ FILES` on, and takes priority over ambient
 credentials. No code changes or extra installs needed — this is all handled internally.
 
+Automatic vending needs a databricks-sdk new enough to support it: **Databricks Runtime 18.0+
+or Serverless client generation 5+** (confirmed by inspecting the actual bundled SDK versions
+— Runtime 17.3 LTS and earlier only expose a table-scoped credentials API, not usable for
+arbitrary paths). `litebfx.register_all(spark)` warns once, up front, if the runtime it
+detects is below that threshold; on those runtimes, direct cloud reads fall back to ambient
+credentials — this still works on a classic cluster with an instance profile configured, but
+not on Serverless below client 5 (no instance-profile equivalent there). Use a Unity Catalog
+Volume path instead if you're on an older runtime and need direct-path reads to just work.
+
 **GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
 already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most
 common ambient GCS credential (`GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account

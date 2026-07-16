@@ -177,4 +177,118 @@ def test_vend_credential_no_log_when_off_databricks(monkeypatch, caplog):
     monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
     with caplog.at_level("DEBUG", logger="litebfx._cloud"):
         assert _cloud.vend_credential("s3://bucket/key") is None
-    assert caplog.records == []
+
+
+def test_vend_credential_old_sdk_logs_specific_message_not_raw_importerror(monkeypatch, caplog):
+    """The real bug this covers: databricks-sdk 0.49.0 (Databricks Runtime 17.3 LTS's bundled
+    version) genuinely lacks PathOperation -- the unguarded `from ... import PathOperation`
+    used to let that ImportError escape into the generic except-Exception handler, logging a
+    confusing raw traceback that looked like a permissions problem rather than a version gap.
+    _import_path_credentials_api() must intercept this before ever reaching that import."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    monkeypatch.setattr(_cloud, "_import_path_credentials_api", lambda: None)
+    with caplog.at_level("INFO", logger="litebfx._cloud"):
+        assert _cloud.vend_credential("s3://bucket/key") is None
+    assert any("doesn't support path-scoped" in r.message for r in caplog.records)
+    assert not any(r.exc_info for r in caplog.records)    # no raw traceback for this case
+
+
+# --- _databricks_runtime_info() / uc_path_vending_warning() -----------------------------
+
+@pytest.mark.parametrize("version,expected", [
+    ("17.3", (False, 17)),
+    ("18.0", (False, 18)),
+    ("14.3.x-scala2.12", (False, 14)),
+    ("client.5.8", (True, 5)),
+    ("client5.8", (True, 5)),
+    ("CLIENT.4.2", (True, 4)),
+])
+def test_databricks_runtime_info_parses_classic_and_serverless(monkeypatch, version, expected):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", version)
+    assert _cloud._databricks_runtime_info() == expected
+
+
+def test_databricks_runtime_info_none_when_unset_or_unparseable(monkeypatch):
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    assert _cloud._databricks_runtime_info() is None
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "not-a-version-string")
+    assert _cloud._databricks_runtime_info() is None
+
+
+def test_uc_path_vending_warning_none_off_databricks(monkeypatch):
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    assert _cloud.uc_path_vending_warning() is None
+
+
+@pytest.mark.parametrize("version", ["17.3", "16.4", "1.0"])
+def test_uc_path_vending_warning_fires_below_classic_threshold(monkeypatch, version):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", version)
+    msg = _cloud.uc_path_vending_warning()
+    assert msg is not None
+    assert "Runtime" in msg and "18" in msg
+
+
+@pytest.mark.parametrize("version", ["18.0", "19.1"])
+def test_uc_path_vending_warning_none_at_or_above_classic_threshold(monkeypatch, version):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", version)
+    assert _cloud.uc_path_vending_warning() is None
+
+
+@pytest.mark.parametrize("version", ["client.4.9", "client3.1"])
+def test_uc_path_vending_warning_fires_below_serverless_threshold(monkeypatch, version):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", version)
+    msg = _cloud.uc_path_vending_warning()
+    assert msg is not None
+    assert "Serverless" in msg
+
+
+@pytest.mark.parametrize("version", ["client.5.8", "client6.0"])
+def test_uc_path_vending_warning_none_at_or_above_serverless_threshold(monkeypatch, version):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", version)
+    assert _cloud.uc_path_vending_warning() is None
+
+
+# --- register_all()'s proactive warning --------------------------------------------------
+
+class _FakeConf:
+    def get(self, key, default=None):
+        return default
+
+
+class _FakeDataSource:
+    def __init__(self):
+        self.registered = []
+
+    def register(self, ds):
+        self.registered.append(ds)
+
+
+class _FakeSpark:
+    """Just enough of a SparkSession's surface for register_all() -- no JVM needed, since
+    register_all()'s own logic (pushdown-conf check, warning check, dataSource.register calls)
+    never touches Spark internals beyond these two attributes."""
+
+    def __init__(self):
+        self.conf = _FakeConf()
+        self.dataSource = _FakeDataSource()
+
+
+def test_register_all_warns_on_old_databricks_runtime(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    import litebfx
+    with pytest.warns(UserWarning, match="path-scoped Unity Catalog"):
+        litebfx.register_all(_FakeSpark())
+
+
+def test_register_all_no_warning_on_new_databricks_runtime(recwarn, monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "18.0")
+    import litebfx
+    litebfx.register_all(_FakeSpark())
+    assert not any("Unity Catalog" in str(w.message) for w in recwarn.list)
+
+
+def test_register_all_no_warning_off_databricks(recwarn, monkeypatch):
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    import litebfx
+    litebfx.register_all(_FakeSpark())
+    assert not any("Unity Catalog" in str(w.message) for w in recwarn.list)

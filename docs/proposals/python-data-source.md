@@ -317,20 +317,35 @@ worker process, regardless of query selectivity — in exchange for direct `abfs
 with no mount. Query efficiency *after* the download is unaffected (pysam's own indexed
 seeking works normally against the local copy).
 
-**On Databricks, credential vending is automatic — no extra install step.** `_cloud.py` vends
-a short-lived, path-scoped credential from Unity Catalog's Temporary Credentials API
-(`generate_temporary_path_credentials`) for any cloud path, lazily on first open in a worker
-process, and it takes priority over ambient credentials. This relies on `databricks-sdk`,
-which is *not* a litebfx extra (there was one briefly; it was removed after a real install
-failure on dedicated compute — see `pyproject.toml`'s comment and `python/TASKS.md`) —
-`databricks-sdk` is preinstalled on every Databricks Runtime/Serverless image, and declaring
-it as a dependency just forces pip to reconcile against whatever version is already pinned
-there. This is the Databricks-native equivalent of what UC Volumes' FUSE mount does
-internally, applied directly to `s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE
-indirection. One thing this *doesn't* resolve without a real workspace: whether
-`WorkspaceClient()`'s default auth actually resolves inside the isolated Python Data Source
-worker subprocess (vs. only the driver, which is well-established to work) — see
-`tests/smoke_uc_credential_vending.py` and `TASKS.md`'s open questions.
+**On Databricks Runtime 18.0+ / Serverless client 5+, credential vending is automatic — no
+extra install step.** `_cloud.py` vends a short-lived, path-scoped credential from Unity
+Catalog's Temporary Credentials API (`generate_temporary_path_credentials`) for any cloud
+path, lazily on first open in a worker process, and it takes priority over ambient
+credentials. This relies on `databricks-sdk`, which is *not* a litebfx extra (there was one
+briefly; it was removed after a real install failure on dedicated compute — see
+`pyproject.toml`'s comment and `python/TASKS.md`) — `databricks-sdk` is preinstalled on every
+Databricks Runtime/Serverless image, and declaring it as a dependency just forces pip to
+reconcile against whatever version is already pinned there. This is the Databricks-native
+equivalent of what UC Volumes' FUSE mount does internally, applied directly to
+`s3://`/`gs://`/`abfss://` paths instead of requiring the FUSE indirection.
+
+**The version floor is real, not conservative padding**: inspecting the actual bundled SDK
+wheels (not guessing) found that `generate_temporary_path_credentials` doesn't exist at all
+in Runtime 17.3 LTS's databricks-sdk (0.49.0) or earlier — only a table-scoped equivalent
+that needs a UC `table_id`, unusable for arbitrary paths. `_cloud.uc_path_vending_warning()`
+detects this (parsing `DATABRICKS_RUNTIME_VERSION`'s two independent schemes: classic DBR's
+plain numeric version, and Serverless's separate `client.N.M` versioning) and
+`register_all()` warns once at setup time; `_cloud._import_path_credentials_api()` is the
+actual-import-based check `vend_credential()` itself relies on, so a stale or wrong version
+inference in the warning never causes an incorrect *behavior*, only a possibly-missing or
+spurious warning. Below the threshold, direct cloud reads fall back to ambient credentials —
+fine on a classic cluster with an instance profile, a real gap on Serverless (no
+instance-profile equivalent) below client 5.
+
+One thing this *still doesn't* resolve without a real workspace, even where the version floor
+is met: whether `WorkspaceClient()`'s default auth actually resolves inside the isolated
+Python Data Source worker subprocess (vs. only the driver, which is well-established to
+work) — see `tests/smoke_uc_credential_vending.py` and `TASKS.md`'s open questions.
 
 **Off Databricks, `pip install lite-bfx-spark` alone covers S3 and Azure; GCS needs the `gcp`
 extra.** `pysam` is the only hard dependency — `pyspark`/`pyarrow` are expected to already be
