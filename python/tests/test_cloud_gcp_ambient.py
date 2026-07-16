@@ -153,26 +153,6 @@ def test_prepare_env_gcs_noop_without_credentials_file(monkeypatch):
     assert dict(os.environ) == before
 
 
-def test_prepare_env_databricks_vended_gcs_token_takes_priority(monkeypatch):
-    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
-    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/key.json")
-    vended = _cloud._VendedCredential({"GCS_OAUTH_TOKEN": "vended-token"}, {}, None)
-    monkeypatch.setattr(_cloud, "credentials_for", lambda path: vended)
-    fake = _install_fake_google_auth(monkeypatch, _FakeCredentials(token="should-not-be-used"))
-    _cloud.prepare_env("gs://bucket/key")
-    assert os.environ["GCS_OAUTH_TOKEN"] == "vended-token"
-    assert fake.default_calls == []    # ambient mint never attempted -- vending already won
-
-
-def test_prepare_env_databricks_falls_back_to_ambient_mint_when_vending_fails(monkeypatch):
-    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
-    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/key.json")
-    monkeypatch.setattr(_cloud, "credentials_for", lambda path: None)
-    _install_fake_google_auth(monkeypatch, _FakeCredentials(token="fallback-token"))
-    _cloud.prepare_env("gs://bucket/key")
-    assert os.environ["GCS_OAUTH_TOKEN"] == "fallback-token"
-
-
 def test_prepare_env_s3_path_never_triggers_gcs_mint(monkeypatch):
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/fake/key.json")
     fake = _install_fake_google_auth(monkeypatch, _FakeCredentials())

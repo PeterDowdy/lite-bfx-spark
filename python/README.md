@@ -17,14 +17,13 @@ the JAR field-for-field.
 pip install lite-bfx-spark
 ```
 
-`pysam` is the only hard dependency. `pyspark`, `pyarrow`, and (on Databricks) `databricks-sdk`
-are all deliberately left out of the dependency graph entirely — they're already present in
-every environment this package actually runs in (any Spark cluster; Databricks Runtime/
-Serverless specifically bundles a runtime-pinned `pyarrow` and `databricks-sdk`, both tightly
-coupled to internal machinery), and declaring them risks pip reconciling against those pins
-and conflicting — a real, observed install failure on Databricks dedicated compute, not a
-hypothetical one (see `pyproject.toml`'s comments for the details). One optional extra
-remains: `gcp`, for minting a GCS access token off Databricks from an ambient
+`pysam` is the only hard dependency. `pyspark` and `pyarrow` are deliberately left out of the
+dependency graph entirely — they're already present in every environment this package
+actually runs in (any Spark cluster; Databricks Runtime/Serverless specifically bundles a
+runtime-pinned `pyarrow` tightly coupled to internal machinery), and declaring them risks pip
+reconciling against those pins and conflicting — a real, observed install failure on
+Databricks dedicated compute, not a hypothetical one (see `pyproject.toml`'s comments for the
+details). One optional extra remains: `gcp`, for minting a GCS access token from an ambient
 `GOOGLE_APPLICATION_CREDENTIALS` service-account key:
 
 ```bash
@@ -91,31 +90,27 @@ this gets you direct Azure support with no mount, at the cost of the range-reque
 efficiency S3/GCS get (the whole file transfers once per worker process, then reads from it
 are as fast as local disk, including index-guided seeks within the downloaded copy).
 
-**Credentials** are ambient by default (env vars, instance profile / workload identity,
-shared config — the same resolution any AWS/GCS/Azure SDK tool uses). **On Databricks**, a
-short-lived, path-scoped credential is vended automatically (via the preinstalled
-`databricks-sdk`) from Unity Catalog's Temporary Credentials API for any path under a
-registered External Location the caller has `READ FILES` on, and takes priority over ambient
-credentials. No code changes or extra installs needed — this is all handled internally.
-
-Automatic vending needs a databricks-sdk new enough to support it: **Databricks Runtime 18.0+
-or Serverless client generation 5+** (confirmed by inspecting the actual bundled SDK versions
-— Runtime 17.3 LTS and earlier only expose a table-scoped credentials API, not usable for
-arbitrary paths). `litebfx.register_all(spark)` warns once, up front, if the runtime it
-detects is below that threshold; on those runtimes, direct cloud reads fall back to ambient
-credentials — this still works on a classic cluster with an instance profile configured, but
-not on Serverless below client 5 (no instance-profile equivalent there). Use a Unity Catalog
-Volume path instead if you're on an older runtime and need direct-path reads to just work.
+**Credentials** are ambient (env vars, instance profile / workload identity, shared config —
+the same resolution any AWS/GCS/Azure SDK tool uses). On Databricks, this means an
+instance-profile-configured classic cluster works out of the box; Serverless has no
+instance-profile equivalent, so direct cloud reads there need credentials made ambient some
+other way (e.g. a service principal's `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET`
+injected into the compute environment) or a Unity Catalog Volume path instead. litebfx does
+not vend Databricks credentials itself — Unity Catalog's Temporary Credentials API was
+evaluated and removed after confirming it cannot authenticate from inside the isolated Python
+Data Source worker subprocess (no ambient Databricks credential of any kind is available
+there, and the SDK's automatic in-notebook auth strategy depends on an internal package that
+isn't present in that stripped-down environment either) — see `python/TASKS.md` for the full
+investigation.
 
 **GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
 already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most
 common ambient GCS credential (`GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account
-key, standard Application Default Credentials) isn't directly usable by itself. Off
-Databricks, install the `gcp` extra and this package mints a token from that key file
-automatically (cached and refreshed as it nears expiry); without the extra, `gs://` reads
-fail with a permission error even though the key file is right there. S3 and Azure don't
-have this gap — their ambient credential shapes are exactly what htslib/`pyarrow.fs` already
-expect.
+key, standard Application Default Credentials) isn't directly usable by itself. Install the
+`gcp` extra and this package mints a token from that key file automatically (cached and
+refreshed as it nears expiry); without the extra, `gs://` reads fail with a permission error
+even though the key file is right there. S3 and Azure don't have this gap — their ambient
+credential shapes are exactly what htslib/`pyarrow.fs` already expect.
 
 Everything else — `adl://`, `hdfs://`, `http(s)://`, `ftp://` — still needs a mount:
 
