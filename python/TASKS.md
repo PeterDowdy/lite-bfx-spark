@@ -65,6 +65,19 @@ Java JAR, filesystem-path I/O only (FUSE mounts for cloud), Arrow output.
 - Publishing via PyPI **Trusted Publishing (OIDC)** — no API tokens/secrets. Each publish job
   has `permissions: id-token: write`; configure a trusted publisher on PyPI and TestPyPI for
   this repo (workflows `python-publish.yml` / `python-ci.yml`).
+- **Installing a TestPyPI staging build needs `--extra-index-url`.** TestPyPI is not a mirror
+  of real PyPI — it only has what this project itself has published there. A bare
+  `pip install --index-url https://test.pypi.org/simple/ lite-bfx-spark` confines pip to
+  TestPyPI for *every* dependency, including third-party ones like `pysam` that were never
+  published there — pip falls back to whatever stray old artifact happens to exist (an sdist,
+  forcing a source build), whose own build-time `setuptools` requirement then *also* isn't
+  resolvable there, surfacing as a confusing `setuptools>=X ... from versions: none` error
+  that has nothing to do with litebfx's own dependency declarations. Fix: add
+  `--extra-index-url https://pypi.org/simple/` so pip falls through to real PyPI for anything
+  TestPyPI doesn't have:
+  ```bash
+  pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ lite-bfx-spark
+  ```
 - Test matrix: Python 3.10–3.12 (pysam wheels), Spark 4.0.x, JDK 17 in CI (local box is JDK 25 — Spark 4 may not start there).
 
 ## Module layout
