@@ -40,6 +40,12 @@ def register_all(spark):
     check happens once here and picks a reader class that either has pushFilters() or
     doesn't — the class itself has to differ, since Spark's check is "is pushFilters
     overridden at all", not something a no-op body could satisfy.
+
+    Also warns once, proactively, if this Databricks runtime generation predates path-scoped
+    Unity Catalog credential vending support (see ``_cloud.uc_path_vending_warning()``) — this
+    is register_all()'s one guaranteed driver-side, pre-any-read call site, so it's the
+    earliest point a user can be told direct cloud reads will fall back to ambient credentials
+    here, rather than discovering it lazily (and less legibly) on the first actual cloud read.
     """
     from .bam import (BamDataSource, CramDataSource,
                       _BamDataSourcePushdown, _CramDataSourcePushdown)
@@ -47,6 +53,12 @@ def register_all(spark):
     from .fasta import FastaDataSource
     from .fastq import FastqDataSource
     from .vcf import VcfDataSource, _VcfDataSourcePushdown
+    from . import _cloud
+
+    uc_warning = _cloud.uc_path_vending_warning()
+    if uc_warning:
+        import warnings
+        warnings.warn(uc_warning, stacklevel=2)
 
     try:
         pushdown = str(spark.conf.get(_PUSHDOWN_CONF, "false")).lower() == "true"

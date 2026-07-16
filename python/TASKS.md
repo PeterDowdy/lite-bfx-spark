@@ -162,9 +162,13 @@ JDK 17 + PySpark 4.0, 29 passing).**
   silently swallowed — the fallback-to-ambient behavior itself is still deliberate and
   correct, but a fallback that then *also* fails previously gave zero indication vending was
   even attempted. See `python/tests/test_cloudfs_cache.py` and the new logging tests in
-  `test_cloud_databricks.py`. **Not yet confirmed against the reporting user's live
-  workspace** — two separate install-time blockers (see the next two entries) prevented a
-  clean retest; genuinely unknown yet whether this fix alone resolves the original report.
+  `test_cloud_databricks.py`. **Confirmed via a worker-side diagnostic against the reporting
+  user's live workspace**: this fix was necessary but not sufficient on its own — two
+  install-time blockers (next two entries) had to clear first before a clean retest was even
+  possible, and once they did, a captured `litebfx._cloud` log line from inside a real
+  distributed task pinpointed the actual remaining cause precisely (see the SDK-version-gap
+  entry below), not a further cache issue. So: real bug, real fix, but not the *whole* story
+  for this specific report.
 - **Fixed: `pyarrow` as a hard dependency broke installs on Databricks dedicated compute** —
   surfaced while trying to get a clean install of the fix above onto a real workspace for
   verification. `pyproject.toml` declared `pyarrow>=4` unconditionally, but every Databricks
@@ -193,6 +197,55 @@ JDK 17 + PySpark 4.0, 29 passing).**
   runtime behavior changes off the extras mechanism itself — only the install-time story
   does. Off Databricks, install it directly (`pip install databricks-sdk`) if exercising the
   vending code path without a real workspace.
+- **Fixed: the actual remaining cause — `generate_temporary_path_credentials` doesn't exist
+  in the databricks-sdk bundled with Databricks Runtime 17.3 LTS at all.** Found via a
+  worker-side diagnostic against the reporting user's live workspace that captured
+  `vend_credential()`'s own log output directly (rather than relying on wherever Databricks
+  surfaces isolated-worker-subprocess stderr, which is exactly the kind of thing that's hard
+  to track down remotely): `ImportError: cannot import name 'PathOperation' from
+  'databricks.sdk.service.catalog'`. Confirmed empirically (downloaded and inspected the
+  actual wheels from PyPI, and looked up each Databricks Runtime's own "Installed Python
+  libraries" release-notes table rather than guessing) that this is not a fluke:
+
+  | Databricks Runtime | Spark | bundled databricks-sdk | path-scoped vending? |
+  |---|---|---|---|
+  | 16.4 LTS | 3.5.2 | 0.30.0 | n/a — Spark 3.x can't run litebfx's Python Data Source at all |
+  | 17.3 LTS | 4.0.2 | 0.49.0 | No — only a *table*-scoped `generate_temporary_table_credentials(table_id=...)`, unusable here since litebfx reads arbitrary cloud paths, not paths pre-resolved to a registered UC table |
+  | 18.0 | 4.1.0 | 0.67.0 | Yes |
+  | Serverless (classic-DBR-independent versioning, e.g. `DATABRICKS_RUNTIME_VERSION="client.5.8"`) | — | client ≥5 bundles 0.67.0 | Yes from client generation 5 |
+
+  A different, older API (`CredentialsAPI.generate_temporary_service_credential`, present in
+  0.49.0, response-shape-compatible with `_credential_from_response()` with no new parsing
+  code needed) was investigated as a possible 17.x fallback — technically reachable via
+  `external_locations.list()` + client-side URL-prefix matching to find the right
+  `credential_name` — but its own docstring requires "metastore admin or the metastore
+  privilege **ACCESS** on the service credential," a materially different and typically
+  *more* privileged grant than the `READ FILES` on an External Location that path-scoped
+  vending needs; most UC setups reserve direct storage-credential `ACCESS` for admins.
+  Building this risked trading one confusing permission error for a different one, for an
+  outcome not confirmed to actually work for the reporting user's identity — decided against
+  it (user's call, given the added complexity and uncertain payoff) in favor of:
+
+  1. `_import_path_credentials_api()` — an actual-import-based check (the source of truth)
+     that makes `vend_credential()` fail with one clear, specific log line ("this SDK version
+     doesn't support path-scoped vending, expected on 17.x-and-earlier") instead of letting a
+     raw `ImportError` traceback escape into the generic exception handler and look like a
+     bug or a permissions problem.
+  2. `uc_path_vending_warning()` + `_databricks_runtime_info()` — a *proactive*,
+     version-string-based heuristic (parses `DATABRICKS_RUNTIME_VERSION`, handling both
+     classic DBR's plain numeric scheme and Serverless's separate `client.N.M` scheme) that
+     `register_all()` checks once at setup time, so a user on an unsupported runtime finds
+     out immediately via a `UserWarning` in their notebook — not lazily, buried in a worker
+     log, on first failed cloud read. Deliberately kept as a *second*, complementary check
+     rather than replacing (1): this one infers from a version string and could in principle
+     be wrong (a manually-upgraded SDK on an old runtime, or a future Databricks bundling
+     policy change); (1) checks the real installed SDK and stays correct regardless.
+
+  Net effect for Runtime 17.x and earlier: direct `s3://`/`gs://`/`abfss://` reads fall back
+  to ambient credential resolution, same as off Databricks entirely. This still works on a
+  classic cluster with an instance profile configured (that predates UC vending and is
+  independent of it) but not on Serverless below client generation 5, which has no
+  instance-profile equivalent — a real, currently-unclosed gap there, not just a rough edge.
 
 ### Still deferred (documented limitations)
 
@@ -240,18 +293,27 @@ pytest -q -m "not spark"        # pure-Python units only (no JVM)
   testing via `pyarrow.fs.GcsFileSystem`'s explicit `endpoint_override`).
 - Databricks UC credential vending (`_cloud.py`): whether `WorkspaceClient()`'s default auth
   resolves inside the isolated Python Data Source worker subprocess (vs. only the driver) is
-  unverified without a real workspace — see `tests/smoke_uc_credential_vending.py`, run
-  manually pre-release, not in default CI. A real Serverless 403 report traced to a *different*
-  bug (stale `_cloudfs.py` filesystem cache, now fixed — see "Implemented since first cut"),
-  not this one, so this question is still open, not resolved by that fix.
-- Whether `_cloud.is_databricks()`'s single-signal check (`DATABRICKS_RUNTIME_VERSION` env
-  var) reliably detects Databricks **Serverless** compute specifically (vs. classic clusters,
-  where it's long-established to work) is unconfirmed — flagged during the Serverless 403
-  investigation above but not yet verified either way. If it turns out to under-detect
-  Serverless, `vend_credential()` would now at least log *why* (`is_databricks()` returning
-  False makes it return early with no log line at all, by design, since that's also the
-  correct behavior for the common "genuinely not on Databricks" case) — so confirm via the
-  now-logged INFO/WARNING output first before assuming this is the cause.
+  **still unverified** — a live Serverless 403 report turned out to be caused by two other,
+  earlier issues in sequence (stale `_cloudfs.py` filesystem cache; then, decisively, the
+  reporting user's Runtime 17.3 LTS bundling a databricks-sdk with no path-scoped vending API
+  at all — see "Implemented since first cut"), and on 17.x the fix for the second one means
+  `vend_credential()` now returns early (`_import_path_credentials_api()` is None) *before*
+  ever reaching `WorkspaceClient()` construction. So this investigation, despite getting
+  real worker-side diagnostic access to the reporting user's live workspace, never actually
+  exercised this code path — the question remains open, answerable only on Runtime 18+ /
+  Serverless client 5+, or via `tests/smoke_uc_credential_vending.py` against such a
+  workspace (run manually pre-release, not in default CI).
+- `_cloud.is_databricks()`'s single-signal check (`DATABRICKS_RUNTIME_VERSION` env var)
+  **confirmed** to correctly detect Databricks inside an isolated worker subprocess on
+  dedicated/classic compute, via a worker-side diagnostic (`is_databricks: True,
+  DATABRICKS_RUNTIME_VERSION: '17.3'`) run against the reporting user's live workspace.
+  Serverless sets `DATABRICKS_RUNTIME_VERSION` too, just in a different format
+  (`"client.N.M"`, confirmed by the user directly) — `is_databricks()` itself only checks
+  the var's *presence*, not its shape, so this should hold there as well, though not
+  independently re-verified via a Serverless-side diagnostic (Serverless doesn't expose
+  `sparkContext.parallelize()`/`.map()`, so the same kind of direct worker-side check used
+  for dedicated compute isn't available there — confirmed by the user hitting exactly this
+  limitation while trying to reproduce this diagnostic on Serverless).
 - `_cloud.py`'s cloud-read lock serializes all cloud-backed reads within one worker process
   (a deliberate correctness-over-parallelism tradeoff — see its module docstring) because
   it's unverified whether htslib re-reads env vars only at open time or per range-request.
