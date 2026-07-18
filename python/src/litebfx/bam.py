@@ -21,8 +21,9 @@ from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
 from . import _cloud, _cloudfs
-from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
-                    resolve_files, resolve_index, round_robin, wants_metadata)
+from ._base import (METADATA_FIELD, attach_credential, credential_for_partitions, get_opt,
+                    import_pysam, metadata_value, num_partitions, resolve_files, resolve_index,
+                    round_robin, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .bgzf import split_start_voffset
 from .io import is_cloud_path, normalize_path
@@ -89,6 +90,8 @@ class _AlnPartition(InputPartition):
     region: tuple = None                       # (contig, start0, end)
     start_byte: int = 0
     end_byte: int = 0
+    aws_credential: object = None              # driver-vended _cloud._DatabricksPathCredential;
+                                                # see _base.attach_credential()
 
 
 # --- reader -----------------------------------------------------------------------------
@@ -146,10 +149,11 @@ class _AlignmentReader(DataSourceReader):
     def partitions(self):
         parts = []
         for path in self.files:
-            parts += self._file_partitions(path)
+            cred = credential_for_partitions(path)
+            parts += attach_credential(self._file_partitions(path, cred), cred)
         return parts
 
-    def _file_partitions(self, path):
+    def _file_partitions(self, path, cred=None):
         if (not self.is_cram) and path.lower().endswith(".sam"):
             return [_AlnPartition("all", path)]
 
@@ -160,7 +164,7 @@ class _AlignmentReader(DataSourceReader):
             index = self._synthesize_crai(path)
 
         if index:
-            with _cloud.cloud_read_scope(path), self._open(path, index) as af:
+            with _cloud.cloud_read_scope(path, cred), self._open(path, index) as af:
                 refs = list(af.references)
             parts = [_AlnPartition("contigs", path, index, contigs=g)
                      for g in round_robin(refs, self.num_partitions)]
@@ -181,7 +185,7 @@ class _AlignmentReader(DataSourceReader):
 
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        with _cloud.cloud_read_scope(partition.path):
+        with _cloud.cloud_read_scope(partition.path, partition.aws_credential):
             af = self._open(partition.path, partition.index)
             try:
                 if partition.kind == "all":

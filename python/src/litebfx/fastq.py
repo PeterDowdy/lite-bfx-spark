@@ -13,8 +13,8 @@ from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
 from . import _cloud, _cloudfs
-from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, num_partitions,
-                    resolve_files, wants_metadata)
+from ._base import (METADATA_FIELD, attach_credential, credential_for_partitions, get_opt,
+                    import_pysam, metadata_value, num_partitions, resolve_files, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .schemas import FASTQ_SCHEMA
 
@@ -34,6 +34,8 @@ class _FastqPartition(InputPartition):
     start: int = 0
     end: int = 0
     whole: bool = True          # True => stream the whole file with pysam
+    aws_credential: object = None              # driver-vended _cloud._DatabricksPathCredential;
+                                                # see _base.attach_credential()
 
 
 class FastqDataSource(DataSource):
@@ -62,19 +64,22 @@ class _FastqReader(DataSourceReader):
     def partitions(self):
         parts = []
         for path in self.files:
+            cred = credential_for_partitions(path)
+            file_parts = []
             if path.endswith(".gz"):
-                parts.append(_FastqPartition(path, 0, 0, True))
-                continue
-            size = _cloudfs.getsize(path)
-            n = min(self.num_partitions, max(1, size // self.min_split))
-            if n <= 1:
-                parts.append(_FastqPartition(path, 0, 0, True))
-                continue
-            chunk = -(-size // n)                       # ceil division
-            for i in range(n):
-                s, e = i * chunk, min((i + 1) * chunk, size)
-                if s < size:
-                    parts.append(_FastqPartition(path, s, e, False))
+                file_parts.append(_FastqPartition(path, 0, 0, True))
+            else:
+                size = _cloudfs.getsize(path)
+                n = min(self.num_partitions, max(1, size // self.min_split))
+                if n <= 1:
+                    file_parts.append(_FastqPartition(path, 0, 0, True))
+                else:
+                    chunk = -(-size // n)                       # ceil division
+                    for i in range(n):
+                        s, e = i * chunk, min((i + 1) * chunk, size)
+                        if s < size:
+                            file_parts.append(_FastqPartition(path, s, e, False))
+            parts += attach_credential(file_parts, cred)
         return parts
 
     def read(self, partition):
@@ -83,14 +88,14 @@ class _FastqReader(DataSourceReader):
     def _rows(self, partition):
         rn = read_number(partition.path)
         md = (metadata_value(partition.path),) if self.metadata else ()
-        if partition.whole:
-            with _cloud.cloud_read_scope(partition.path):
+        with _cloud.cloud_read_scope(partition.path, partition.aws_credential):
+            if partition.whole:
                 pysam = import_pysam()
                 with pysam.FastxFile(_cloudfs.resolve_open_path(partition.path)) as fx:
                     for e in fx:
                         yield (e.name, e.sequence, e.quality, e.comment or None, rn) + md
-        else:
-            yield from self._read_range(partition, rn, md)
+            else:
+                yield from self._read_range(partition, rn, md)
 
     def _read_range(self, partition, rn, md):
         with _cloudfs.open_stream(partition.path) as f:
