@@ -7,8 +7,8 @@ from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
 from . import _cloud, _cloudfs
-from ._base import (METADATA_FIELD, import_pysam, metadata_value, resolve_files, resolve_index,
-                    wants_metadata)
+from ._base import (METADATA_FIELD, attach_credential, credential_for_partitions, import_pysam,
+                    metadata_value, resolve_files, resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .io import cloud_read_mode
 from .schemas import FASTA_SCHEMA
@@ -21,6 +21,8 @@ class _FastaPartition(InputPartition):
     path: str = ""
     contigs: list = field(default_factory=list)   # empty => stream the whole file
     index: str = None
+    aws_credential: object = None              # driver-vended _cloud._DatabricksPathCredential;
+                                                # see _base.attach_credential()
 
 
 class FastaDataSource(DataSource):
@@ -48,14 +50,16 @@ class _FastaReader(DataSourceReader):
     def partitions(self):
         parts = []
         for path in self.files:
+            cred = credential_for_partitions(path)
             fai = resolve_index(self.options, path, (".fai",), self.single)
             if fai and _cloudfs.exists(fai):
                 with io.TextIOWrapper(_cloudfs.open_stream(fai)) as fh:
                     contigs = [ln.split("\t", 1)[0] for ln in fh if ln.strip()]
-                parts += ([_FastaPartition(path, [c], fai) for c in contigs]
-                          or [_FastaPartition(path, [], fai)])
+                file_parts = ([_FastaPartition(path, [c], fai) for c in contigs]
+                              or [_FastaPartition(path, [], fai)])
             else:
-                parts.append(_FastaPartition(path, [], None))
+                file_parts = [_FastaPartition(path, [], None)]
+            parts += attach_credential(file_parts, cred)
         return parts
 
     def read(self, partition):
@@ -63,7 +67,7 @@ class _FastaReader(DataSourceReader):
 
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        with _cloud.cloud_read_scope(partition.path):
+        with _cloud.cloud_read_scope(partition.path, partition.aws_credential):
             pysam = import_pysam()
             mode = cloud_read_mode(partition.path)
             path = _cloudfs.resolve_open_path(partition.path)

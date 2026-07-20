@@ -317,32 +317,82 @@ worker process, regardless of query selectivity — in exchange for direct `abfs
 with no mount. Query efficiency *after* the download is unaffected (pysam's own indexed
 seeking works normally against the local copy).
 
-**No Databricks-specific credential vending — ambient credentials only, everywhere.** Unity
-Catalog's Temporary Credentials API (`generate_temporary_path_credentials`) was implemented
-(`_cloud.vend_credential()`), shipped, and then removed after a multi-stage live investigation
-against a real Databricks Serverless workspace, prompted by a genuine production 403 report.
-Three real, independent bugs were found and fixed along the way — a stale `_cloudfs.py`
-filesystem cache poisoning vended credentials, `pyarrow`/`databricks-sdk` as unnecessary hard/
-extra dependencies conflicting with what Databricks Runtime images already bundle, and a
-genuine SDK-version gap (`generate_temporary_path_credentials` doesn't exist at all in the
-databricks-sdk bundled with Runtime 17.3 LTS or earlier, confirmed by inspecting actual PyPI
-wheels) — but fixing all three finally exposed the structural blocker underneath: a worker-side
-diagnostic run inside the actual isolated Python Data Source worker subprocess (not the
-driver) showed `WorkspaceClient()`'s default auth failing with `ModuleNotFoundError: No
-module named 'dbruntime'` (an internal Databricks package available in notebook/driver
-contexts but not in the worker's stripped-down venv), and a follow-up diagnostic confirmed the
-worker has *no* ambient `DATABRICKS_HOST`/`TOKEN`/`CLIENT_ID`/`CLIENT_SECRET` of any kind
-either. So automatic, zero-config vending from inside a Python Data Source worker isn't
-achievable with today's databricks-sdk auth model, regardless of SDK version — see
-`python/TASKS.md`'s "Implemented since first cut" section for the full investigation, findings,
-and the reasoning behind not building a riskier fallback (a different, older UC API was
-evaluated and rejected — it needs a materially more privileged grant than plain `READ FILES`).
+**Databricks S3 credential vending, take two — vend once on the driver, thread to workers.**
+Unity Catalog's Temporary Credentials API (`generate_temporary_path_credentials`) was
+implemented once already (`_cloud.vend_credential()`), shipped, and removed after a
+multi-stage live investigation against a real Databricks Serverless workspace, prompted by a
+genuine production 403 report. Three real, independent bugs were found and fixed along the
+way — a stale `_cloudfs.py` filesystem cache poisoning vended credentials, `pyarrow`/
+`databricks-sdk` as unnecessary hard/extra dependencies conflicting with what Databricks
+Runtime images already bundle, and a genuine SDK-version gap (`generate_temporary_path_
+credentials` doesn't exist at all in the databricks-sdk bundled with Runtime 17.3 LTS or
+earlier, confirmed by inspecting actual PyPI wheels) — but fixing all three finally exposed
+the structural blocker underneath: a worker-side diagnostic run inside the actual isolated
+Python Data Source worker subprocess (not the driver) showed `WorkspaceClient()`'s default
+auth failing with `ModuleNotFoundError: No module named 'dbruntime'` (an internal Databricks
+package available in notebook/driver contexts but not in the worker's stripped-down venv),
+and a follow-up diagnostic confirmed the worker has *no* ambient `DATABRICKS_HOST`/`TOKEN`/
+`CLIENT_ID`/`CLIENT_SECRET` of any kind either. So automatic, zero-config vending *from inside
+a Python Data Source worker* isn't achievable with today's databricks-sdk auth model,
+regardless of SDK version — see `python/TASKS.md`'s "Implemented since first cut" section for
+the full investigation and the reasoning behind not building a riskier fallback (a different,
+older UC API was evaluated and rejected — it needs a materially more privileged grant than
+plain `READ FILES`). That first attempt was removed entirely.
 
-On Databricks, this means an instance-profile-configured classic cluster's ambient credentials
-work as they always have (this predates and is independent of Unity Catalog vending); direct
-cloud reads on Serverless need credentials made ambient some other way — e.g. a manually
-provisioned service principal's `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` injected
-into the compute environment — or a Unity Catalog Volume path instead.
+The key realization behind the second attempt: the settled fact above only rules out a
+*worker* authenticating to Databricks on its own — it says nothing about vending from the
+*driver*, where a real SparkSession (and therefore `dbutils`) does exist, and shipping the
+resulting plain credential values to workers instead of a live SDK client. Databricks
+support, engaged after the first removal, confirmed this shape works: the driver calls Unity
+Catalog's Temporary Path Credentials REST endpoint directly
+(`POST /api/2.1/unity-catalog/temporary-path-credentials`, stdlib `urllib.request` — no SDK
+dependency), authenticated with the notebook context's own ephemeral API token obtained via
+`dbutils` (`dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken()
+.get()`) rather than `databricks-sdk`'s auto-authenticating `WorkspaceClient()`. The resulting
+`access_key_id`/`secret_access_key`/`session_token` values travel to the worker as a field on
+the `InputPartition` Python Data Source already builds per partition — the one channel this
+API is documented to guarantee crosses the driver→worker boundary intact. A worker just sets
+three env vars; it never talks to Databricks at all, so the `dbruntime`/isolated-venv problem
+that sank the first attempt simply doesn't apply to this one.
+
+This reintroduces a risk the *original* (pre-first-attempt) version of this section explicitly
+designed around: an `InputPartition` can appear in Spark's plan explain output or a worker
+traceback, so a credential-bearing field on it is a real exposure surface. Closed via
+redaction rather than avoidance this time — `_cloud._DatabricksPathCredential`'s `__repr__`/
+`__str__` show only the (non-secret) expiration timestamp, never the key material.
+
+**Refresh is bounded by what `partitions()`-then-`read()` actually allows, and that ceiling is
+documented, not hidden.** `partitions()` runs once, up front, before any partition executes,
+and a worker has no channel to call the driver back mid-read — so credentials can only ever be
+as fresh as the most recent `partitions()` call, i.e. the start of the current Spark action.
+`databricks_credential_for()` caches per `(scheme, bucket)` and re-vends when the cached entry
+is missing or expired, so *the next* action against a cloud path gets a fresh credential
+automatically — but a single action whose own wall-clock execution outlives the vended
+credential's ~1h lifetime will still hit mid-read expiry with no way to recover short of
+re-running that action. AWS/S3 only, for now — the same REST endpoint likely returns an
+analogous shape for GCS/Azure, matching what the removed `databricks-sdk`-based implementation
+used to parse, but that's unconfirmed through this raw-REST path specifically and out of scope
+for this round.
+
+Prerequisite grant: `EXTERNAL USE LOCATION` on the external location backing the path — a
+different, narrower grant than the `READ FILES` the first, removed implementation needed.
+Mocked end-to-end in `test_cloud_databricks_vending.py` (no real workspace, no network); a
+rewritten `tests/smoke_uc_credential_vending.py` covers the one thing mocks can't — whether
+this actually authenticates against a live workspace — but unlike the first attempt's version
+of that script, it can't run via `databricks-connect` (Spark Connect's gateway-less client
+can't provide the real `dbutils` this mechanism needs driver-side); it has to run as an actual
+notebook cell or Databricks Job task instead, and has not yet been re-run against a live
+workspace since this reimplementation.
+
+On Databricks, this means `s3://` reads on a real workspace now work automatically once the
+`EXTERNAL USE LOCATION` grant is in place — including Serverless, which previously had no
+credential path at all short of manually injecting a service principal. An
+instance-profile-configured classic cluster's ambient credentials still work as they always
+have, independent of and unaffected by UC vending. GCS and Azure remain ambient-only on
+Databricks, same as before — direct cloud reads for those two on Serverless still need
+credentials made ambient some other way (e.g. a manually provisioned service principal's
+`DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` injected into the compute environment) or a
+Unity Catalog Volume path instead.
 
 **`pip install lite-bfx-spark` alone covers S3 and Azure; GCS needs the `gcp` extra.** `pysam`
 is the only hard dependency — `pyspark`/`pyarrow` are expected to already be present (the

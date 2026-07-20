@@ -6,8 +6,8 @@ from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
 from . import _cloud, _cloudfs
-from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, resolve_files,
-                    resolve_index, wants_metadata)
+from ._base import (METADATA_FIELD, attach_credential, credential_for_partitions, get_opt,
+                    import_pysam, metadata_value, resolve_files, resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .regions import parse_region, push_region
 from .schemas import VCF_SCHEMA
@@ -70,6 +70,8 @@ class _VcfPartition(InputPartition):
     path: str = ""
     index: str = None
     region: tuple = None
+    aws_credential: object = None              # driver-vended _cloud._DatabricksPathCredential;
+                                                # see _base.attach_credential()
 
 
 class VcfDataSource(DataSource):
@@ -114,7 +116,8 @@ class _VcfReader(DataSourceReader):
         for path in self.files:
             idx = self._indexes[path]
             region = self.region.fetch_args() if (idx and self.region) else None
-            parts.append(_VcfPartition(path, idx, region))
+            cred = credential_for_partitions(path)
+            parts += attach_credential([_VcfPartition(path, idx, region)], cred)
         return parts
 
     def read(self, partition):
@@ -122,7 +125,7 @@ class _VcfReader(DataSourceReader):
 
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        with _cloud.cloud_read_scope(partition.path):
+        with _cloud.cloud_read_scope(partition.path, partition.aws_credential):
             pysam = import_pysam()
             index = _cloudfs.resolve_open_path(partition.index) if partition.index else None
             vf = pysam.VariantFile(_cloudfs.resolve_open_path(partition.path), index_filename=index)

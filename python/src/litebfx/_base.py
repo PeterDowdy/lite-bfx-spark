@@ -7,10 +7,32 @@ import os
 
 from pyspark.sql.types import LongType, StringType, StructField, StructType, TimestampType
 
-from . import _cloudfs
+from . import _cloud, _cloudfs
 from .io import is_cloud_path, normalize_path
 
 _INDEX_EXTS = (".bai", ".crai", ".csi", ".tbi", ".fai", ".gzi")
+
+
+def credential_for_partitions(path):
+    """DRIVER-ONLY. A driver-vended Databricks AWS credential for `path`, or None (not a
+    cloud path, not on Databricks, or vending unavailable/failed) -- call once per file at
+    the top of partitions(), then pass the result to attach_credential() for every
+    InputPartition built for that file. See _cloud.py's module docstring for why this has to
+    happen driver-side and travel with the partition rather than being vended fresh by each
+    worker."""
+    return _cloud.databricks_credential_for(path) if is_cloud_path(path) else None
+
+
+def attach_credential(parts, cred):
+    """Set .aws_credential on every partition in `parts`, if cred is not None -- shared by
+    every format's partitions(). InputPartition is the one channel Python Data Source is
+    documented to guarantee crosses the driver->worker boundary; whether a given Spark
+    version also happens to preserve `self` state on the reader isn't something this package
+    relies on, so the credential lives on the partition itself, not on self."""
+    if cred is not None:
+        for p in parts:
+            p.aws_credential = cred
+    return parts
 
 
 def get_opt(options, key, default=None):

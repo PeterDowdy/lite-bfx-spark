@@ -8,8 +8,8 @@ from pyspark.sql.datasource import DataSource, DataSourceReader, InputPartition
 from pyspark.sql.types import StructType
 
 from . import _cloud, _cloudfs
-from ._base import (METADATA_FIELD, get_opt, import_pysam, metadata_value, resolve_files,
-                    resolve_index, wants_metadata)
+from ._base import (METADATA_FIELD, attach_credential, credential_for_partitions, get_opt,
+                    import_pysam, metadata_value, resolve_files, resolve_index, wants_metadata)
 from .arrow import batches, to_arrow_schema
 from .regions import parse_region, push_region
 from .schemas import BED_SCHEMA
@@ -97,6 +97,8 @@ class _BedPartition(InputPartition):
     path: str = ""
     index: str = None
     region: tuple = None      # (contig, start0, end) for a tabix query, else None
+    aws_credential: object = None              # driver-vended _cloud._DatabricksPathCredential;
+                                                # see _base.attach_credential()
 
 
 class BedDataSource(DataSource):
@@ -140,10 +142,9 @@ class _BedReader(DataSourceReader):
         parts = []
         for path in self.files:
             idx = self._indexes[path]
-            if idx and self.region:
-                parts.append(_BedPartition(path, idx, self.region.fetch_args()))
-            else:
-                parts.append(_BedPartition(path, idx, None))
+            cred = credential_for_partitions(path)
+            region = self.region.fetch_args() if (idx and self.region) else None
+            parts += attach_credential([_BedPartition(path, idx, region)], cred)
         return parts
 
     def read(self, partition):
@@ -151,8 +152,8 @@ class _BedReader(DataSourceReader):
 
     def _rows(self, partition):
         md = (metadata_value(partition.path, partition.index),) if self.metadata else ()
-        if partition.region:
-            with _cloud.cloud_read_scope(partition.path):
+        with _cloud.cloud_read_scope(partition.path, partition.aws_credential):
+            if partition.region:
                 pysam = import_pysam()
                 c, s0, e = partition.region
                 index = _cloudfs.resolve_open_path(partition.index) if partition.index else None
@@ -161,12 +162,12 @@ class _BedReader(DataSourceReader):
                         row = parse_bed_line(line)
                         if row:
                             yield row + md
-        else:
-            for line in _open_text(partition.path):
-                if _is_data_line(line):
-                    row = parse_bed_line(line)
-                    if row:
-                        yield row + md
+            else:
+                for line in _open_text(partition.path):
+                    if _is_data_line(line):
+                        row = parse_bed_line(line)
+                        if row:
+                            yield row + md
 
 
 class _BedReaderPushdown(_BedReader):

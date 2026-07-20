@@ -91,17 +91,26 @@ efficiency S3/GCS get (the whole file transfers once per worker process, then re
 are as fast as local disk, including index-guided seeks within the downloaded copy).
 
 **Credentials** are ambient (env vars, instance profile / workload identity, shared config —
-the same resolution any AWS/GCS/Azure SDK tool uses). On Databricks, this means an
-instance-profile-configured classic cluster works out of the box; Serverless has no
-instance-profile equivalent, so direct cloud reads there need credentials made ambient some
-other way (e.g. a service principal's `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET`
-injected into the compute environment) or a Unity Catalog Volume path instead. litebfx does
-not vend Databricks credentials itself — Unity Catalog's Temporary Credentials API was
-evaluated and removed after confirming it cannot authenticate from inside the isolated Python
-Data Source worker subprocess (no ambient Databricks credential of any kind is available
-there, and the SDK's automatic in-notebook auth strategy depends on an internal package that
-isn't present in that stripped-down environment either) — see `python/TASKS.md` for the full
-investigation.
+the same resolution any AWS/GCS/Azure SDK tool uses) — for GCS and Azure everywhere, and for
+S3 everywhere off Databricks. **On Databricks, `s3://` paths get an automatically-vended
+Unity Catalog path credential instead**: the driver fetches a short-lived AWS credential from
+UC's Temporary Path Credentials API (via `dbutils`'s own notebook-context token, not
+`databricks-sdk` — this package still doesn't depend on it) and threads it to the worker that
+needs it. The only setup required is granting the running identity `EXTERNAL USE LOCATION` on
+the external location backing the path. This is a second, differently-shaped attempt at
+Databricks credential vending — a first version (workers calling Unity Catalog's API
+directly) was built and then removed after confirming it cannot authenticate from inside the
+isolated Python Data Source worker subprocess at all; this one avoids that problem by never
+asking a worker to authenticate to Databricks in the first place. See `python/TASKS.md` for
+the full history of both attempts.
+
+GCS and Azure aren't covered by this vending mechanism yet, so on Databricks Serverless
+specifically (which has no instance-profile equivalent for ambient credentials) those two
+clouds still need credentials made ambient some other way (e.g. a service principal's
+`DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` injected into the compute environment) or a
+Unity Catalog Volume path instead. A classic, instance-profile-configured cluster is
+unaffected for any of the three clouds — ambient resolution works there the same as off
+Databricks.
 
 **GCS is a partial exception to "ambient just works."** htslib's native GCS backend needs an
 already-minted OAuth *access token* in `GCS_OAUTH_TOKEN`, not a key file path — so the most

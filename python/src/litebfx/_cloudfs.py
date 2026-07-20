@@ -1,10 +1,15 @@
 """pyarrow.fs dispatch: local-vs-cloud filesystem operations behind one API.
 
 Every function here dispatches on ``io.is_cloud_path()`` internally, so callers
-(``_base.py``, ``bgzf.py``, format readers) never branch on local-vs-cloud themselves. No
-credential-vending knowledge lives here — see ``_cloud.py`` for GCS's ambient-token minting;
-this module only turns a cloud URI into bytes via ``pyarrow.fs``, using whatever credentials
-are already ambient (env vars, instance metadata, shared config).
+(``_base.py``, ``bgzf.py``, format readers) never branch on local-vs-cloud themselves. Most
+credential-vending knowledge lives in ``_cloud.py`` (GCS's ambient-token minting, Databricks'
+driver-vended AWS credentials) — this module mainly turns a cloud URI into bytes via
+``pyarrow.fs``, using whatever credentials are already ambient (env vars, instance metadata,
+shared config) by default. The one exception: S3 construction below also checks
+``_cloud.active_credential()`` / ``_cloud.databricks_credential_for()`` first, since some
+cloud reads (e.g. an unindexed FASTQ byte-range split, or index resolution during driver-side
+partition planning) go through ``pyarrow.fs`` directly and never touch ``_cloud.prepare_env()``
+at all.
 
 A non-AWS S3-compatible endpoint (MinIO, on-prem Ceph, etc.) needs the standard
 ``AWS_ENDPOINT_URL`` env var -- ``pyarrow.fs.FileSystem.from_uri()``'s ambient resolution
@@ -45,39 +50,70 @@ import pyarrow.fs
 from . import _cloud
 from . import io as _io
 
-_FS_CACHE = {}   # (scheme, bucket-or-account) -> pyarrow.fs.FileSystem
+_FS_CACHE = {}   # (scheme, bucket-or-account, credential-id-or-None) -> pyarrow.fs.FileSystem
 
 _AZURE_SCHEMES = ("abfs", "abfss", "wasb", "wasbs")
+_S3_SCHEMES = ("s3", "s3a", "s3n")
+
+
+def _cache_fs(cache_key, fs):
+    """Insert `fs` under `cache_key` and drop any other entry sharing the same (scheme,
+    bucket-or-account) prefix -- a credential refresh changes `cache_key`'s third element
+    (see filesystem_for()'s docstring), so without this, _FS_CACHE would grow by one stale,
+    never-reused entry per re-vend over a long-running driver process instead of staying at
+    one live entry per bucket."""
+    prefix = cache_key[:2]
+    for other in [k for k in _FS_CACHE if k[:2] == prefix and k != cache_key]:
+        del _FS_CACHE[other]
+    _FS_CACHE[cache_key] = fs
 
 
 def filesystem_for(path: str):
     """Return (pyarrow.fs.FileSystem, within-fs-path) for a cloud URI.
 
-    The filesystem is memoized per (scheme, bucket-or-account): constructing one does real
-    credential resolution, not free. Ambient credential resolution (env vars, instance
-    metadata, shared config) happens via `pyarrow.fs.FileSystem.from_uri` for S3/GCS, with no
-    arguments needed. Azure always needs explicit construction (see module docstring) -- see
-    `_azure_filesystem_for`.
+    The filesystem is memoized per (scheme, bucket-or-account, credential identity):
+    constructing one does real credential resolution, not free. Ambient credential resolution
+    (env vars, instance metadata, shared config) happens via `pyarrow.fs.FileSystem.from_uri`
+    for S3/GCS, with no arguments needed -- unless an S3 credential is available from
+    `_cloud.active_credential()` (a partition's driver-vended Databricks credential, set for
+    the duration of an enclosing `_cloud.cloud_read_scope()`) or, failing that,
+    `_cloud.databricks_credential_for(path)` (a fresh direct vend -- only actually succeeds
+    driver-side, e.g. during `partitions()`'s own index/size lookups; harmlessly returns None
+    if called from a worker with no active scope, same as calling it off Databricks at all).
+    Explicit credentials, when available, are constructed with `S3FileSystem(**fs_kwargs)`
+    instead of `from_uri()`. Azure always needs explicit construction (see module docstring)
+    -- see `_azure_filesystem_for`.
+
+    The credential identity is part of the cache key -- not just (scheme, bucket) -- so a
+    freshly re-vended credential naturally invalidates the old entry instead of the stale
+    filesystem being reused forever once it expires.
 
     Raises ValueError if `path` is not a cloud path litebfx recognizes.
     """
     s = _io.scheme(path)
     if s in _AZURE_SCHEMES:
         return _azure_filesystem_for(path)
-    if s not in ("s3", "s3a", "s3n", "gs", "gcs"):
+    if s not in _S3_SCHEMES and s not in ("gs", "gcs"):
         raise ValueError(f"not a cloud path: {path!r}")
     _, bucket, key = _io.bucket_key(path)
-    cache_key = (s, bucket)
+    cred = None
+    if s in _S3_SCHEMES:
+        cred = _cloud.active_credential()
+        if cred is None:
+            cred = _cloud.databricks_credential_for(path) if _cloud.is_databricks() else None
+    cache_key = (s, bucket, id(cred) if cred is not None else None)
     fs = _FS_CACHE.get(cache_key)
     if fs is None:
         gcs_endpoint = os.environ.get("GCS_ENDPOINT_URL") if s in ("gs", "gcs") else None
-        if gcs_endpoint:
+        if cred is not None:
+            fs = pyarrow.fs.S3FileSystem(**cred.fs_kwargs)
+        elif gcs_endpoint:
             parsed = urllib.parse.urlparse(gcs_endpoint)
             fs = pyarrow.fs.GcsFileSystem(
                 anonymous=True, scheme=parsed.scheme or "http", endpoint_override=parsed.netloc)
         else:
             fs, _ = pyarrow.fs.FileSystem.from_uri(f"{s}://{bucket}")
-        _FS_CACHE[cache_key] = fs
+        _cache_fs(cache_key, fs)
     return fs, f"{bucket}/{key}" if key else bucket
 
 

@@ -309,6 +309,42 @@ databricks fs cp target/lite-bfx-spark-*-serverless.jar \
 
 ---
 
+## Databricks Unity Catalog path-credential vending (Python package, real workspace only)
+
+The Python `litebfx` package vends short-lived AWS credentials from Unity Catalog's
+Temporary Path Credentials API when running on Databricks, for direct `s3://` reads (see
+`python/src/litebfx/_cloud.py`'s module docstring). Vending happens **on the driver**, via
+`dbutils`'s own notebook-context API token, and the resulting credential values are threaded
+to workers through `InputPartition` — workers never authenticate to Databricks themselves.
+
+Unlike `smoke_serverless.py` above, this **cannot** be verified through `databricks-connect`
+(Spark Connect from a local/CI machine): `dbutils`, in the specific shape this mechanism
+depends on, is only reliably present on a driver process Databricks itself launched (a real
+notebook or a Job's Python task), not one connecting remotely through Spark Connect's
+gateway-less client — that would just silently fall back to ambient credential resolution
+and confirm nothing about the mechanism being tested.
+
+To verify against a real workspace:
+1. Install `litebfx` in the target environment (e.g. `%pip install lite-bfx-spark` in a
+   notebook cell, or as a Job library).
+2. Grant the running identity `EXTERNAL USE LOCATION` on the external location backing a
+   small test BAM — a different, narrower grant than `READ FILES`, which the removed first
+   implementation of this feature needed instead.
+3. Run `tests/smoke_uc_credential_vending.py` either as a pasted/`%run` notebook cell, or as
+   a Databricks Job "Python script" task — both give it the real `spark`/`dbutils` globals it
+   needs, which a local `docker compose run` cannot. Set `UC_TEST_BAM_URL` (an `s3://` URL —
+   AWS only for now, see `_cloud.py`) as an env var (Job task) or notebook widget before
+   running.
+
+Run this manually before a release that touches `_cloud.py`, `_cloudfs.py`, or any format
+reader's `partitions()`/credential wiring — it is not part of default CI (no real workspace
+there) and has not yet been re-run against a live workspace since this feature's
+reimplementation (see `python/TASKS.md`'s "Re-implemented: Unity Catalog credential vending,
+take two" entry for the full history of the first attempt's removal and why this one is
+architecturally different).
+
+---
+
 ## Live AWS S3 (real bucket, not MinIO)
 
 The Python package's `test_cloud_s3.py` suite normally runs against MinIO (see "Cloud
