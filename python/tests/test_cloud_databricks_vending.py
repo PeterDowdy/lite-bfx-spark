@@ -19,10 +19,12 @@ TESTING.md).
 """
 
 import json
+import logging
 import os
 import sys
 import time
 import types
+import urllib.error
 
 import pytest
 
@@ -43,6 +45,7 @@ def _clean_env(monkeypatch):
 def _reset_caches(monkeypatch):
     monkeypatch.setattr(_cloud, "_DATABRICKS_CRED_CACHE", {})
     monkeypatch.setattr(_cloud, "_ACTIVE_CREDENTIAL", None)
+    monkeypatch.setattr(_cloud, "_LAST_INJECTED_CREDENTIAL_KEYS", set())
     monkeypatch.setattr(_cloudfs, "_FS_CACHE", {})
 
 
@@ -227,6 +230,9 @@ class _FakeHttpResponse:
     def read(self):
         return self._payload_bytes
 
+    def close(self):
+        pass    # urllib.error.HTTPError's own __del__ cleanup expects fp to support this
+
     def __enter__(self):
         return self
 
@@ -286,6 +292,50 @@ def test_vend_credential_none_on_malformed_json_response(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     assert _cloud._vend_databricks_path_credential("s3://bucket/key.bam") is None
+
+
+def test_vend_credential_logs_http_error_detail_and_returns_none(monkeypatch, caplog):
+    """A 403 (or other non-2xx) on the *vending request itself* -- most commonly a missing
+    EXTERNAL USE LOCATION grant -- must surface the actual status and response body in the
+    driver log, not vanish into a bare `except Exception: return None`. This is the
+    diagnostic this project's own history (see TASKS.md) needed multiple rounds to get right
+    for the first, since-removed implementation -- log it from the start this time."""
+    _stub_driver_context(monkeypatch)
+    body = (b'{"error_code":"PERMISSION_DENIED","message":"User does not have EXTERNAL USE '
+            b'LOCATION on External Location \'my-loc\'."}')
+    err = urllib.error.HTTPError(
+        url="https://adb-123.4.azuredatabricks.net/api/2.1/unity-catalog/"
+            "temporary-path-credentials",
+        code=403, msg="Forbidden", hdrs=None, fp=_FakeHttpResponse(body))
+
+    def raise_http_error(req, timeout=None):
+        raise err
+
+    monkeypatch.setattr("urllib.request.urlopen", raise_http_error)
+    with caplog.at_level(logging.WARNING, logger="litebfx._cloud"):
+        result = _cloud._vend_databricks_path_credential("s3://bucket/key.bam")
+
+    assert result is None
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "403" in msg
+    assert "PERMISSION_DENIED" in msg
+    assert "EXTERNAL USE LOCATION" in msg
+
+
+def test_vend_credential_logs_success_at_info_level(monkeypatch, caplog):
+    _stub_driver_context(monkeypatch)
+    _install_fake_urlopen(monkeypatch, payload={
+        "aws_temp_credentials": {"access_key_id": "AK", "secret_access_key": "SK"},
+        "expiration_time": 1234567890000,
+    })
+    with caplog.at_level(logging.INFO, logger="litebfx._cloud"):
+        result = _cloud._vend_databricks_path_credential("s3://bucket/key.bam")
+
+    assert result is not None
+    assert any("vended" in r.getMessage().lower() for r in caplog.records)
+    # never log the actual secret material, only ever the non-secret request/expiry details
+    assert not any("SK" in r.getMessage() for r in caplog.records)
 
 
 def test_vend_credential_none_when_aws_temp_credentials_missing(monkeypatch):
@@ -468,6 +518,44 @@ def test_prepare_env_credential_and_endpoint_override_compose(monkeypatch):
     _cloud.prepare_env("s3://bucket/key.bam", credential=cred)
     assert os.environ["AWS_ACCESS_KEY_ID"] == "AK"
     assert os.environ["HTS_S3_HOST"] == "minio:9000"
+
+
+def test_prepare_env_clears_stale_credential_env_when_credential_becomes_none():
+    """A worker process can be reused across partitions/files. If a later prepare_env() call
+    gets no credential (vend failed, or a different, non-Databricks path), a credential
+    injected by an EARLIER call must not silently linger in os.environ and get reused against
+    a bucket it was never scoped for -- that's a real, confusing-403 hazard, not just
+    untidiness."""
+    cred = _cloud._DatabricksPathCredential("AK", "SK", "TOK", None)
+    _cloud.prepare_env("s3://bucket-a/key.bam", credential=cred)
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "AK"
+
+    _cloud.prepare_env("s3://bucket-b/key.bam", credential=None)
+    assert "AWS_ACCESS_KEY_ID" not in os.environ
+    assert "AWS_SECRET_ACCESS_KEY" not in os.environ
+    assert "AWS_SESSION_TOKEN" not in os.environ
+
+
+def test_prepare_env_never_touches_env_vars_it_did_not_inject(monkeypatch):
+    """The cleanup above must not clobber AWS credentials that were already ambient before
+    litebfx ever touched the environment (e.g. a real instance-profile/manually-exported-key
+    setup) -- only keys litebfx itself injected from a credential are fair game to clear."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AMBIENT_KEY")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "AMBIENT_SECRET")
+    _cloud.prepare_env("s3://bucket/key.bam", credential=None)
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "AMBIENT_KEY"
+    assert os.environ["AWS_SECRET_ACCESS_KEY"] == "AMBIENT_SECRET"
+
+
+def test_prepare_env_swaps_stale_key_when_new_credential_lacks_session_token():
+    cred1 = _cloud._DatabricksPathCredential("AK1", "SK1", "TOK1", None)
+    _cloud.prepare_env("s3://bucket/key.bam", credential=cred1)
+    assert os.environ["AWS_SESSION_TOKEN"] == "TOK1"
+
+    cred2 = _cloud._DatabricksPathCredential("AK2", "SK2", None, None)   # no session token
+    _cloud.prepare_env("s3://bucket/key.bam", credential=cred2)
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "AK2"
+    assert "AWS_SESSION_TOKEN" not in os.environ
 
 
 # --- cloud_read_scope() with a credential ------------------------------------------------------
