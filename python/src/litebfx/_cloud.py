@@ -41,13 +41,27 @@ than by never attaching the credential to a partition at all.
 
 Refresh is bounded by what Python Data Source's design actually allows: partitions() runs
 once, up front, before any partition executes, and workers have no channel to call back to
-the driver mid-read. credentials_for() is cached per (scheme, bucket) and re-vends whenever
-the cached entry is missing or expired, so *every fresh partitions() call* (i.e. every new
-Spark action against a cloud path) gets a credential that's fresh as of that moment -- the
-finest refresh granularity actually achievable. A single action whose total wall-clock
-execution (across all its partitions, stragglers included) exceeds the vended credential's
-~1h lifetime will still see mid-read expiry with no way to recover short of re-running the
-action; see python/TASKS.md.
+the driver mid-read. databricks_credential_for() is cached per (scheme, bucket, dir_key) and
+re-vends whenever the cached entry is missing or expired, so *every fresh partitions() call*
+(i.e. every new Spark action against a cloud path) gets a credential that's fresh as of that
+moment -- the finest refresh granularity actually achievable. A single action whose total
+wall-clock execution (across all its partitions, stragglers included) exceeds the vended
+credential's ~1h lifetime will still see mid-read expiry with no way to recover short of
+re-running the action; see python/TASKS.md.
+
+Vending is scoped to the S3 *directory* containing the requested path, not the exact leaf
+key -- found necessary by a live 403 report: a credential vended for a BAM file's exact key
+got a Unity Catalog session policy that didn't authorize s3:GetObject on a co-located sibling
+(its .bai) opened moments later in the same pysam.AlignmentFile(bam, index_filename=bai)
+call. The precise fix (separately-scoped credentials for the file and its index, applied
+independently via htslib's s3://ID:SECRET:TOKEN@bucket/key URL-embedded-credential syntax)
+turned out to be untestable in this repo's Docker/MinIO setup -- confirmed by reading
+hfile_s3.c that the embedded-credential code path never consults HTS_S3_HOST, so it can only
+ever reach real AWS, never MinIO -- so directory-scoping is the accepted tradeoff until an
+upstream htslib fix (see python/TASKS.md's "Second htslib upstream contribution
+opportunity") makes the precise version testable. Broader than strictly necessary (covers
+the whole directory, not just the objects actually read), but reuses the already-proven
+env-var credential-application path instead of an unverifiable new one.
 
 Concurrency: os.environ mutation is process-global, and it's unverified whether htslib
 re-reads env vars only at open time or on every subsequent range request against an
@@ -466,11 +480,34 @@ def _resolve_s3_region(bucket: str):
         return None
 
 
+def _s3_dir_cache_key_and_url(path: str):
+    """((scheme, bucket, dir_key), 's3://bucket/dir_key/') for the S3 "directory" containing
+    `path` -- see databricks_credential_for()'s docstring for why vending is scoped to the
+    containing prefix rather than the exact leaf file."""
+    scheme, bucket, key = _io.bucket_key(path)
+    dir_key = key.rsplit("/", 1)[0] if "/" in key else ""
+    url = f"s3://{bucket}/{dir_key}/" if dir_key else f"s3://{bucket}/"
+    return (scheme, bucket, dir_key), url
+
+
 def databricks_credential_for(path: str):
-    """Cached driver-vended AWS credential for path's bucket, or None (not on Databricks,
-    vending unavailable/failed, or path isn't S3). Re-vends whenever the cached entry is
-    missing or expired -- see module docstring for the refresh-granularity this actually
-    achieves (once per fresh partitions() call, not mid-read).
+    """Cached driver-vended AWS credential for the S3 "directory" containing `path`, or None
+    (not on Databricks, vending unavailable/failed, or path isn't S3). Re-vends whenever the
+    cached entry is missing or expired -- see module docstring for the refresh-granularity
+    this actually achieves (once per fresh partitions() call, not mid-read).
+
+    Vended for path's *containing prefix*, not the exact leaf file -- confirmed necessary by
+    a live 403 report: a credential vended for the exact key of a BAM file produced a Unity
+    Catalog session policy that authorized s3:GetObject on that key alone, not on a
+    co-located sibling (the .bai index) opened moments later within the same
+    pysam.AlignmentFile(bam, index_filename=bai) call ("No session policy allows the
+    s3:GetObject action", specifically on the .bai). Scoping the vend to the directory
+    instead covers every co-located index file (.bai/.csi/.crai/.tbi/.fai/.gzi) with the same
+    one credential, matching how Unity Catalog's temporary path credentials are generally
+    used for reading a table's many data files under one external location anyway. Cached
+    per (scheme, bucket, dir_key) rather than just (scheme, bucket), since two files in
+    different directories of the same bucket now legitimately need separately-scoped
+    credentials.
 
     DRIVER-ONLY in effect: _vend_databricks_path_credential() needs a real SparkSession,
     which _active_spark_session() only ever finds on the driver -- calling this from worker
@@ -479,11 +516,11 @@ def databricks_credential_for(path: str):
     """
     if not is_databricks() or _io.scheme(path) not in _S3_SCHEMES:
         return None
-    key = _io.bucket_key(path)[:2]
-    cached = _DATABRICKS_CRED_CACHE.get(key)
+    cache_key, url = _s3_dir_cache_key_and_url(path)
+    cached = _DATABRICKS_CRED_CACHE.get(cache_key)
     if cached is None or cached.is_expired():
-        cached = _vend_databricks_path_credential(path)
-        _DATABRICKS_CRED_CACHE[key] = cached
+        cached = _vend_databricks_path_credential(url)
+        _DATABRICKS_CRED_CACHE[cache_key] = cached
     return cached
 
 

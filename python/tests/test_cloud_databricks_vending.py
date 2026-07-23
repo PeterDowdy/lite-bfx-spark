@@ -30,7 +30,7 @@ import pytest
 
 pyarrow_fs = pytest.importorskip("pyarrow.fs")
 
-from litebfx import _cloud, _cloudfs, io    # noqa: E402
+from litebfx import _cloud, _cloudfs, io
 
 
 @pytest.fixture(autouse=True)
@@ -502,9 +502,71 @@ def test_databricks_credential_for_vends_and_caches_per_bucket(monkeypatch):
     assert len(calls) == 1
 
 
+def test_databricks_credential_for_vends_directory_scoped_url(monkeypatch):
+    """The bug this closes: a credential vended for the exact leaf file's key produced a
+    Unity Catalog session policy that didn't authorize s3:GetObject on a co-located sibling
+    (a BAM's .bai) opened moments later in the same call ("No session policy allows the
+    s3:GetObject action", confirmed against a real workspace). Vending for the containing
+    directory instead covers every co-located index file with the same one credential."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    captured = []
+
+    def fake_vend(url, operation="PATH_READ"):
+        captured.append(url)
+        return _cloud._DatabricksPathCredential("AK", "SK", None, None)
+
+    monkeypatch.setattr(_cloud, "_vend_databricks_path_credential", fake_vend)
+    _cloud.databricks_credential_for("s3://bucket/some/dir/sample.bam")
+    assert captured == ["s3://bucket/some/dir/"]
+
+
+def test_databricks_credential_for_bucket_root_file_has_single_trailing_slash(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    captured = []
+    monkeypatch.setattr(_cloud, "_vend_databricks_path_credential",
+                         lambda url, operation="PATH_READ":
+                         captured.append(url) or _cloud._DatabricksPathCredential(
+                             "AK", "SK", None, None))
+    _cloud.databricks_credential_for("s3://bucket/sample.bam")
+    assert captured == ["s3://bucket/"]
+
+
+def test_databricks_credential_for_covers_colocated_index_with_one_vend(monkeypatch):
+    """The actual fix, exercised directly: a BAM and its co-located .bai (same directory)
+    share one cached credential, vended once."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    calls = []
+
+    def fake_vend(url, operation="PATH_READ"):
+        calls.append(url)
+        return _cloud._DatabricksPathCredential("AK", "SK", None, None)
+
+    monkeypatch.setattr(_cloud, "_vend_databricks_path_credential", fake_vend)
+    bam_cred = _cloud.databricks_credential_for("s3://bucket/some/dir/sample.bam")
+    bai_cred = _cloud.databricks_credential_for("s3://bucket/some/dir/sample.bam.bai")
+    assert bam_cred is bai_cred
+    assert len(calls) == 1
+
+
+def test_databricks_credential_for_different_directories_same_bucket_vended_separately(
+        monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
+    calls = []
+
+    def fake_vend(url, operation="PATH_READ"):
+        calls.append(url)
+        return _cloud._DatabricksPathCredential(url, url, None, None)
+
+    monkeypatch.setattr(_cloud, "_vend_databricks_path_credential", fake_vend)
+    a = _cloud.databricks_credential_for("s3://bucket/dir-a/sample.bam")
+    b = _cloud.databricks_credential_for("s3://bucket/dir-b/sample.bam")
+    assert a is not b
+    assert calls == ["s3://bucket/dir-a/", "s3://bucket/dir-b/"]
+
+
 def test_databricks_credential_for_revends_once_expired(monkeypatch):
     monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "17.3")
-    _cloud._DATABRICKS_CRED_CACHE[("s3", "bucket")] = \
+    _cloud._DATABRICKS_CRED_CACHE[("s3", "bucket", "")] = \
         _cloud._DatabricksPathCredential("OLD", "OLD", None, 0)     # already expired
     calls = []
 
@@ -543,7 +605,6 @@ def test_databricks_credential_for_retries_after_failed_vend(monkeypatch):
 
     def fake_vend(path, operation="PATH_READ"):
         calls.append(path)
-        return None
 
     monkeypatch.setattr(_cloud, "_vend_databricks_path_credential", fake_vend)
     first = _cloud.databricks_credential_for("s3://bucket/key.bam")
@@ -651,10 +712,9 @@ def test_cloud_read_scope_local_path_never_activates_credential():
 
 def test_cloud_read_scope_clears_credential_on_exception():
     cred = _cloud._DatabricksPathCredential("AK", "SK", None, None)
-    with pytest.raises(RuntimeError):
-        with _cloud.cloud_read_scope("s3://bucket/key.bam", cred):
-            assert _cloud.active_credential() is cred
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), _cloud.cloud_read_scope("s3://bucket/key.bam", cred):
+        assert _cloud.active_credential() is cred
+        raise RuntimeError("boom")
     assert _cloud.active_credential() is None
 
 
@@ -707,7 +767,7 @@ def test_filesystem_for_uses_active_credential(monkeypatch):
     monkeypatch.setattr(_cloud, "databricks_credential_for",
                          lambda p: fallback_calls.append(p) or None)
 
-    fs, within = _cloudfs.filesystem_for("s3://bucket/some/key.bam")
+    _fs, within = _cloudfs.filesystem_for("s3://bucket/some/key.bam")
 
     assert within == "bucket/some/key.bam"
     assert fallback_calls == []

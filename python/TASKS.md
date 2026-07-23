@@ -319,8 +319,9 @@ JDK 17 + PySpark 4.0, 29 passing).**
   against a real workspace**, flagged in its own docstring — note also that open-source
   PySpark, unlike real Databricks Runtime, ships no `pyspark.dbutils` module at all, confirmed
   empirically, so this path is only ever reachable on Databricks itself), and
-  `databricks_credential_for()` (driver-only in effect, cached per `(scheme, bucket)`,
-  re-vends when missing or expired — a failed vend is *not* cached, so every call after a
+  `databricks_credential_for()` (driver-only in effect, cached per `(scheme, bucket, dir_key)`
+  — directory, not just bucket; see the follow-up below for why — re-vends when missing or
+  expired — a failed vend is *not* cached, so every call after a
   failure retries rather than permanently poisoning that bucket). `_base.py`'s
   `credential_for_partitions()`/`attach_credential()` are shared by all five format readers'
   `partitions()` to fetch-once-per-file and attach-to-every-partition-for-that-file.
@@ -353,6 +354,53 @@ JDK 17 + PySpark 4.0, 29 passing).**
   re-run against a live workspace** — whether it actually authenticates end-to-end still
   needs that manual, pre-release check, same as the first attempt did before its own gaps
   surfaced.
+
+  **Follow-up, from a live 403 report against a real workspace (the first end-to-end test of
+  this mechanism)** — three things found and fixed, none of them the first guess:
+  1. `_vend_databricks_path_credential()`'s bare `except Exception: return None` discarded
+     the actual failure reason, including Unity Catalog's own `<Message>` text on a rejected
+     vend request (which usually names the missing privilege). Now logs the HTTP
+     status/reason/body (`urllib.error.HTTPError` specifically) or the exception via the
+     standard `logging` module before falling back, plus a success line (bucket/expiry only,
+     never secrets).
+  2. `prepare_env()` only ever *added* a credential's env vars, never removed a *previous*
+     call's when the current call got no credential — a worker process reused across
+     partitions/files could keep signing later requests with an earlier file's credential.
+     Fixed by tracking exactly which keys the last call injected
+     (`_LAST_INJECTED_CREDENTIAL_KEYS`) and clearing precisely those when they don't carry
+     forward — never touching env vars litebfx didn't itself inject.
+  3. **The actual root cause**: a credential vended for the exact main-file key (e.g.
+     `sample.bam`) got a Unity Catalog session policy authorizing `s3:GetObject` on that key
+     alone — not on a co-located sibling (the `.bai` index) opened moments later in the same
+     `pysam.AlignmentFile(bam, index_filename=bai)` call ("No session policy allows the
+     s3:GetObject action", confirmed against the real workspace, specifically on the `.bai`).
+     The precise fix — separately-scoped credentials for the file and its resolved index,
+     applied independently via htslib's `s3://ID:SECRET:TOKEN@bucket/key` URL-embedded-
+     credential syntax — turned out to be untestable in this repo's Docker/MinIO setup: the
+     embedded-credential code path in `hfile_s3.c` never consults `HTS_S3_HOST` (confirmed by
+     reading the source), so it can only ever reach real AWS, never MinIO, and a real
+     MinIO-minted STS credential — correctly percent-encoded — failed once embedded in the
+     URL for exactly that reason (see the new "Second htslib upstream contribution
+     opportunity" entry below). Given that, `databricks_credential_for()` instead vends for
+     the S3 *directory* containing the requested path (a trailing-slash prefix, not the exact
+     key) — covers the file and every co-located index (`.bai`/`.csi`/`.crai`/`.tbi`/
+     `.fai`/`.gzi`) with one credential, reusing the already-proven env-var application path
+     instead of an unverifiable new one. Broader than strictly necessary (grants the whole
+     directory, not just the objects actually read) — an accepted, documented tradeoff until
+     the upstream htslib fix makes the precise version testable. Cache key changed from
+     `(scheme, bucket)` to `(scheme, bucket, dir_key)` accordingly, since files in different
+     directories of the same bucket now need separately-scoped credentials.
+
+  Also found and fixed in the same investigation, independent of the root cause above: vended
+  credentials threaded no region information at all, so `pyarrow.fs.S3FileSystem`
+  (constructed with explicit credentials) silently defaulted to `us-east-1`, and htslib had
+  no region auto-detection of its own beyond whatever was already ambient — either gap signs
+  requests for the wrong region against a bucket outside that default, and AWS reports the
+  result as `AccessDenied`, not a clearer region error. Not the reporting workspace's actual
+  bug (that bucket already was `us-east-1`) but a real one regardless —
+  `_vend_databricks_path_credential()` now resolves the bucket's actual region via
+  `pyarrow.fs.resolve_s3_region()` once per vend and threads it through as
+  `AWS_DEFAULT_REGION`/`region`.
 
 ### Still deferred (documented limitations)
 
@@ -398,6 +446,26 @@ pytest -q -m "not spark"        # pure-Python units only (no JVM)
   genuinely useful, scoped upstream fix for github.com/samtools/htslib, not just a litebfx
   workaround. `test_cloud_gcs.py` documents the current workaround (orchestration-layer-only
   testing via `pyarrow.fs.GcsFileSystem`'s explicit `endpoint_override`).
+- **Second htslib upstream contribution opportunity**: `hfile_s3.c`'s URL-embedded-credential
+  syntax (`s3://ID:SECRET:TOKEN@bucket/key`, an alternative to `AWS_ACCESS_KEY_ID`-family env
+  vars for per-object credentials) and its `HTS_S3_HOST`/`AWS_DEFAULT_REGION`/
+  `HTS_S3_ADDRESS_STYLE` custom-endpoint support are mutually exclusive in the current source
+  — confirmed by direct code reading (`setup_auth_data()`'s `if (*path == '@') {...} else {
+  ...getenv("HTS_S3_HOST")...}` branch: the env-var reads, including the endpoint-override
+  ones, only happen in the *no*-embedded-credentials branch) and empirically (minted a real
+  STS credential from MinIO, embedded it in the URL, got "Permission denied" — not a bad
+  credential or bad percent-encoding, but `HTS_S3_HOST` being silently ignored so htslib
+  tried to reach real AWS instead of MinIO). This blocks a real use case: per-object
+  credentials (e.g. two different Unity Catalog temporary path credentials for a BAM and a
+  separately-permissioned index file in the same `pysam.AlignmentFile(bam,
+  index_filename=bai)` call, rather than one shared env-var credential broad enough to cover
+  both — see "Re-implemented: Unity Catalog credential vending" above for why litebfx settled
+  for directory-scoped vending instead) cannot be tested against MinIO/any S3-compatible
+  emulator at all, only real AWS — the same class of gap as the GCS entry above, but for
+  credential embedding rather than a missing host override. Letting the embedded-credential
+  branch also consult `HTS_S3_HOST`/`AWS_DEFAULT_REGION`/`HTS_S3_ADDRESS_STYLE` (instead of
+  skipping straight past them) would close it — a scoped, useful upstream fix, not just a
+  litebfx workaround. Litebfx intends to submit this upstream; not yet filed.
 - ~~Databricks UC credential vending, take one: whether `WorkspaceClient()`'s default auth
   resolves inside the isolated Python Data Source worker subprocess~~ — **resolved: no, it
   doesn't**, and that first implementation was removed as a result (a real worker-side
