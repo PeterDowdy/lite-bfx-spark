@@ -242,18 +242,30 @@ class _DatabricksPathCredential:
     on real InputPartition subclasses (see bam.py etc.), which Spark can print in full via
     plan explain output or a worker traceback on a failed task. Only the non-secret
     expiration timestamp is shown.
-    """
-    __slots__ = ("access_key_id", "secret_access_key", "session_token", "expiration_time_ms")
 
-    def __init__(self, access_key_id, secret_access_key, session_token, expiration_time_ms):
+    `region`, when resolved (see _vend_databricks_path_credential()), is threaded through to
+    both consumers: pyarrow.fs.S3FileSystem defaults to us-east-1 when constructed with
+    explicit credentials and no region kwarg (confirmed empirically -- unlike its ambient,
+    no-explicit-credentials from_uri() construction, which does real region auto-detection),
+    and htslib's S3 backend has no ambient region detection of its own at all, only whatever
+    AWS_DEFAULT_REGION happens to already be set. Either gap silently signs requests for the
+    wrong region against any bucket outside that default, which AWS surfaces as AccessDenied,
+    not a clearer region/redirect error.
+    """
+    __slots__ = ("access_key_id", "secret_access_key", "session_token", "expiration_time_ms",
+                 "region")
+
+    def __init__(self, access_key_id, secret_access_key, session_token, expiration_time_ms,
+                 region=None):
         self.access_key_id = access_key_id
         self.secret_access_key = secret_access_key
         self.session_token = session_token
         self.expiration_time_ms = expiration_time_ms
+        self.region = region
 
     def __repr__(self):
         return (f"{self.__class__.__name__}(<redacted>, "
-                f"expiration_time_ms={self.expiration_time_ms!r})")
+                f"expiration_time_ms={self.expiration_time_ms!r}, region={self.region!r})")
 
     __str__ = __repr__
 
@@ -268,6 +280,8 @@ class _DatabricksPathCredential:
              "AWS_SECRET_ACCESS_KEY": self.secret_access_key}
         if self.session_token:
             d["AWS_SESSION_TOKEN"] = self.session_token
+        if self.region:
+            d["AWS_DEFAULT_REGION"] = self.region
         return d
 
     @property
@@ -275,6 +289,8 @@ class _DatabricksPathCredential:
         d = {"access_key": self.access_key_id, "secret_key": self.secret_access_key}
         if self.session_token:
             d["session_token"] = self.session_token
+        if self.region:
+            d["region"] = self.region
         return d
 
 
@@ -415,11 +431,39 @@ def _vend_databricks_path_credential(path: str, operation: str = "PATH_READ"):
                       "no usable aws_temp_credentials (response top-level keys: %s) -- "
                       "falling back to ambient credentials", url, sorted(payload.keys()))
         return None
+    region = _resolve_s3_region(bucket)
     _LOG.info("litebfx: vended a Databricks Unity Catalog path credential for %r "
-              "(expires=%r)", url, payload.get("expiration_time"))
+              "(expires=%r, region=%r)", url, payload.get("expiration_time"), region)
     return _DatabricksPathCredential(
         aws["access_key_id"], aws["secret_access_key"], aws.get("session_token"),
-        payload.get("expiration_time"))
+        payload.get("expiration_time"), region)
+
+
+def _resolve_s3_region(bucket: str):
+    """The bucket's actual AWS region via pyarrow.fs.resolve_s3_region(), or None on any
+    failure. Needed because pyarrow.fs.S3FileSystem, when constructed with explicit
+    credentials (as _DatabricksPathCredential.fs_kwargs does), defaults to us-east-1 rather
+    than auto-detecting -- confirmed empirically, unlike its ambient/from_uri() construction,
+    which does real region auto-detection. htslib's S3 backend has no auto-detection of its
+    own either. Either gap silently signs requests for the wrong region against any bucket
+    outside that default, which AWS reports as AccessDenied, not a clearer region error --
+    resolving it once per vend and threading it through both consumers (see
+    _DatabricksPathCredential.env/fs_kwargs) closes that gap.
+
+    resolve_s3_region() makes a real (unauthenticated) network call and raises on any failure
+    (bucket not found, network error, and plausibly others) -- never let that block vending
+    the credential itself; a None here just means htslib/pyarrow fall back to their own
+    default region, the same as before this function existed.
+    """
+    try:
+        import pyarrow.fs
+        return pyarrow.fs.resolve_s3_region(bucket)
+    except Exception as e:
+        _LOG.warning("litebfx: could not resolve the AWS region for bucket %r (%r) -- S3 "
+                      "requests will use pyarrow/htslib's own default region, which may "
+                      "cause AccessDenied against a bucket outside that default (commonly "
+                      "us-east-1)", bucket, e)
+        return None
 
 
 def databricks_credential_for(path: str):
