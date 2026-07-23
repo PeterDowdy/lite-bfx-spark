@@ -60,13 +60,17 @@ Local-path reads never touch this lock.
 
 import contextlib
 import json
+import logging
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
 from . import io as _io
+
+_LOG = logging.getLogger(__name__)
 
 # htslib's S3 backend recognizes only s3://, s3+http://, and s3+https:// -- s3a:// and
 # s3n:// give "Protocol not supported" (confirmed empirically), so they're normalized to
@@ -97,6 +101,15 @@ _AMBIENT_GCS_CACHE = None
 
 # Driver-only: vended AWS credential per (scheme, bucket). See databricks_credential_for().
 _DATABRICKS_CRED_CACHE = {}
+
+# The os.environ keys the most recent prepare_env(..., credential=...) call injected from a
+# _DatabricksPathCredential, so a later call -- same worker process, different partition --
+# that gets no credential (or a differently-shaped one) can clean up exactly those keys. A
+# worker process can be reused across partitions/files; without this, a credential vended for
+# one bucket would silently linger in os.environ and get reused against a later file it was
+# never scoped for, producing a real (if confusing) 403 instead of a clean fallback. Never
+# touches an env var litebfx didn't itself inject -- see prepare_env()'s docstring.
+_LAST_INJECTED_CREDENTIAL_KEYS = set()
 
 
 def cloud_read_lock():
@@ -300,9 +313,14 @@ def _databricks_notebook_context(spark):
     """
     try:
         workspace_url = spark.conf.get("spark.databricks.workspaceUrl")
-    except Exception:
+    except Exception as e:
+        _LOG.warning("litebfx: could not read spark.databricks.workspaceUrl (%r) -- "
+                      "Databricks UC credential vending disabled, falling back to ambient "
+                      "credentials", e)
         return None
     if not workspace_url:
+        _LOG.warning("litebfx: spark.databricks.workspaceUrl is empty -- Databricks UC "
+                      "credential vending disabled, falling back to ambient credentials")
         return None
     dbutils = None
     try:
@@ -316,14 +334,25 @@ def _databricks_notebook_context(spark):
         try:
             from pyspark.dbutils import DBUtils
             dbutils = DBUtils(spark)
-        except Exception:
+        except Exception as e:
+            _LOG.warning("litebfx: no notebook-injected dbutils, and pyspark.dbutils."
+                          "DBUtils(spark) construction failed (%r) -- Databricks UC "
+                          "credential vending disabled, falling back to ambient credentials",
+                          e)
             return None
     try:
         token = (dbutils.notebook.entry_point.getDbutils()
                  .notebook().getContext().apiToken().get())
-    except Exception:
+    except Exception as e:
+        _LOG.warning("litebfx: got a dbutils object but could not obtain a notebook API "
+                      "token from it (%r) -- Databricks UC credential vending disabled, "
+                      "falling back to ambient credentials", e)
         return None
-    return (workspace_url, token) if token else None
+    if not token:
+        _LOG.warning("litebfx: dbutils returned an empty notebook API token -- Databricks "
+                      "UC credential vending disabled, falling back to ambient credentials")
+        return None
+    return workspace_url, token
 
 
 def _vend_databricks_path_credential(path: str, operation: str = "PATH_READ"):
@@ -360,11 +389,34 @@ def _vend_databricks_path_credential(path: str, operation: str = "PATH_READ"):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read())
-    except Exception:
+    except urllib.error.HTTPError as e:
+        # e.g. a 403 here means Unity Catalog itself rejected the *vending request* (most
+        # likely a missing/insufficient EXTERNAL USE LOCATION grant on the external location
+        # covering `url`) -- a materially different problem from a 403 on the actual S3 read
+        # that follows a *successful* vend (wrong-scoped credential, or a path the vended
+        # credential doesn't cover, e.g. an index file outside the main file's grant). The
+        # response body usually names the specific privilege/location UC found missing.
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:2000]
+        except Exception:
+            pass
+        _LOG.warning("litebfx: Unity Catalog temporary-path-credentials request for %r "
+                      "failed: HTTP %s %s -- %s -- falling back to ambient credentials",
+                      url, e.code, e.reason, detail)
+        return None
+    except Exception as e:
+        _LOG.warning("litebfx: Unity Catalog temporary-path-credentials request for %r "
+                      "failed: %r -- falling back to ambient credentials", url, e)
         return None
     aws = payload.get("aws_temp_credentials")
     if not aws or not aws.get("access_key_id") or not aws.get("secret_access_key"):
+        _LOG.warning("litebfx: Unity Catalog temporary-path-credentials response for %r had "
+                      "no usable aws_temp_credentials (response top-level keys: %s) -- "
+                      "falling back to ambient credentials", url, sorted(payload.keys()))
         return None
+    _LOG.info("litebfx: vended a Databricks Unity Catalog path credential for %r "
+              "(expires=%r)", url, payload.get("expiration_time"))
     return _DatabricksPathCredential(
         aws["access_key_id"], aws["secret_access_key"], aws.get("session_token"),
         payload.get("expiration_time"))
@@ -398,13 +450,24 @@ def prepare_env(path: str, credential=None) -> None:
 
     Independent things happen here for a "native" cloud path:
     - If `credential` is given (a partition's driver-vended _DatabricksPathCredential -- see
-      module docstring), its env vars are applied and take priority over everything below.
-    - Otherwise, for a GCS path specifically, GOOGLE_APPLICATION_CREDENTIALS is minted into a
-      GCS_OAUTH_TOKEN when set and the `gcp` extra is installed (see
-      _mint_ambient_gcs_token()), since GOOGLE_APPLICATION_CREDENTIALS itself is not
-      something htslib's GCS backend can use directly. Missing extra, missing env var, or a
-      minting failure: skipped, htslib resolves GCS_OAUTH_TOKEN from the ambient environment
-      itself (i.e. does nothing further -- same as if this bullet didn't exist).
+      module docstring), its env vars are applied and take priority over everything below. Any
+      key a *previous* call injected from a different credential (e.g. this worker process
+      already handled a partition for a different bucket) but the current one doesn't set --
+      most commonly AWS_SESSION_TOKEN, if credentials without one follow credentials with one
+      -- is removed first, so no stale value can survive a credential swap.
+    - If `credential` is None, any AWS_* keys the *previous* call injected from a credential are
+      removed -- never env vars litebfx didn't itself inject, i.e. genuinely ambient
+      credentials (an instance profile, a manually exported key) are left alone. Without this,
+      a worker process reused across partitions -- one whose vend succeeded for bucket A, a
+      later one whose vend failed or wasn't attempted for bucket B -- would silently keep
+      signing bucket B's requests with bucket A's credential and get a confusing 403 instead of
+      a clean fallback to whatever's actually ambient.
+    - Otherwise (no credential, S3 keys already clean), for a GCS path specifically,
+      GOOGLE_APPLICATION_CREDENTIALS is minted into a GCS_OAUTH_TOKEN when set and the `gcp`
+      extra is installed (see _mint_ambient_gcs_token()), since GOOGLE_APPLICATION_CREDENTIALS
+      itself is not something htslib's GCS backend can use directly. Missing extra, missing env
+      var, or a minting failure: skipped, htslib resolves GCS_OAUTH_TOKEN from the ambient
+      environment itself (i.e. does nothing further -- same as if this bullet didn't exist).
     - If AWS_ENDPOINT_URL is set (a non-AWS S3-compatible endpoint), HTS_S3_HOST and
       HTS_S3_ADDRESS_STYLE are derived from it, since htslib has no other way to learn a
       non-default host. This alone is *not* enough for htslib to actually use that host --
@@ -415,15 +478,24 @@ def prepare_env(path: str, credential=None) -> None:
     package's established pattern. Caller must hold cloud_read_lock() for the duration of the
     read that follows -- see module docstring.
     """
+    global _LAST_INJECTED_CREDENTIAL_KEYS
     if _io.cloud_read_mode(path) != "native":
         return
     _fix_ca_bundle_path()
     if credential is not None:
+        new_keys = set(credential.env)
+        for stale_key in _LAST_INJECTED_CREDENTIAL_KEYS - new_keys:
+            os.environ.pop(stale_key, None)
         os.environ.update(credential.env)
-    elif _io.scheme(path) in _GCS_SCHEMES:
-        cred = _mint_ambient_gcs_token()
-        if cred is not None:
-            os.environ.update(cred.env)
+        _LAST_INJECTED_CREDENTIAL_KEYS = new_keys
+    else:
+        for stale_key in _LAST_INJECTED_CREDENTIAL_KEYS:
+            os.environ.pop(stale_key, None)
+        _LAST_INJECTED_CREDENTIAL_KEYS = set()
+        if _io.scheme(path) in _GCS_SCHEMES:
+            cred = _mint_ambient_gcs_token()
+            if cred is not None:
+                os.environ.update(cred.env)
     endpoint = os.environ.get("AWS_ENDPOINT_URL")
     if endpoint and _io.scheme(path) in _S3_SCHEMES:
         os.environ["HTS_S3_HOST"] = urllib.parse.urlparse(endpoint).netloc
