@@ -49,6 +49,19 @@ def _reset_caches(monkeypatch):
     monkeypatch.setattr(_cloudfs, "_FS_CACHE", {})
 
 
+@pytest.fixture(autouse=True)
+def _no_real_region_lookup(monkeypatch):
+    """pyarrow.fs.resolve_s3_region() -- the one real network call _resolve_s3_region() makes
+    -- defaults to raising (same as "bucket not found"/no network), which _resolve_s3_region()
+    itself catches and turns into a clean None, so every test that reaches
+    _vend_databricks_path_credential()'s success path doesn't silently depend on network
+    access. Patched at the pyarrow level, not _cloud._resolve_s3_region itself, so this
+    function's own dedicated tests below still exercise its real try/except logic and can
+    override this mock for their own scenarios."""
+    monkeypatch.setattr(pyarrow_fs, "resolve_s3_region",
+                         lambda bucket: (_ for _ in ()).throw(OSError("no network in tests")))
+
+
 # --- _DatabricksPathCredential ------------------------------------------------------------
 
 def test_repr_and_str_redact_secrets():
@@ -80,6 +93,31 @@ def test_fs_kwargs_includes_session_token_when_present():
 def test_fs_kwargs_omits_session_token_when_absent():
     cred = _cloud._DatabricksPathCredential("AK", "SK", None, None)
     assert cred.fs_kwargs == {"access_key": "AK", "secret_key": "SK"}
+
+
+def test_env_includes_region_when_present():
+    cred = _cloud._DatabricksPathCredential("AK", "SK", None, None, region="eu-west-1")
+    assert cred.env["AWS_DEFAULT_REGION"] == "eu-west-1"
+
+
+def test_env_omits_region_when_absent():
+    cred = _cloud._DatabricksPathCredential("AK", "SK", None, None)
+    assert "AWS_DEFAULT_REGION" not in cred.env
+
+
+def test_fs_kwargs_includes_region_when_present():
+    cred = _cloud._DatabricksPathCredential("AK", "SK", None, None, region="eu-west-1")
+    assert cred.fs_kwargs["region"] == "eu-west-1"
+
+
+def test_fs_kwargs_omits_region_when_absent():
+    cred = _cloud._DatabricksPathCredential("AK", "SK", None, None)
+    assert "region" not in cred.fs_kwargs
+
+
+def test_repr_shows_region_not_just_expiration():
+    cred = _cloud._DatabricksPathCredential("AK", "SK", None, None, region="eu-west-1")
+    assert "eu-west-1" in repr(cred)
 
 
 def test_no_expiration_never_expires():
@@ -219,6 +257,29 @@ def test_notebook_context_success_via_dbutils_fallback(monkeypatch):
     spark = _FakeSpark(workspace_url="adb-123.4.azuredatabricks.net")
     assert _cloud._databricks_notebook_context(spark) == (
         "adb-123.4.azuredatabricks.net", "tok-xyz")
+
+
+# --- _resolve_s3_region() --------------------------------------------------------------------
+
+def test_resolve_s3_region_returns_pyarrow_result(monkeypatch):
+    monkeypatch.setattr(pyarrow_fs, "resolve_s3_region", lambda bucket: "eu-west-1")
+    assert _cloud._resolve_s3_region("some-bucket") == "eu-west-1"
+
+
+def test_resolve_s3_region_none_on_failure_does_not_raise(monkeypatch):
+    def raise_lookup(bucket):
+        raise OSError(f"Bucket {bucket!r} not found")
+
+    monkeypatch.setattr(pyarrow_fs, "resolve_s3_region", raise_lookup)
+    assert _cloud._resolve_s3_region("some-bucket") is None
+
+
+def test_resolve_s3_region_logs_warning_on_failure(monkeypatch, caplog):
+    monkeypatch.setattr(pyarrow_fs, "resolve_s3_region",
+                         lambda bucket: (_ for _ in ()).throw(OSError("not found")))
+    with caplog.at_level(logging.WARNING, logger="litebfx._cloud"):
+        _cloud._resolve_s3_region("some-bucket")
+    assert any("some-bucket" in r.getMessage() for r in caplog.records)
 
 
 # --- _vend_databricks_path_credential() ------------------------------------------------------
@@ -387,6 +448,20 @@ def test_vend_credential_success_parses_response_and_request_shape(monkeypatch):
     assert req.get_header("Content-type") == "application/json"
     assert json.loads(req.data) == {
         "url": "s3://my-bucket/some/key.bam", "operation": "PATH_READ"}
+
+
+def test_vend_credential_resolves_and_attaches_region(monkeypatch):
+    _stub_driver_context(monkeypatch)
+    region_calls = []
+    monkeypatch.setattr(_cloud, "_resolve_s3_region",
+                         lambda bucket: region_calls.append(bucket) or "eu-west-1")
+    _install_fake_urlopen(monkeypatch, payload={
+        "aws_temp_credentials": {"access_key_id": "AK", "secret_access_key": "SK"}})
+
+    cred = _cloud._vend_databricks_path_credential("s3://my-bucket/some/key.bam")
+
+    assert cred.region == "eu-west-1"
+    assert region_calls == ["my-bucket"]
 
 
 def test_vend_credential_bare_bucket_path_has_no_trailing_slash(monkeypatch):
